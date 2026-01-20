@@ -36,10 +36,12 @@ BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
 METADATA_FILE = BASE_DIR / "image_metadata.json"
 PROGRESS_FILE = BASE_DIR / "sync_progress.json"
+ERRORS_FILE = BASE_DIR / "sync_errors.json"
 # Test folders (use --test flag)
 IMAGES_DIR_TEST = BASE_DIR / "images_test"
 METADATA_FILE_TEST = BASE_DIR / "image_metadata_test.json"
 PROGRESS_FILE_TEST = BASE_DIR / "sync_progress_test.json"
+ERRORS_FILE_TEST = BASE_DIR / "sync_errors_test.json"
 
 IMAGES_DIR.mkdir(exist_ok=True)
 
@@ -77,6 +79,20 @@ def save_progress(progress: dict):
         json.dump(progress, f)
 
 
+def load_errors() -> dict:
+    """Load existing errors mapping listing_id -> error reason."""
+    if ERRORS_FILE.exists():
+        with open(ERRORS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_errors(errors: dict):
+    """Save errors to disk."""
+    with open(ERRORS_FILE, "w") as f:
+        json.dump(errors, f)
+
+
 def get_remaining_calls(client: httpx.Client) -> int:
     """Check remaining API calls from response headers."""
     response = client.get(
@@ -88,25 +104,28 @@ def get_remaining_calls(client: httpx.Client) -> int:
     return remaining
 
 
-def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, str] | None:
-    """Get the first image's ID and URL for a listing."""
+def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, str, None] | tuple[None, None, str]:
+    """Get the first image's ID and URL for a listing.
+
+    Returns (image_id, url, None) on success, or (None, None, error_reason) on failure.
+    """
     try:
         response = client.get(
             f"{BASE_URL}/application/listings/{listing_id}/images",
             headers={"x-api-key": ETSY_API_KEY},
         )
         if response.status_code == 404:
-            return None  # Listing no longer exists
+            return None, None, "404"
         response.raise_for_status()
         images = response.json().get("results", [])
 
         if images:
             first = images[0]
-            return first["listing_image_id"], first["url_170x135"]
-        return None
+            return first["listing_image_id"], first["url_170x135"], None
+        return None, None, "no_images"
     except httpx.HTTPStatusError as e:
         print(f"  Error fetching images for {listing_id}: {e.response.status_code}")
-        return None
+        return None, None, f"http_{e.response.status_code}"
 
 
 def download_image(client: httpx.Client, url: str, listing_id: int) -> bool:
@@ -190,6 +209,7 @@ def sync_full_taxonomy(limit: int = 0):
 
     metadata = load_metadata()
     progress = load_progress()
+    errors = load_errors()
 
     # Check if 24h has passed since last reset
     if time.time() - progress.get("last_reset", 0) > 86400:
@@ -197,6 +217,7 @@ def sync_full_taxonomy(limit: int = 0):
         progress["last_reset"] = time.time()
 
     print(f"Existing images in corpus: {len(metadata)}")
+    print(f"Existing errors logged: {len(errors)}")
     print(f"API calls used today: {progress['api_calls_today']}")
     print(f"Starting from offset: {progress['offset']}")
 
@@ -263,14 +284,13 @@ def sync_full_taxonomy(limit: int = 0):
 
                 # Get image info
                 time.sleep(API_DELAY)
-                image_info = get_first_image_info(client, listing_id)
+                image_id, image_url, error = get_first_image_info(client, listing_id)
                 progress["api_calls_today"] += 1
 
-                if not image_info:
+                if error:
+                    errors[listing_id_str] = error
                     stats["errors"] += 1
                     continue
-
-                image_id, image_url = image_info
                 existing_image_id = metadata.get(listing_id_str)
 
                 if existing_image_id == image_id:
@@ -293,6 +313,7 @@ def sync_full_taxonomy(limit: int = 0):
             progress["offset"] = offset
             save_progress(progress)
             save_metadata(metadata)
+            save_errors(errors)
 
             print(f"  Downloaded: {stats['downloaded']} | "
                   f"Skipped: {stats['skipped']} | "
@@ -301,6 +322,7 @@ def sync_full_taxonomy(limit: int = 0):
 
     save_progress(progress)
     save_metadata(metadata)
+    save_errors(errors)
 
     print("\n" + "=" * 50)
     print("Session complete!")
@@ -337,6 +359,7 @@ if __name__ == "__main__":
         IMAGES_DIR = IMAGES_DIR_TEST
         METADATA_FILE = METADATA_FILE_TEST
         PROGRESS_FILE = PROGRESS_FILE_TEST
+        ERRORS_FILE = ERRORS_FILE_TEST
         IMAGES_DIR.mkdir(exist_ok=True)
         print("*** TEST MODE - using test folders ***\n")
 
