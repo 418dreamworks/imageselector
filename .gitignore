@@ -9,8 +9,6 @@ image_metadata.json
 image_metadata_test.json
 sync_progress.json
 sync_progress_test.json
-sync_errors.json
-sync_errors_test.json
 etsy_taxonomy.json
 
 # Dev/experimental
