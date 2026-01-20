@@ -28,7 +28,48 @@ load_dotenv()
 # Config
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
-TAXONOMY_ID = 967  # Furniture
+
+# Leaf taxonomy IDs for furniture (deepest level categories)
+# This gives us 38 categories × 10,000 offset limit = 380,000 potential unique listings
+FURNITURE_TAXONOMIES = [
+    12455, 12456,  # Bed Frames, Headboards
+    970,   # Dressers & Armoires
+    972,   # Nightstands
+    971,   # Steps & Stools (bedroom)
+    12470, # Vanity Tables
+    974,   # Buffets & China Cabinets
+    975,   # Dining Chairs
+    976,   # Dining Sets
+    977,   # Kitchen & Dining Tables
+    11837, # Kitchen Islands
+    978,   # Stools & Banquettes
+    12403, # Hall Trees
+    12405, # Standing Coat Racks
+    12406, # Umbrella Stands
+    981,   # Bean Bag Chairs
+    982,   # Benches & Toy Boxes
+    983,   # Bookcases (kids)
+    985,   # Desks, Tables & Chairs (kids)
+    986,   # Dressers & Drawers (kids)
+    987,   # Steps & Stools (kids)
+    988,   # Toddler Beds
+    12369, # Benches
+    12370, # Trunks
+    991,   # Bookshelves
+    992,   # Chairs
+    12371, # Coffee Tables
+    12372, # End Tables
+    11355, # Console & Sofa Tables
+    11356, # TV Stands & Media Centers
+    998,   # Couches & Loveseats
+    996,   # Floor Pillows
+    12468, # Ottomans & Poufs
+    12216, # Room Dividers
+    997,   # Slipcovers
+    1000,  # Desk Chairs
+    1001,  # Desks
+    12408, # Filing Cabinets
+]
 
 # Paths
 BASE_DIR = Path(__file__).parent
@@ -83,7 +124,7 @@ def load_progress() -> dict:
     if PROGRESS_FILE.exists():
         with open(PROGRESS_FILE) as f:
             return json.load(f)
-    return {"offset": 0, "api_calls_today": 0, "last_reset": time.time(), "sort_index": 0}
+    return {"offset": 0, "api_calls_today": 0, "last_reset": time.time(), "sort_index": 0, "taxonomy_index": 0}
 
 
 def save_progress(progress: dict):
@@ -218,15 +259,18 @@ def sync_full_taxonomy(limit: int = 0):
     success_count = sum(1 for v in metadata.values() if isinstance(v, int))
     error_count = len(metadata) - success_count
 
-    # Get current sort strategy
+    # Get current sort strategy and taxonomy
     sort_index = progress.get("sort_index", 0) % len(SORT_STRATEGIES)
+    taxonomy_index = progress.get("taxonomy_index", 0) % len(FURNITURE_TAXONOMIES)
     sort_strategy = SORT_STRATEGIES[sort_index]
+    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
 
     print(f"Existing images in corpus: {success_count}")
     print(f"Existing errors logged: {error_count}")
     print(f"API calls used today: {progress['api_calls_today']}")
     print(f"Starting from offset: {progress['offset']}")
-    print(f"Sort strategy: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+    print(f"Taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
+    print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
 
     stats = {
         "skipped": 0,
@@ -257,7 +301,7 @@ def sync_full_taxonomy(limit: int = 0):
                 f"{BASE_URL}/application/listings/active",
                 headers={"x-api-key": ETSY_API_KEY},
                 params={
-                    "taxonomy_id": TAXONOMY_ID,
+                    "taxonomy_id": current_taxonomy,
                     "limit": batch_size,
                     "offset": offset,
                     **sort_strategy,
@@ -271,14 +315,20 @@ def sync_full_taxonomy(limit: int = 0):
                 continue
 
             if response.status_code == 400 and offset >= MAX_OFFSET:
-                # Etsy API doesn't allow offset > 10000, rotate to next sort strategy
+                # Etsy API doesn't allow offset > 10000
+                # First try next sort strategy, then next taxonomy
                 sort_index = (sort_index + 1) % len(SORT_STRATEGIES)
+                if sort_index == 0:
+                    # Exhausted all sorts for this taxonomy, move to next
+                    taxonomy_index = (taxonomy_index + 1) % len(FURNITURE_TAXONOMIES)
+                    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
+                    print(f"\nMoving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
                 sort_strategy = SORT_STRATEGIES[sort_index]
-                print(f"\nReached Etsy's offset limit ({MAX_OFFSET}).")
-                print(f"Switching to sort strategy: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+                print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
                 offset = 0
                 progress["offset"] = 0
                 progress["sort_index"] = sort_index
+                progress["taxonomy_index"] = taxonomy_index
                 save_progress(progress)
                 continue
 
@@ -287,9 +337,24 @@ def sync_full_taxonomy(limit: int = 0):
             results = data.get("results", [])
 
             if not results:
-                print("\nCompleted full sync!")
-                progress["offset"] = 0  # Reset for next full run
-                break
+                # No more listings for this taxonomy/sort combo, try next
+                sort_index = (sort_index + 1) % len(SORT_STRATEGIES)
+                if sort_index == 0:
+                    taxonomy_index = (taxonomy_index + 1) % len(FURNITURE_TAXONOMIES)
+                    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
+                    if taxonomy_index == 0:
+                        # We've cycled through everything
+                        print("\nCompleted full cycle through all taxonomies!")
+                        break
+                    print(f"\nMoving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
+                sort_strategy = SORT_STRATEGIES[sort_index]
+                print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+                offset = 0
+                progress["offset"] = 0
+                progress["sort_index"] = sort_index
+                progress["taxonomy_index"] = taxonomy_index
+                save_progress(progress)
+                continue
 
             print(f"\nBatch at offset {offset} ({len(results)} listings)...")
 
