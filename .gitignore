@@ -1,0 +1,26 @@
+# Environment
+.env
+venv/
+
+# Data (too large for git)
+images/
+images_test/
+image_metadata.json
+image_metadata_test.json
+sync_progress.json
+sync_progress_test.json
+etsy_taxonomy.json
+
+# Dev/experimental
+dev/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
