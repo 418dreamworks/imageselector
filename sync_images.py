@@ -47,6 +47,16 @@ IMAGES_DIR.mkdir(exist_ok=True)
 DAILY_LIMIT = 90000  # Leave 10k buffer for development
 API_DELAY = 0.011    # ~95 requests/second for sync (leave room for dev at 5 QPS)
 CDN_DELAY = 0.05     # Throttle image downloads
+MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
+
+# Different sort strategies to get broader coverage of listings
+SORT_STRATEGIES = [
+    {"sort_on": "created", "sort_order": "desc"},  # Newest first
+    {"sort_on": "created", "sort_order": "asc"},   # Oldest first
+    {"sort_on": "price", "sort_order": "asc"},     # Cheapest first
+    {"sort_on": "price", "sort_order": "desc"},    # Most expensive first
+    {"sort_on": "score", "sort_order": "desc"},    # Default relevance
+]
 
 
 def load_metadata() -> dict:
@@ -73,7 +83,7 @@ def load_progress() -> dict:
     if PROGRESS_FILE.exists():
         with open(PROGRESS_FILE) as f:
             return json.load(f)
-    return {"offset": 0, "api_calls_today": 0, "last_reset": time.time()}
+    return {"offset": 0, "api_calls_today": 0, "last_reset": time.time(), "sort_index": 0}
 
 
 def save_progress(progress: dict):
@@ -208,10 +218,15 @@ def sync_full_taxonomy(limit: int = 0):
     success_count = sum(1 for v in metadata.values() if isinstance(v, int))
     error_count = len(metadata) - success_count
 
+    # Get current sort strategy
+    sort_index = progress.get("sort_index", 0) % len(SORT_STRATEGIES)
+    sort_strategy = SORT_STRATEGIES[sort_index]
+
     print(f"Existing images in corpus: {success_count}")
     print(f"Existing errors logged: {error_count}")
     print(f"API calls used today: {progress['api_calls_today']}")
     print(f"Starting from offset: {progress['offset']}")
+    print(f"Sort strategy: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
 
     stats = {
         "skipped": 0,
@@ -245,6 +260,7 @@ def sync_full_taxonomy(limit: int = 0):
                     "taxonomy_id": TAXONOMY_ID,
                     "limit": batch_size,
                     "offset": offset,
+                    **sort_strategy,
                 },
             )
             progress["api_calls_today"] += 1
@@ -252,6 +268,18 @@ def sync_full_taxonomy(limit: int = 0):
             if response.status_code == 429:
                 print("Rate limited. Waiting 60 seconds...")
                 time.sleep(60)
+                continue
+
+            if response.status_code == 400 and offset >= MAX_OFFSET:
+                # Etsy API doesn't allow offset > 10000, rotate to next sort strategy
+                sort_index = (sort_index + 1) % len(SORT_STRATEGIES)
+                sort_strategy = SORT_STRATEGIES[sort_index]
+                print(f"\nReached Etsy's offset limit ({MAX_OFFSET}).")
+                print(f"Switching to sort strategy: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+                offset = 0
+                progress["offset"] = 0
+                progress["sort_index"] = sort_index
+                save_progress(progress)
                 continue
 
             response.raise_for_status()
@@ -328,10 +356,9 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"  Next offset: {progress['offset']}")
     print(f"  Images stored in: {IMAGES_DIR}")
 
-    if progress["offset"] > 0:
-        remaining = 535000 - progress["offset"]
-        days_needed = remaining // DAILY_LIMIT + 1
-        print(f"\n  ~{days_needed} more days to complete full sync.")
+    # Note: Etsy API limits offset to 10000, so we cycle through
+    # the same ~10000 listings but metadata prevents re-downloads.
+    # Over time, as listings change, we'll capture different ones.
 
 
 def get_image_path(listing_id: int) -> Path | None:
