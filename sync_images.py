@@ -101,16 +101,22 @@ SORT_STRATEGIES = [
 
 
 def load_metadata() -> dict:
-    """Load existing metadata mapping listing_id -> listing_image_id or error string.
+    """Load existing metadata mapping listing_id -> metadata dict or error string.
 
     Values are either:
-    - int: listing_image_id (successful download)
-    - str starting with "error:": error reason (e.g., "error:404", "error:no_images")
+    - dict: {"image_id": int, "shop_id": int} for successful download
+    - int: legacy format (just image_id) - still treated as success
+    - str: error reason (e.g., "404", "no_images", "cdn_error")
     """
     if METADATA_FILE.exists():
         with open(METADATA_FILE) as f:
             return json.load(f)
     return {}
+
+
+def is_success(value) -> bool:
+    """Check if metadata value represents a successful download."""
+    return isinstance(value, dict) or isinstance(value, int)
 
 
 def save_metadata(metadata: dict):
@@ -263,7 +269,7 @@ def sync_full_taxonomy(limit: int = 0):
         progress["last_reset"] = time.time()
 
     # Count successes vs errors in metadata
-    success_count = sum(1 for v in metadata.values() if isinstance(v, int))
+    success_count = sum(1 for v in metadata.values() if is_success(v))
     error_count = len(metadata) - success_count
 
     # Get current sort strategy and taxonomy
@@ -414,12 +420,14 @@ def sync_full_taxonomy(limit: int = 0):
                 listing_id_str = str(listing_id)
 
                 # Skip if already downloaded (don't waste API call)
-                # But retry if it was an error (string value, not int image_id)
+                # But retry if it was an error (string value, not dict/int)
                 existing = metadata.get(listing_id_str)
-                if existing is not None and isinstance(existing, int):
+                if existing is not None and is_success(existing):
                     stats["skipped"] += 1
                     stats["processed"] += 1
                     continue
+
+                shop_id = listing.get("shop_id")
 
                 # Get image info
                 time.sleep(API_DELAY)
@@ -435,7 +443,7 @@ def sync_full_taxonomy(limit: int = 0):
                 # Download image
                 time.sleep(CDN_DELAY)
                 if download_image(client, image_url, listing_id):
-                    metadata[listing_id_str] = image_id
+                    metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
                     stats["downloaded"] += 1
                 else:
                     metadata[listing_id_str] = "cdn_error"
@@ -476,6 +484,16 @@ def get_image_path(listing_id: int) -> Path | None:
     """Get the local image path for a listing ID. Returns None if not downloaded."""
     path = IMAGES_DIR / f"{listing_id}.jpg"
     return path if path.exists() else None
+
+
+def get_unique_shop_ids() -> set[int]:
+    """Extract unique shop IDs from metadata for phase 2 crawling."""
+    metadata = load_metadata()
+    shop_ids = set()
+    for value in metadata.values():
+        if isinstance(value, dict) and "shop_id" in value:
+            shop_ids.add(value["shop_id"])
+    return shop_ids
 
 
 if __name__ == "__main__":
