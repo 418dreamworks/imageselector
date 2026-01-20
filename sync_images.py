@@ -282,6 +282,12 @@ def sync_full_taxonomy(limit: int = 0):
                 listing_id = listing["listing_id"]
                 listing_id_str = str(listing_id)
 
+                # Skip if already downloaded (don't waste API call)
+                if listing_id_str in metadata:
+                    stats["skipped"] += 1
+                    stats["processed"] += 1
+                    continue
+
                 # Get image info
                 time.sleep(API_DELAY)
                 image_id, image_url, error = get_first_image_info(client, listing_id)
@@ -290,21 +296,16 @@ def sync_full_taxonomy(limit: int = 0):
                 if error:
                     errors[listing_id_str] = error
                     stats["errors"] += 1
+                    stats["processed"] += 1
                     continue
-                existing_image_id = metadata.get(listing_id_str)
 
-                if existing_image_id == image_id:
-                    stats["skipped"] += 1
+                # Download image
+                time.sleep(CDN_DELAY)
+                if download_image(client, image_url, listing_id):
+                    metadata[listing_id_str] = image_id
+                    stats["downloaded"] += 1
                 else:
-                    time.sleep(CDN_DELAY)
-                    if download_image(client, image_url, listing_id):
-                        metadata[listing_id_str] = image_id
-                        if existing_image_id:
-                            stats["updated"] += 1
-                        else:
-                            stats["downloaded"] += 1
-                    else:
-                        stats["errors"] += 1
+                    stats["errors"] += 1
 
                 stats["processed"] += 1
 
