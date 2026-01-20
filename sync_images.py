@@ -36,12 +36,10 @@ BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
 METADATA_FILE = BASE_DIR / "image_metadata.json"
 PROGRESS_FILE = BASE_DIR / "sync_progress.json"
-ERRORS_FILE = BASE_DIR / "sync_errors.json"
 # Test folders (use --test flag)
 IMAGES_DIR_TEST = BASE_DIR / "images_test"
 METADATA_FILE_TEST = BASE_DIR / "image_metadata_test.json"
 PROGRESS_FILE_TEST = BASE_DIR / "sync_progress_test.json"
-ERRORS_FILE_TEST = BASE_DIR / "sync_errors_test.json"
 
 IMAGES_DIR.mkdir(exist_ok=True)
 
@@ -52,7 +50,12 @@ CDN_DELAY = 0.05     # Throttle image downloads
 
 
 def load_metadata() -> dict:
-    """Load existing metadata mapping listing_id -> listing_image_id."""
+    """Load existing metadata mapping listing_id -> listing_image_id or error string.
+
+    Values are either:
+    - int: listing_image_id (successful download)
+    - str starting with "error:": error reason (e.g., "error:404", "error:no_images")
+    """
     if METADATA_FILE.exists():
         with open(METADATA_FILE) as f:
             return json.load(f)
@@ -77,20 +80,6 @@ def save_progress(progress: dict):
     """Save progress for resume."""
     with open(PROGRESS_FILE, "w") as f:
         json.dump(progress, f)
-
-
-def load_errors() -> dict:
-    """Load existing errors mapping listing_id -> error reason."""
-    if ERRORS_FILE.exists():
-        with open(ERRORS_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_errors(errors: dict):
-    """Save errors to disk."""
-    with open(ERRORS_FILE, "w") as f:
-        json.dump(errors, f)
 
 
 def get_remaining_calls(client: httpx.Client) -> int:
@@ -209,15 +198,18 @@ def sync_full_taxonomy(limit: int = 0):
 
     metadata = load_metadata()
     progress = load_progress()
-    errors = load_errors()
 
     # Check if 24h has passed since last reset
     if time.time() - progress.get("last_reset", 0) > 86400:
         progress["api_calls_today"] = 0
         progress["last_reset"] = time.time()
 
-    print(f"Existing images in corpus: {len(metadata)}")
-    print(f"Existing errors logged: {len(errors)}")
+    # Count successes vs errors in metadata
+    success_count = sum(1 for v in metadata.values() if isinstance(v, int))
+    error_count = len(metadata) - success_count
+
+    print(f"Existing images in corpus: {success_count}")
+    print(f"Existing errors logged: {error_count}")
     print(f"API calls used today: {progress['api_calls_today']}")
     print(f"Starting from offset: {progress['offset']}")
 
@@ -283,7 +275,9 @@ def sync_full_taxonomy(limit: int = 0):
                 listing_id_str = str(listing_id)
 
                 # Skip if already downloaded (don't waste API call)
-                if listing_id_str in metadata:
+                # But retry if it was an error (string value, not int image_id)
+                existing = metadata.get(listing_id_str)
+                if existing is not None and isinstance(existing, int):
                     stats["skipped"] += 1
                     stats["processed"] += 1
                     continue
@@ -294,7 +288,7 @@ def sync_full_taxonomy(limit: int = 0):
                 progress["api_calls_today"] += 1
 
                 if error:
-                    errors[listing_id_str] = error
+                    metadata[listing_id_str] = error
                     stats["errors"] += 1
                     stats["processed"] += 1
                     continue
@@ -305,6 +299,7 @@ def sync_full_taxonomy(limit: int = 0):
                     metadata[listing_id_str] = image_id
                     stats["downloaded"] += 1
                 else:
+                    metadata[listing_id_str] = "cdn_error"
                     stats["errors"] += 1
 
                 stats["processed"] += 1
@@ -314,7 +309,6 @@ def sync_full_taxonomy(limit: int = 0):
             progress["offset"] = offset
             save_progress(progress)
             save_metadata(metadata)
-            save_errors(errors)
 
             print(f"  Downloaded: {stats['downloaded']} | "
                   f"Skipped: {stats['skipped']} | "
@@ -323,7 +317,6 @@ def sync_full_taxonomy(limit: int = 0):
 
     save_progress(progress)
     save_metadata(metadata)
-    save_errors(errors)
 
     print("\n" + "=" * 50)
     print("Session complete!")
@@ -360,7 +353,6 @@ if __name__ == "__main__":
         IMAGES_DIR = IMAGES_DIR_TEST
         METADATA_FILE = METADATA_FILE_TEST
         PROGRESS_FILE = PROGRESS_FILE_TEST
-        ERRORS_FILE = ERRORS_FILE_TEST
         IMAGES_DIR.mkdir(exist_ok=True)
         print("*** TEST MODE - using test folders ***\n")
 
