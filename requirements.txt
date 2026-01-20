@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+pillow
+torch
+transformers
+numpy
+httpx
+python-dotenv
+jinja2
+aiofiles
