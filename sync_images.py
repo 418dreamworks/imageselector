@@ -124,7 +124,14 @@ def load_progress() -> dict:
     if PROGRESS_FILE.exists():
         with open(PROGRESS_FILE) as f:
             return json.load(f)
-    return {"offset": 0, "api_calls_today": 0, "last_reset": time.time(), "sort_index": 0, "taxonomy_index": 0}
+    return {
+        "offset": 0,
+        "api_calls_today": 0,
+        "last_reset": time.time(),
+        "sort_index": 0,
+        "taxonomy_index": 0,
+        "exhausted": [],  # List of "taxonomy_index:sort_index" combos that are fully crawled
+    }
 
 
 def save_progress(progress: dict):
@@ -260,13 +267,44 @@ def sync_full_taxonomy(limit: int = 0):
     error_count = len(metadata) - success_count
 
     # Get current sort strategy and taxonomy
-    sort_index = progress.get("sort_index", 0) % len(SORT_STRATEGIES)
-    taxonomy_index = progress.get("taxonomy_index", 0) % len(FURNITURE_TAXONOMIES)
+    sort_index = progress.get("sort_index", 0)
+    taxonomy_index = progress.get("taxonomy_index", 0)
+    exhausted = set(progress.get("exhausted", []))
+
+    # Total possible combinations
+    total_combos = len(FURNITURE_TAXONOMIES) * len(SORT_STRATEGIES)
+
+    def combo_key(tax_idx, sort_idx):
+        return f"{tax_idx}:{sort_idx}"
+
+    def find_next_unexhausted(start_tax, start_sort):
+        """Find next taxonomy/sort combo that isn't exhausted."""
+        tax_idx = start_tax
+        sort_idx = start_sort
+        checked = 0
+        while checked < total_combos:
+            if combo_key(tax_idx, sort_idx) not in exhausted:
+                return tax_idx, sort_idx
+            # Move to next
+            sort_idx = (sort_idx + 1) % len(SORT_STRATEGIES)
+            if sort_idx == 0:
+                tax_idx = (tax_idx + 1) % len(FURNITURE_TAXONOMIES)
+            checked += 1
+        return None, None  # All exhausted
+
+    # Find first unexhausted combo
+    taxonomy_index, sort_index = find_next_unexhausted(taxonomy_index, sort_index)
+    if taxonomy_index is None:
+        print("All taxonomy/sort combinations have been exhausted!")
+        print(f"Total images in corpus: {success_count}")
+        return
+
     sort_strategy = SORT_STRATEGIES[sort_index]
     current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
 
     print(f"Existing images in corpus: {success_count}")
     print(f"Existing errors logged: {error_count}")
+    print(f"Exhausted combos: {len(exhausted)}/{total_combos}")
     print(f"API calls used today: {progress['api_calls_today']}")
     print(f"Starting from offset: {progress['offset']}")
     print(f"Taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
@@ -315,20 +353,25 @@ def sync_full_taxonomy(limit: int = 0):
                 continue
 
             if response.status_code == 400 and offset >= MAX_OFFSET:
-                # Etsy API doesn't allow offset > 10000
-                # First try next sort strategy, then next taxonomy
-                sort_index = (sort_index + 1) % len(SORT_STRATEGIES)
-                if sort_index == 0:
-                    # Exhausted all sorts for this taxonomy, move to next
-                    taxonomy_index = (taxonomy_index + 1) % len(FURNITURE_TAXONOMIES)
-                    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
-                    print(f"\nMoving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
+                # Etsy API doesn't allow offset > 10000 - mark this combo as exhausted
+                exhausted.add(combo_key(taxonomy_index, sort_index))
+                print(f"\n  Exhausted (offset limit): taxonomy {current_taxonomy}, sort {sort_strategy['sort_on']}")
+
+                # Find next unexhausted combo
+                taxonomy_index, sort_index = find_next_unexhausted(taxonomy_index, sort_index)
+                if taxonomy_index is None:
+                    print("\nAll taxonomy/sort combinations exhausted!")
+                    break
+
+                current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
                 sort_strategy = SORT_STRATEGIES[sort_index]
+                print(f"Moving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
                 print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
                 offset = 0
                 progress["offset"] = 0
                 progress["sort_index"] = sort_index
                 progress["taxonomy_index"] = taxonomy_index
+                progress["exhausted"] = list(exhausted)
                 save_progress(progress)
                 continue
 
@@ -337,22 +380,25 @@ def sync_full_taxonomy(limit: int = 0):
             results = data.get("results", [])
 
             if not results:
-                # No more listings for this taxonomy/sort combo, try next
-                sort_index = (sort_index + 1) % len(SORT_STRATEGIES)
-                if sort_index == 0:
-                    taxonomy_index = (taxonomy_index + 1) % len(FURNITURE_TAXONOMIES)
-                    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
-                    if taxonomy_index == 0:
-                        # We've cycled through everything
-                        print("\nCompleted full cycle through all taxonomies!")
-                        break
-                    print(f"\nMoving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
+                # No more listings for this taxonomy/sort combo - mark as exhausted
+                exhausted.add(combo_key(taxonomy_index, sort_index))
+                print(f"\n  Exhausted (no more results): taxonomy {current_taxonomy}, sort {sort_strategy['sort_on']}")
+
+                # Find next unexhausted combo
+                taxonomy_index, sort_index = find_next_unexhausted(taxonomy_index, sort_index)
+                if taxonomy_index is None:
+                    print("\nAll taxonomy/sort combinations exhausted!")
+                    break
+
+                current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
                 sort_strategy = SORT_STRATEGIES[sort_index]
+                print(f"Moving to taxonomy: {current_taxonomy} ({taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)})")
                 print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
                 offset = 0
                 progress["offset"] = 0
                 progress["sort_index"] = sort_index
                 progress["taxonomy_index"] = taxonomy_index
+                progress["exhausted"] = list(exhausted)
                 save_progress(progress)
                 continue
 
