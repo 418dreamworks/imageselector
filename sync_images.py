@@ -783,6 +783,11 @@ def sync_full_taxonomy(limit: int = 0):
                 save_metadata(metadata)
                 return True  # Still work to do
 
+            # Skip if shop_id was already filled in by a previous shop sync
+            if entry.get("shop_id") is not None:
+                fixed_count += 1
+                continue
+
             listing_id = int(listing_id_str)
 
             # Get listing details to find shop_id
