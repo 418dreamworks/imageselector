@@ -95,7 +95,7 @@ IMAGES_DIR.mkdir(exist_ok=True)
 # Rate limiting
 DAILY_LIMIT = 90000  # Leave 10k buffer for development
 API_DELAY = 0.011    # ~95 requests/second for sync (leave room for dev at 5 QPS)
-CDN_DELAY = 0.05     # Throttle image downloads
+CDN_RATE_LIMIT = 10  # Max image downloads per second across all workers
 MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
 
 # All furniture taxonomy IDs (parent + leaf) for filtering shop listings
@@ -241,6 +241,30 @@ def download_image(client: httpx.Client, url: str, listing_id: int) -> bool:
 # =============================================================================
 # This allows API calls to continue while images download in background threads
 
+class RateLimiter:
+    """Thread-safe rate limiter using token bucket algorithm."""
+
+    def __init__(self, rate: float):
+        """Initialize rate limiter.
+
+        Args:
+            rate: Maximum operations per second
+        """
+        self.rate = rate
+        self.min_interval = 1.0 / rate
+        self.lock = threading.Lock()
+        self.last_time = 0.0
+
+    def acquire(self):
+        """Block until we can proceed without exceeding rate limit."""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_time
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_time = time.time()
+
+
 class ImageDownloadQueue:
     """Background queue for downloading images without blocking API calls.
 
@@ -250,7 +274,8 @@ class ImageDownloadQueue:
     metadata - no need for separate queue tracking.
     """
 
-    def __init__(self, num_workers: int = 4, metadata: dict = None, metadata_lock: threading.Lock = None):
+    def __init__(self, num_workers: int = 4, metadata: dict = None, metadata_lock: threading.Lock = None,
+                 rate_limit: float = CDN_RATE_LIMIT):
         self.queue = queue.Queue()
         self.workers = []
         self.num_workers = num_workers
@@ -259,6 +284,7 @@ class ImageDownloadQueue:
         self.stats = {"downloaded": 0, "errors": 0}
         self.stats_lock = threading.Lock()
         self.running = True
+        self.rate_limiter = RateLimiter(rate_limit)  # Shared across all workers
 
     def start(self):
         """Start worker threads."""
@@ -284,7 +310,7 @@ class ImageDownloadQueue:
                     listing_id, image_url = job
                     listing_id_str = str(listing_id)
 
-                    time.sleep(CDN_DELAY)  # Rate limit CDN
+                    self.rate_limiter.acquire()  # Shared rate limit across all workers
                     success = download_image(client, image_url, listing_id)
 
                     with self.stats_lock:
@@ -446,8 +472,8 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             stats["downloaded"] += 1
             downloaded_this_shop += 1
         else:
-            # Sync: download immediately
-            time.sleep(CDN_DELAY)
+            # Sync: download immediately (rare - only used when no queue provided)
+            time.sleep(1.0 / CDN_RATE_LIMIT)
             if download_image(client, image_url, listing_id):
                 metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
                 stats["downloaded"] += 1
@@ -507,7 +533,7 @@ def sync_from_list(listing_ids: list[int]):
 
             image_id, image_url = image_info
 
-            time.sleep(CDN_DELAY)
+            time.sleep(1.0 / CDN_RATE_LIMIT)
             if download_image(client, image_url, listing_id):
                 metadata[str(listing_id)] = image_id
                 stats["downloaded"] += 1
