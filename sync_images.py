@@ -449,6 +449,11 @@ def sync_full_taxonomy(limit: int = 0):
     Algorithm:
     (A) Every 10 days, clear synced_shops to re-check for new listings
 
+    AT STARTUP (before crawling):
+      (B)/(C) Fix existing data first:
+        - For any listing without shop_id, get the shop
+        - For any shop not in synced_shops, sync all its furniture listings
+
     For each leaf taxonomy:
       (D1) Crawl listings with sort=relevance until 10k offset or exhausted
       (D2) Reset offset, crawl with sort=created_desc until 10k or exhausted
@@ -456,8 +461,8 @@ def sync_full_taxonomy(limit: int = 0):
       (D4) Reset offset, crawl with sort=price_desc until 10k or exhausted
       (D5) Reset offset, crawl with sort=price_asc until 10k or exhausted
       (B)/(C) After all sorts exhausted for this leaf:
-        - For any listing without shop_id, get the shop
-        - For any shop not in synced_shops, sync all its furniture listings
+        - Fix any new listings missing shop_id
+        - Sync any new unsynced shops
       Move to next leaf
 
     When syncing a shop, only include furniture listings (taxonomy in FURNITURE_TAXONOMY_IDS).
@@ -651,6 +656,16 @@ def sync_full_taxonomy(limit: int = 0):
 
         # Track the last taxonomy we completed (B)/(C) for
         last_fixed_taxonomy = progress.get("last_fixed_taxonomy", -1)
+
+        # =========================================================
+        # (B)/(C) AT STARTUP: Fix existing data before crawling
+        # =========================================================
+        print("\n(B)/(C) Startup - fixing existing data...")
+        still_fixing = run_fix_existing_data(client, metadata, progress)
+        if still_fixing:
+            # Hit daily limit while fixing - stop and resume tomorrow
+            print("Daily limit hit during startup fix. Run again tomorrow.")
+            return
 
         while True:
             # Check listing limit
