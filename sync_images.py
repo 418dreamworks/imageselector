@@ -247,7 +247,8 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
     """
     stats = {"downloaded": 0, "skipped": 0, "errors": 0, "api_calls": 0}
 
-    # Fetch all active listings from this shop
+    # First pass: collect all furniture listings from this shop
+    all_furniture_listings = []
     offset = 0
     batch_size = 100
 
@@ -265,7 +266,6 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
         stats["api_calls"] += 1
 
         if response.status_code == 404:
-            # Shop not found or no listings
             break
         if response.status_code == 429:
             time.sleep(60)
@@ -278,48 +278,64 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             break
 
         for listing in listings:
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                break
-
-            listing_id = listing["listing_id"]
-            listing_id_str = str(listing_id)
             taxonomy_id = listing.get("taxonomy_id")
-
-            # Only process furniture listings
-            if taxonomy_id not in FURNITURE_TAXONOMY_IDS:
-                continue
-
-            existing = metadata.get(listing_id_str)
-
-            if existing is not None and is_success(existing):
-                # Already have this one, but update shop_id if missing
-                if needs_shop_id(existing):
-                    existing["shop_id"] = shop_id
-                stats["skipped"] += 1
-                continue
-
-            # Need to download this listing's image
-            time.sleep(API_DELAY)
-            image_id, image_url, error = get_first_image_info(client, listing_id)
-            progress["api_calls_today"] += 1
-            stats["api_calls"] += 1
-
-            if error:
-                metadata[listing_id_str] = error
-                stats["errors"] += 1
-                continue
-
-            time.sleep(CDN_DELAY)
-            if download_image(client, image_url, listing_id):
-                metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
-                stats["downloaded"] += 1
-            else:
-                metadata[listing_id_str] = "cdn_error"
-                stats["errors"] += 1
+            if taxonomy_id in FURNITURE_TAXONOMY_IDS:
+                all_furniture_listings.append(listing)
 
         offset += batch_size
-        if offset >= 10000:  # Safety limit
+        if offset >= 10000:
             break
+
+    # Count how many we already have vs need
+    already_have = 0
+    need_download = 0
+    for listing in all_furniture_listings:
+        listing_id_str = str(listing["listing_id"])
+        existing = metadata.get(listing_id_str)
+        if existing is not None and is_success(existing):
+            already_have += 1
+        else:
+            need_download += 1
+
+    if all_furniture_listings:
+        print(f"      Shop {shop_id}: {len(all_furniture_listings)} furniture listings "
+              f"({already_have} have, {need_download} need)")
+
+    # Second pass: download missing images
+    for listing in all_furniture_listings:
+        if progress["api_calls_today"] >= DAILY_LIMIT:
+            break
+
+        listing_id = listing["listing_id"]
+        listing_id_str = str(listing_id)
+
+        existing = metadata.get(listing_id_str)
+
+        if existing is not None and is_success(existing):
+            # Already have this one, but update shop_id if missing
+            if needs_shop_id(existing):
+                existing["shop_id"] = shop_id
+            stats["skipped"] += 1
+            continue
+
+        # Need to download this listing's image
+        time.sleep(API_DELAY)
+        image_id, image_url, error = get_first_image_info(client, listing_id)
+        progress["api_calls_today"] += 1
+        stats["api_calls"] += 1
+
+        if error:
+            metadata[listing_id_str] = error
+            stats["errors"] += 1
+            continue
+
+        time.sleep(CDN_DELAY)
+        if download_image(client, image_url, listing_id):
+            metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+            stats["downloaded"] += 1
+        else:
+            metadata[listing_id_str] = "cdn_error"
+            stats["errors"] += 1
 
     return stats
 
