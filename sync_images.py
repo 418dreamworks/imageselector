@@ -24,7 +24,13 @@ import httpx
 import threading
 import queue
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
+
+
+def ts():
+    """Return timestamp string for logging."""
+    return datetime.now().strftime("%H:%M:%S")
 
 load_dotenv()
 
@@ -539,7 +545,7 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             need_download += 1
 
     if all_furniture_listings:
-        print(f"      Shop {shop_id}: {len(all_furniture_listings)} furniture listings "
+        print(f"[{ts()}]   Shop {shop_id}: {len(all_furniture_listings)} furniture listings "
               f"({already_have} have, {need_download} need)")
 
     # Second pass: download missing images
@@ -825,7 +831,7 @@ def sync_full_taxonomy(limit: int = 0):
                             1 for lid, v in metadata.items()
                             if isinstance(v, dict) and v.get("shop_id") is None
                         )
-                        print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
+                        print(f"[{ts()}] Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
                         shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
                         # Note: "complete" is based on queued, not actually downloaded yet
                         # We mark synced optimistically - metadata updates happen async
@@ -834,7 +840,7 @@ def sync_full_taxonomy(limit: int = 0):
                             shops_synced += 1
                             progress["synced_shops"] = list(synced_shops)
                         if shop_stats["downloaded"] > 0:
-                            print(f"      +{shop_stats['downloaded']} queued from shop")
+                            print(f"[{ts()}]   +{shop_stats['downloaded']} queued from shop")
                             if not shop_stats.get("complete", False):
                                 print(f"      (incomplete - will resume next run)")
                         save_progress(progress)
@@ -859,16 +865,16 @@ def sync_full_taxonomy(limit: int = 0):
                 1 for lid, v in metadata.items()
                 if isinstance(v, dict) and v.get("shop_id") is None
             )
-            print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
+            print(f"[{ts()}] Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
             shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
             if shop_stats.get("complete", False):
                 synced_shops.add(shop_id)
                 shops_synced += 1
                 progress["synced_shops"] = list(synced_shops)
             if shop_stats["downloaded"] > 0:
-                print(f"      +{shop_stats['downloaded']} queued from shop")
+                print(f"[{ts()}]   +{shop_stats['downloaded']} queued from shop")
                 if not shop_stats.get("complete", False):
-                    print(f"      (incomplete - will resume next run)")
+                    print(f"[{ts()}]   (incomplete - will resume next run)")
             save_progress(progress)
             with metadata_lock:
                 save_metadata(metadata)
@@ -1063,14 +1069,14 @@ def sync_full_taxonomy(limit: int = 0):
                     break
                 if shop_id in synced_shops:
                     continue
-                print(f"  (C) Syncing shop {shop_id}...")
+                print(f"[{ts()}] (C) Syncing shop {shop_id}...")
                 shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
                 if shop_stats.get("complete", False):
                     synced_shops.add(shop_id)
                 if shop_stats["downloaded"] > 0 or shop_stats["errors"] > 0:
-                    print(f"    Shop {shop_id}: +{shop_stats['downloaded']} queued, {shop_stats['errors']} errors")
+                    print(f"[{ts()}]   Shop {shop_id}: +{shop_stats['downloaded']} queued, {shop_stats['errors']} errors")
                     if not shop_stats.get("complete", False):
-                        print(f"    (incomplete - will resume next run)")
+                        print(f"[{ts()}]   (incomplete - will resume next run)")
                 stats["downloaded"] += shop_stats["downloaded"]
                 stats["errors"] += shop_stats["errors"]
                 progress["synced_shops"] = list(synced_shops)
