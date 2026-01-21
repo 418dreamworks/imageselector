@@ -271,6 +271,47 @@ def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, st
         return None, None, f"http_{e.response.status_code}"
 
 
+def get_batch_image_info(client: httpx.Client, listing_ids: list[int]) -> dict[int, tuple[int, str]]:
+    """Get first image info for multiple listings in one API call.
+
+    Uses the batch endpoint with includes=Images to fetch up to 100 listings
+    with their images in a single request.
+
+    Args:
+        listing_ids: List of listing IDs (max 100)
+
+    Returns:
+        Dict mapping listing_id -> (image_id, url) for listings that have images.
+        Listings without images or with errors are omitted from the result.
+    """
+    if not listing_ids:
+        return {}
+
+    # Batch endpoint accepts comma-separated IDs
+    ids_param = ",".join(str(lid) for lid in listing_ids)
+
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/listings/batch",
+            headers={"x-api-key": ETSY_API_KEY},
+            params={"listing_ids": ids_param, "includes": "Images"},
+        )
+        response.raise_for_status()
+
+        results = {}
+        for listing in response.json().get("results", []):
+            lid = listing.get("listing_id")
+            images = listing.get("images", [])
+            if images:
+                first = images[0]
+                results[lid] = (first["listing_image_id"], first["url_170x135"])
+
+        return results
+    except httpx.HTTPStatusError as e:
+        print(f"  Error in batch image fetch: {e.response.status_code}")
+        return {}
+
+
 def create_white_placeholder(filepath: Path) -> int:
     """Create a minimal white JPEG placeholder image.
 
@@ -548,15 +589,11 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
         print(f"[{ts()}]   Shop {shop_id}: {len(all_furniture_listings)} furniture listings "
               f"({already_have} have, {need_download} need)")
 
-    # Second pass: download missing images
-    downloaded_this_shop = 0
+    # Second pass: collect listings that need images, then batch fetch
+    listings_needing_images = []
     for listing in all_furniture_listings:
-        if progress["api_calls_today"] >= DAILY_LIMIT:
-            break
-
         listing_id = listing["listing_id"]
         listing_id_str = str(listing_id)
-
         existing = metadata.get(listing_id_str)
 
         if existing is not None and is_success(existing, listing_id):
@@ -564,40 +601,49 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             if needs_shop_id(existing):
                 existing["shop_id"] = shop_id
             stats["skipped"] += 1
-            continue
+        else:
+            listings_needing_images.append(listing_id)
 
-        # Need to download this listing's image
+    # Batch fetch images (up to 100 at a time)
+    downloaded_this_shop = 0
+    BATCH_SIZE = 100
+
+    for i in range(0, len(listings_needing_images), BATCH_SIZE):
+        if progress["api_calls_today"] >= DAILY_LIMIT:
+            break
+
+        batch = listings_needing_images[i:i + BATCH_SIZE]
+
         time.sleep(API_DELAY)
-        image_id, image_url, error = get_first_image_info(client, listing_id)
+        image_info = get_batch_image_info(client, batch)
         progress["api_calls_today"] += 1
         stats["api_calls"] += 1
 
-        if error:
-            metadata[listing_id_str] = error
-            stats["errors"] += 1
-            continue
+        # Process results
+        for listing_id in batch:
+            listing_id_str = str(listing_id)
 
-        if download_queue is not None:
-            # Async: queue the download
-            download_queue.add(listing_id, image_url, image_id, shop_id)
-            stats["downloaded"] += 1
-            downloaded_this_shop += 1
-        else:
-            # Sync: download immediately (rare - only used when no queue provided)
-            time.sleep(1.0 / CDN_RATE_LIMIT)
-            if download_image(client, image_url, listing_id):
-                metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
-                stats["downloaded"] += 1
-                downloaded_this_shop += 1
-                # Show progress and save every 50 downloads
-                if downloaded_this_shop % 10 == 0:
-                    remaining = need_download - downloaded_this_shop
-                    print(f"        [{downloaded_this_shop}/{need_download}] downloaded, {remaining} remaining")
-                if downloaded_this_shop % 50 == 0:
-                    save_metadata(metadata)
-                    save_progress(progress)
+            if listing_id in image_info:
+                image_id, image_url = image_info[listing_id]
+
+                if download_queue is not None:
+                    # Async: queue the download
+                    download_queue.add(listing_id, image_url, image_id, shop_id)
+                    stats["downloaded"] += 1
+                    downloaded_this_shop += 1
+                else:
+                    # Sync: download immediately (rare - only used when no queue provided)
+                    time.sleep(1.0 / CDN_RATE_LIMIT)
+                    if download_image(client, image_url, listing_id):
+                        metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+                        stats["downloaded"] += 1
+                        downloaded_this_shop += 1
+                    else:
+                        metadata[listing_id_str] = "cdn_error"
+                        stats["errors"] += 1
             else:
-                metadata[listing_id_str] = "cdn_error"
+                # No image found for this listing
+                metadata[listing_id_str] = "no_images"
                 stats["errors"] += 1
 
     # Mark whether this shop was fully synced
