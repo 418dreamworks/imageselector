@@ -19,7 +19,10 @@ import os
 import sys
 import json
 import time
+import signal
 import httpx
+import threading
+import queue
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -102,6 +105,22 @@ FURNITURE_TAXONOMY_IDS = {
     989, 990, 12369, 12370, 991, 992, 993, 12371, 12372, 994, 11355, 11356, 998,
     996, 12468, 12216, 997, 999, 1000, 1001, 12408
 }
+
+# Global reference for signal handler cleanup
+_active_download_queue = None
+
+
+def _signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully - shutdown download workers."""
+    print("\n\nInterrupted! Shutting down download workers...")
+    if _active_download_queue is not None:
+        _active_download_queue.shutdown()
+    sys.exit(0)
+
+
+# Register signal handler for graceful shutdown
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 def load_metadata() -> dict:
@@ -217,8 +236,122 @@ def download_image(client: httpx.Client, url: str, listing_id: int) -> bool:
         return False
 
 
-def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progress: dict) -> dict:
+# =============================================================================
+# ASYNC IMAGE DOWNLOAD QUEUE
+# =============================================================================
+# This allows API calls to continue while images download in background threads
+
+class ImageDownloadQueue:
+    """Background queue for downloading images without blocking API calls.
+
+    When add() is called, metadata is immediately set to a placeholder dict with
+    image_id and shop_id. The worker then downloads the image. If download fails,
+    metadata is updated to "cdn_error". This means skip checks can just look at
+    metadata - no need for separate queue tracking.
+    """
+
+    def __init__(self, num_workers: int = 4, metadata: dict = None, metadata_lock: threading.Lock = None):
+        self.queue = queue.Queue()
+        self.workers = []
+        self.num_workers = num_workers
+        self.metadata = metadata
+        self.metadata_lock = metadata_lock
+        self.stats = {"downloaded": 0, "errors": 0}
+        self.stats_lock = threading.Lock()
+        self.running = True
+
+    def start(self):
+        """Start worker threads."""
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self.workers.append(t)
+
+    def _worker(self):
+        """Worker thread that processes download jobs."""
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            was_empty = True  # Start assuming empty, so first check uses long timeout
+            while self.running:
+                try:
+                    # If queue was empty last time, wait longer before checking again
+                    timeout = 10.0 if was_empty else 0.1
+                    job = self.queue.get(timeout=timeout)
+                    was_empty = False  # Got a job, so queue wasn't empty
+
+                    if job is None:  # Shutdown signal
+                        break
+
+                    listing_id, image_url = job
+                    listing_id_str = str(listing_id)
+
+                    time.sleep(CDN_DELAY)  # Rate limit CDN
+                    success = download_image(client, image_url, listing_id)
+
+                    with self.stats_lock:
+                        if success:
+                            self.stats["downloaded"] += 1
+                            # Print progress every 1000 downloads
+                            if self.stats["downloaded"] % 1000 == 0:
+                                pending = self.queue.qsize()
+                                print(f"    [Download workers] {self.stats['downloaded']:,} downloaded, {pending:,} pending")
+                        else:
+                            self.stats["errors"] += 1
+                            # Update metadata to error on failure
+                            if self.metadata is not None and self.metadata_lock is not None:
+                                with self.metadata_lock:
+                                    self.metadata[listing_id_str] = "cdn_error"
+
+                    self.queue.task_done()
+                except queue.Empty:
+                    was_empty = True  # Queue is empty, wait longer next time
+                    continue
+
+    def add(self, listing_id: int, image_url: str, image_id: int, shop_id: int):
+        """Add a download job to the queue.
+
+        Immediately sets metadata to the final value (placeholder with image_id/shop_id).
+        Worker just downloads the image file. On failure, metadata is updated to error.
+        """
+        listing_id_str = str(listing_id)
+        # Set metadata immediately - this is the "placeholder" that makes the listing
+        # appear as already processed to skip checks
+        if self.metadata is not None and self.metadata_lock is not None:
+            with self.metadata_lock:
+                self.metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+        self.queue.put((listing_id, image_url))
+
+    def pending(self) -> int:
+        """Return number of pending downloads."""
+        return self.queue.qsize()
+
+    def get_stats(self) -> dict:
+        """Get current download stats."""
+        with self.stats_lock:
+            return dict(self.stats)
+
+    def wait_for_completion(self):
+        """Wait for all pending downloads to complete."""
+        self.queue.join()
+
+    def shutdown(self):
+        """Shutdown all worker threads."""
+        self.running = False
+        # Send shutdown signals
+        for _ in self.workers:
+            self.queue.put(None)
+        # Wait for workers to finish
+        for t in self.workers:
+            t.join(timeout=5.0)
+
+
+def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progress: dict,
+                       download_queue: ImageDownloadQueue = None, metadata_lock: threading.Lock = None) -> dict:
     """Fetch all furniture listings from a shop and download missing images.
+
+    Args:
+        download_queue: Optional async download queue. If provided, downloads are queued
+                       instead of being done synchronously.
+        metadata_lock: Required if download_queue is provided.
 
     Returns stats dict with downloaded/skipped/errors counts.
     """
@@ -263,7 +396,7 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
         if offset >= 10000:
             break
 
-    # Count how many we already have vs need
+    # Count how many we already have vs need (include queued as "have")
     already_have = 0
     need_download = 0
     for listing in all_furniture_listings:
@@ -307,21 +440,28 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             stats["errors"] += 1
             continue
 
-        time.sleep(CDN_DELAY)
-        if download_image(client, image_url, listing_id):
-            metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+        if download_queue is not None:
+            # Async: queue the download
+            download_queue.add(listing_id, image_url, image_id, shop_id)
             stats["downloaded"] += 1
             downloaded_this_shop += 1
-            # Show progress and save every 50 downloads
-            if downloaded_this_shop % 10 == 0:
-                remaining = need_download - downloaded_this_shop
-                print(f"        [{downloaded_this_shop}/{need_download}] downloaded, {remaining} remaining")
-            if downloaded_this_shop % 50 == 0:
-                save_metadata(metadata)
-                save_progress(progress)
         else:
-            metadata[listing_id_str] = "cdn_error"
-            stats["errors"] += 1
+            # Sync: download immediately
+            time.sleep(CDN_DELAY)
+            if download_image(client, image_url, listing_id):
+                metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+                stats["downloaded"] += 1
+                downloaded_this_shop += 1
+                # Show progress and save every 50 downloads
+                if downloaded_this_shop % 10 == 0:
+                    remaining = need_download - downloaded_this_shop
+                    print(f"        [{downloaded_this_shop}/{need_download}] downloaded, {remaining} remaining")
+                if downloaded_this_shop % 50 == 0:
+                    save_metadata(metadata)
+                    save_progress(progress)
+            else:
+                metadata[listing_id_str] = "cdn_error"
+                stats["errors"] += 1
 
     # Mark whether this shop was fully synced
     stats["complete"] = (downloaded_this_shop + already_have >= len(all_furniture_listings))
@@ -438,6 +578,15 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"Crawl units: {len(CRAWL_UNITS)}")
     print(f"API calls today: {progress['api_calls_today']}")
 
+    # Create thread-safe metadata access and download queue early
+    # so it can be used by both startup fix and main crawl
+    global _active_download_queue
+    metadata_lock = threading.Lock()
+    download_queue = ImageDownloadQueue(num_workers=4, metadata=metadata, metadata_lock=metadata_lock)
+    download_queue.start()
+    _active_download_queue = download_queue  # For signal handler cleanup
+    print(f"Started {download_queue.num_workers} background download workers")
+
     def run_fix_existing_data(client, metadata, progress):
         """(B) and (C): Fix existing data - get shop_id for all listings, sync all shops.
 
@@ -514,17 +663,20 @@ def sync_full_taxonomy(limit: int = 0):
                             if isinstance(v, dict) and v.get("shop_id") is None
                         )
                         print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
-                        shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
+                        shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
+                        # Note: "complete" is based on queued, not actually downloaded yet
+                        # We mark synced optimistically - metadata updates happen async
                         if shop_stats.get("complete", False):
                             synced_shops.add(shop_id)
                             shops_synced += 1
                             progress["synced_shops"] = list(synced_shops)
                         if shop_stats["downloaded"] > 0:
-                            print(f"      +{shop_stats['downloaded']} images from shop")
+                            print(f"      +{shop_stats['downloaded']} queued from shop")
                             if not shop_stats.get("complete", False):
                                 print(f"      (incomplete - will resume next run)")
                         save_progress(progress)
-                        save_metadata(metadata)
+                        with metadata_lock:
+                            save_metadata(metadata)
 
             except Exception as e:
                 print(f"    Error getting listing {listing_id}: {e}")
@@ -545,21 +697,23 @@ def sync_full_taxonomy(limit: int = 0):
                 if isinstance(v, dict) and v.get("shop_id") is None
             )
             print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
-            shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
+            shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
             if shop_stats.get("complete", False):
                 synced_shops.add(shop_id)
                 shops_synced += 1
                 progress["synced_shops"] = list(synced_shops)
             if shop_stats["downloaded"] > 0:
-                print(f"      +{shop_stats['downloaded']} images from shop")
+                print(f"      +{shop_stats['downloaded']} queued from shop")
                 if not shop_stats.get("complete", False):
                     print(f"      (incomplete - will resume next run)")
             save_progress(progress)
-            save_metadata(metadata)
+            with metadata_lock:
+                save_metadata(metadata)
 
         print(f"\n(B)/(C) Complete: {fixed_count} listings fixed, {shops_synced} shops synced")
         save_progress(progress)
-        save_metadata(metadata)
+        with metadata_lock:
+            save_metadata(metadata)
         return False  # All done
 
     # =========================================================================
@@ -575,6 +729,7 @@ def sync_full_taxonomy(limit: int = 0):
     if crawl_unit_index >= len(CRAWL_UNITS):
         print("All crawl units have been exhausted!")
         print(f"Total images in corpus: {success_count}")
+        download_queue.shutdown()
         return
 
     stats = {
@@ -595,6 +750,12 @@ def sync_full_taxonomy(limit: int = 0):
         still_fixing = run_fix_existing_data(client, metadata, progress)
         if still_fixing:
             print("Daily limit hit during startup fix. Run again tomorrow.")
+            # Wait for pending downloads before exiting
+            pending = download_queue.pending()
+            if pending > 0:
+                print(f"Waiting for {pending} pending downloads...")
+                download_queue.wait_for_completion()
+            download_queue.shutdown()
             return
 
         while crawl_unit_index < len(CRAWL_UNITS):
@@ -708,7 +869,7 @@ def sync_full_taxonomy(limit: int = 0):
                 if shop_id and shop_id not in synced_shops:
                     shops_to_sync.add(shop_id)
 
-                # Skip if already downloaded
+                # Skip if already in metadata (downloaded or queued - both set metadata immediately)
                 existing = metadata.get(listing_id_str)
                 if existing is not None and is_success(existing):
                     if needs_shop_id(existing) and shop_id:
@@ -728,15 +889,9 @@ def sync_full_taxonomy(limit: int = 0):
                     stats["processed"] += 1
                     continue
 
-                # Download image
-                time.sleep(CDN_DELAY)
-                if download_image(client, image_url, listing_id):
-                    metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
-                    stats["downloaded"] += 1
-                else:
-                    metadata[listing_id_str] = "cdn_error"
-                    stats["errors"] += 1
-
+                # Queue image for background download (non-blocking)
+                download_queue.add(listing_id, image_url, image_id, shop_id)
+                stats["downloaded"] += 1  # Optimistic - queue will update metadata on completion
                 stats["processed"] += 1
 
             # Sync any new shops from this batch
@@ -746,11 +901,11 @@ def sync_full_taxonomy(limit: int = 0):
                 if shop_id in synced_shops:
                     continue
                 print(f"  (C) Syncing shop {shop_id}...")
-                shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
+                shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
                 if shop_stats.get("complete", False):
                     synced_shops.add(shop_id)
                 if shop_stats["downloaded"] > 0 or shop_stats["errors"] > 0:
-                    print(f"    Shop {shop_id}: +{shop_stats['downloaded']} images, {shop_stats['errors']} errors")
+                    print(f"    Shop {shop_id}: +{shop_stats['downloaded']} queued, {shop_stats['errors']} errors")
                     if not shop_stats.get("complete", False):
                         print(f"    (incomplete - will resume next run)")
                 stats["downloaded"] += shop_stats["downloaded"]
@@ -761,22 +916,38 @@ def sync_full_taxonomy(limit: int = 0):
             offset += batch_size
             progress["offset"] = offset
             save_progress(progress)
-            save_metadata(metadata)
+            with metadata_lock:
+                save_metadata(metadata)
 
-            print(f"  Downloaded: {stats['downloaded']} | "
+            queue_stats = download_queue.get_stats()
+            print(f"  Queued: {stats['downloaded']} | "
+                  f"Downloaded: {queue_stats['downloaded']} | "
+                  f"Pending: {download_queue.pending()} | "
                   f"Skipped: {stats['skipped']} | "
-                  f"Errors: {stats['errors']} | "
                   f"Shops: {len(synced_shops)} | "
                   f"API: {progress['api_calls_today']}")
 
+    # Wait for all pending downloads to complete
+    pending = download_queue.pending()
+    if pending > 0:
+        print(f"\nWaiting for {pending} pending downloads to complete...")
+        download_queue.wait_for_completion()
+
+    # Get final stats from queue
+    queue_stats = download_queue.get_stats()
+
+    # Shutdown download workers
+    download_queue.shutdown()
+
     save_progress(progress)
-    save_metadata(metadata)
+    with metadata_lock:
+        save_metadata(metadata)
 
     print("\n" + "=" * 50)
     print("Session complete!")
-    print(f"  New downloads: {stats['downloaded']}")
+    print(f"  Images downloaded: {queue_stats['downloaded']}")
+    print(f"  Download errors: {queue_stats['errors']}")
     print(f"  Skipped (unchanged): {stats['skipped']}")
-    print(f"  Errors: {stats['errors']}")
     print(f"  API calls used: {progress['api_calls_today']}")
     print(f"  Next offset: {progress.get('offset', 0)}")
     print(f"  Images stored in: {IMAGES_DIR}")
