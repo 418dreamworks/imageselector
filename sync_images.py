@@ -180,7 +180,7 @@ def load_progress() -> dict:
         "exhausted": [],  # List of "taxonomy_index:sort_index" combos fully crawled
         "small_taxonomies": [],  # Taxonomy indices with < 10000 items (skip extra sorts)
         "synced_shops": [],  # Shop IDs that have been fully synced
-        "last_shop_refresh": 0,  # Timestamp of last shop refresh (every 10 days)
+        "last_shop_refresh": 0,  # Timestamp of last shop refresh (every 30 days)
     }
 
 
@@ -302,6 +302,7 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
               f"({already_have} have, {need_download} need)")
 
     # Second pass: download missing images
+    downloaded_this_shop = 0
     for listing in all_furniture_listings:
         if progress["api_calls_today"] >= DAILY_LIMIT:
             break
@@ -333,6 +334,11 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
         if download_image(client, image_url, listing_id):
             metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
             stats["downloaded"] += 1
+            downloaded_this_shop += 1
+            # Show progress every 10 downloads
+            if downloaded_this_shop % 10 == 0:
+                remaining = need_download - downloaded_this_shop
+                print(f"        [{downloaded_this_shop}/{need_download}] downloaded, {remaining} remaining")
         else:
             metadata[listing_id_str] = "cdn_error"
             stats["errors"] += 1
@@ -463,7 +469,7 @@ def sync_full_taxonomy(limit: int = 0):
     """Main sync loop following the specified algorithm.
 
     Algorithm:
-    (A) Every 10 days, clear synced_shops to re-check for new listings
+    (A) Every 30 days, clear synced_shops to re-check for new listings
 
     AT STARTUP (before crawling):
       (B)/(C) Fix existing data first:
@@ -498,12 +504,12 @@ def sync_full_taxonomy(limit: int = 0):
         progress["api_calls_today"] = 0
         progress["last_reset"] = time.time()
 
-    # (A) Every 10 days, re-check synced shops for new listings
-    TEN_DAYS = 10 * 24 * 60 * 60
+    # (A) Every 30 days, re-check synced shops for new listings
+    THIRTY_DAYS = 30 * 24 * 60 * 60
     last_shop_refresh = progress.get("last_shop_refresh", 0)
 
-    if time.time() - last_shop_refresh > TEN_DAYS:
-        print("(A) 10 days passed - clearing synced_shops to re-check for updates...")
+    if time.time() - last_shop_refresh > THIRTY_DAYS:
+        print("(A) 30 days passed - clearing synced_shops to re-check for updates...")
         progress["synced_shops"] = []
         progress["last_shop_refresh"] = time.time()
         save_progress(progress)

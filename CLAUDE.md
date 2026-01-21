@@ -9,7 +9,7 @@
 ## Algorithm
 
 ```
-(A) Every 10 days, clear synced_shops to re-check for new listings
+(A) Every 30 days, clear synced_shops to re-check for new listings
 
 AT STARTUP (before crawling):
   (B)/(C) Fix existing data first:
@@ -40,5 +40,5 @@ For each leaf taxonomy:
 
 - Only sync **furniture** listings (check `taxonomy_id` against `FURNITURE_TAXONOMY_IDS`)
 - `image_id` = Etsy's `listing_image_id`, useful for detecting image updates
-- `synced_shops` persists and only clears every 10 days
+- `synced_shops` persists and only clears every 30 days
 - Filename `listing_id.jpg` IS the link between image and listing
