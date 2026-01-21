@@ -446,11 +446,21 @@ def ensure_complete(client: httpx.Client, metadata: dict, progress: dict) -> dic
 def sync_full_taxonomy(limit: int = 0):
     """Main sync loop following the specified algorithm.
 
-    Algorithm (in order):
-    (A) Every 10 days, re-check synced shops for new listings
-    (B) For any listing without an image, download it
-    (C) For any listing without shop_id, get the shop, then sync all shop's furniture listings
-    (D) Only after (B) and (C) are complete, crawl new taxonomies
+    Algorithm:
+    (A) Every 10 days, clear synced_shops to re-check for new listings
+
+    For each leaf taxonomy:
+      (D1) Crawl listings with sort=relevance until 10k offset or exhausted
+      (D2) Reset offset, crawl with sort=created_desc until 10k or exhausted
+      (D3) Reset offset, crawl with sort=created_asc until 10k or exhausted
+      (D4) Reset offset, crawl with sort=price_desc until 10k or exhausted
+      (D5) Reset offset, crawl with sort=price_asc until 10k or exhausted
+      (B)/(C) After all sorts exhausted for this leaf:
+        - For any listing without shop_id, get the shop
+        - For any shop not in synced_shops, sync all its furniture listings
+      Move to next leaf
+
+    When syncing a shop, only include furniture listings (taxonomy in FURNITURE_TAXONOMY_IDS).
 
     Args:
         limit: Max listings to process (0 = no limit)
@@ -628,11 +638,18 @@ def sync_full_taxonomy(limit: int = 0):
         "processed": 0,
     }
 
+    def is_leaf_exhausted(tax_idx):
+        """Check if all sort strategies for a taxonomy have been exhausted."""
+        for s_idx in range(len(SORT_STRATEGIES)):
+            if combo_key(tax_idx, s_idx) not in exhausted:
+                return False
+        return True
+
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         offset = progress["offset"]
         batch_size = 100
 
-        # Track the last taxonomy we ran (B)/(C) for, so we only run once per leaf
+        # Track the last taxonomy we completed (B)/(C) for
         last_fixed_taxonomy = progress.get("last_fixed_taxonomy", -1)
 
         while True:
@@ -647,14 +664,11 @@ def sync_full_taxonomy(limit: int = 0):
                 break
 
             # =========================================================
-            # (B)/(C) BEFORE each new leaf: fix existing data first
+            # Display status when starting a new taxonomy
             # =========================================================
-            if taxonomy_index != last_fixed_taxonomy:
-                # Recount corpus
+            if sort_index == 0 and offset == 0:
                 success_count = sum(1 for v in metadata.values() if is_success(v))
                 error_count = len(metadata) - success_count
-
-                # Calculate exhausted combos for display
                 effective_exhausted = len(exhausted)
                 total_combos = len(FURNITURE_TAXONOMIES) * len(SORT_STRATEGIES)
                 skipped_from_small = len(small_taxonomies) * (len(SORT_STRATEGIES) - 1)
@@ -668,25 +682,12 @@ def sync_full_taxonomy(limit: int = 0):
                 print(f"Small taxonomies (< 10k): {len(small_taxonomies)}")
                 print(f"Exhausted combos: {effective_exhausted}/{total_combos - skipped_from_small}")
                 print(f"API calls today: {progress['api_calls_today']}")
-
-                # Run (B)/(C) to fix existing data before crawling this leaf
-                still_fixing = run_fix_existing_data(client, metadata, progress)
-                if still_fixing:
-                    # Hit daily limit while fixing - stop and resume tomorrow
-                    return
-
-                last_fixed_taxonomy = taxonomy_index
-                progress["last_fixed_taxonomy"] = taxonomy_index
-                save_progress(progress)
-
-                # Recount after fixing
-                success_count = sum(1 for v in metadata.values() if is_success(v))
-                print(f"After fixing: {success_count} images in corpus")
-                print(f"Starting taxonomy crawl at offset {offset}, sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+                print(f"Starting sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
 
             # Check offset limit BEFORE making request
             if offset >= MAX_OFFSET:
-                # Hit 10k limit - this is a LARGE taxonomy, try other sorts
+                # Hit 10k limit - mark this sort as exhausted
+                old_taxonomy_index = taxonomy_index
                 exhausted.add(combo_key(taxonomy_index, sort_index))
                 taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
                 print(f"\n  Exhausted (offset limit): {taxonomy_name}, sort {sort_strategy['sort_on']}")
@@ -697,13 +698,26 @@ def sync_full_taxonomy(limit: int = 0):
                     print("\nAll taxonomy/sort combinations exhausted!")
                     break
 
+                # Check if we finished all sorts for the old leaf
+                if is_leaf_exhausted(old_taxonomy_index) and old_taxonomy_index != last_fixed_taxonomy:
+                    print(f"\n(B)/(C) Leaf complete - fixing existing data...")
+                    still_fixing = run_fix_existing_data(client, metadata, progress)
+                    if still_fixing:
+                        # Save state and exit - will resume tomorrow
+                        progress["offset"] = 0
+                        progress["sort_index"] = sort_index
+                        progress["taxonomy_index"] = taxonomy_index
+                        progress["exhausted"] = list(exhausted)
+                        progress["small_taxonomies"] = list(small_taxonomies)
+                        save_progress(progress)
+                        return
+                    last_fixed_taxonomy = old_taxonomy_index
+                    progress["last_fixed_taxonomy"] = old_taxonomy_index
+
                 current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
                 sort_strategy = SORT_STRATEGIES[sort_index]
                 taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-                print(f"\n{'='*60}")
-                print(f"MOVING TO: {taxonomy_name} [{taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)}]")
-                print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
-                print(f"{'='*60}")
+                print(f"\nMOVING TO: {taxonomy_name}, sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
                 offset = 0
                 progress["offset"] = 0
                 progress["sort_index"] = sort_index
@@ -737,7 +751,8 @@ def sync_full_taxonomy(limit: int = 0):
             results = data.get("results", [])
 
             if not results:
-                # No more results - this taxonomy has < 10k items for this sort
+                # No more results - mark this sort as exhausted
+                old_taxonomy_index = taxonomy_index
                 exhausted.add(combo_key(taxonomy_index, sort_index))
                 taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
 
@@ -754,13 +769,26 @@ def sync_full_taxonomy(limit: int = 0):
                     print("\nAll taxonomy/sort combinations exhausted!")
                     break
 
+                # Check if we finished all sorts for the old leaf
+                if is_leaf_exhausted(old_taxonomy_index) and old_taxonomy_index != last_fixed_taxonomy:
+                    print(f"\n(B)/(C) Leaf complete - fixing existing data...")
+                    still_fixing = run_fix_existing_data(client, metadata, progress)
+                    if still_fixing:
+                        # Save state and exit - will resume tomorrow
+                        progress["offset"] = 0
+                        progress["sort_index"] = sort_index
+                        progress["taxonomy_index"] = taxonomy_index
+                        progress["exhausted"] = list(exhausted)
+                        progress["small_taxonomies"] = list(small_taxonomies)
+                        save_progress(progress)
+                        return
+                    last_fixed_taxonomy = old_taxonomy_index
+                    progress["last_fixed_taxonomy"] = old_taxonomy_index
+
                 current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
                 sort_strategy = SORT_STRATEGIES[sort_index]
                 taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-                print(f"\n{'='*60}")
-                print(f"MOVING TO: {taxonomy_name} [{taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)}]")
-                print(f"Sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
-                print(f"{'='*60}")
+                print(f"\nMOVING TO: {taxonomy_name}, sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
                 offset = 0
                 progress["offset"] = 0
                 progress["sort_index"] = sort_index
