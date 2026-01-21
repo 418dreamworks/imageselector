@@ -335,10 +335,13 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
             stats["downloaded"] += 1
             downloaded_this_shop += 1
-            # Show progress every 10 downloads
+            # Show progress and save every 50 downloads
             if downloaded_this_shop % 10 == 0:
                 remaining = need_download - downloaded_this_shop
                 print(f"        [{downloaded_this_shop}/{need_download}] downloaded, {remaining} remaining")
+            if downloaded_this_shop % 50 == 0:
+                save_metadata(metadata)
+                save_progress(progress)
         else:
             metadata[listing_id_str] = "cdn_error"
             stats["errors"] += 1
