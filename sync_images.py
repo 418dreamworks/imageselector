@@ -508,8 +508,9 @@ class ImageDownloadQueue:
                             _existing_images[listing_id] = filepath.stat().st_size
                             # Print progress every 1000 downloads
                             if self.stats["downloaded"] % 1000 == 0:
-                                pending = self.queue.qsize()
-                                print(f"    [Download workers] {self.stats['downloaded']:,} downloaded, {pending:,} pending")
+                                # Count actual empty files on disk for accurate pending count
+                                pending_on_disk = sum(1 for size in _existing_images.values() if size == 0)
+                                print(f"    [Download workers] {self.stats['downloaded']:,} downloaded, {pending_on_disk:,} pending")
                         else:
                             self.stats["errors"] += 1
                             # Update metadata with FAILED_IMAGE_ID marker

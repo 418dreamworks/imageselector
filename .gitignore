@@ -10,6 +10,7 @@ image_metadata_test.json
 sync_progress.json
 sync_progress_test.json
 etsy_taxonomy.json
+pending/
 
 # Dev/experimental
 dev/
