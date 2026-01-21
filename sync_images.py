@@ -346,6 +346,8 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             metadata[listing_id_str] = "cdn_error"
             stats["errors"] += 1
 
+    # Mark whether this shop was fully synced
+    stats["complete"] = (downloaded_this_shop + already_have >= len(all_furniture_listings))
     return stats
 
 
@@ -455,11 +457,12 @@ def ensure_complete(client: httpx.Client, metadata: dict, progress: dict) -> dic
                 # (C) Sync shop if not already done
                 if shop_id not in synced_shops:
                     shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
-                    synced_shops.add(shop_id)
-                    stats["shops_synced"] += 1
                     stats["downloaded"] += shop_stats["downloaded"]
                     stats["errors"] += shop_stats["errors"]
-                    progress["synced_shops"] = list(synced_shops)
+                    if shop_stats.get("complete", False):
+                        synced_shops.add(shop_id)
+                        stats["shops_synced"] += 1
+                        progress["synced_shops"] = list(synced_shops)
 
         except Exception as e:
             print(f"    Error getting listing {listing_id}: {e}")
@@ -601,11 +604,14 @@ def sync_full_taxonomy(limit: int = 0):
                     if shop_id not in synced_shops:
                         print(f"  (C) Syncing shop {shop_id}...")
                         shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
-                        synced_shops.add(shop_id)
-                        shops_synced += 1
-                        progress["synced_shops"] = list(synced_shops)
+                        if shop_stats.get("complete", False):
+                            synced_shops.add(shop_id)
+                            shops_synced += 1
+                            progress["synced_shops"] = list(synced_shops)
                         if shop_stats["downloaded"] > 0:
                             print(f"      +{shop_stats['downloaded']} images from shop")
+                            if not shop_stats.get("complete", False):
+                                print(f"      (incomplete - will resume next run)")
 
                     # Save periodically
                     if fixed_count % 100 == 0:
@@ -630,11 +636,14 @@ def sync_full_taxonomy(limit: int = 0):
 
             print(f"  (C) Syncing shop {shop_id}...")
             shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
-            synced_shops.add(shop_id)
-            shops_synced += 1
-            progress["synced_shops"] = list(synced_shops)
+            if shop_stats.get("complete", False):
+                synced_shops.add(shop_id)
+                shops_synced += 1
+                progress["synced_shops"] = list(synced_shops)
             if shop_stats["downloaded"] > 0:
                 print(f"      +{shop_stats['downloaded']} images from shop")
+                if not shop_stats.get("complete", False):
+                    print(f"      (incomplete - will resume next run)")
 
         print(f"\n(B)/(C) Complete: {fixed_count} listings fixed, {shops_synced} shops synced")
         save_progress(progress)
@@ -933,9 +942,12 @@ def sync_full_taxonomy(limit: int = 0):
                     continue
                 print(f"  (C) Syncing shop {shop_id}...")
                 shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
-                synced_shops.add(shop_id)
+                if shop_stats.get("complete", False):
+                    synced_shops.add(shop_id)
                 if shop_stats["downloaded"] > 0 or shop_stats["errors"] > 0:
                     print(f"    Shop {shop_id}: +{shop_stats['downloaded']} images, {shop_stats['errors']} errors")
+                    if not shop_stats.get("complete", False):
+                        print(f"    (incomplete - will resume next run)")
                 stats["downloaded"] += shop_stats["downloaded"]
                 stats["errors"] += shop_stats["errors"]
                 progress["synced_shops"] = list(synced_shops)
