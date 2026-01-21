@@ -1,7 +1,7 @@
 """
 Sync Etsy furniture listing images.
 
-Downloads the first image (url_170x135) for each listing.
+Downloads the first image (url_570xN) for each listing.
 Can run in two modes:
 1. Full scan: Download all furniture listings (taxonomy 967)
 2. Incremental: Download specific listing IDs from a file
@@ -98,10 +98,20 @@ PROGRESS_FILE_TEST = BASE_DIR / "sync_progress_test.json"
 
 IMAGES_DIR.mkdir(exist_ok=True)
 
-# Rate limiting
+# Rate limiting - defaults to slow mode, use --fast for initial bulk sync
 DAILY_LIMIT = 90000  # Leave 10k buffer for development
-API_DELAY = 0.011    # ~95 requests/second for sync (leave room for dev at 5 QPS)
-CDN_RATE_LIMIT = 15  # Max image downloads per second across all workers
+# Slow mode: ~400k images over 30 days = 1 every 6.5 sec
+API_DELAY_SLOW = 0.33
+CDN_RATE_LIMIT_SLOW = 0.15
+NUM_WORKERS_SLOW = 1
+# Fast mode: ~95 QPS API, 15/sec CDN (original speeds)
+API_DELAY_FAST = 0.011
+CDN_RATE_LIMIT_FAST = 15
+NUM_WORKERS_FAST = 4
+# Active settings (set by --fast/--slow flags, default slow)
+API_DELAY = API_DELAY_SLOW
+CDN_RATE_LIMIT = CDN_RATE_LIMIT_SLOW
+NUM_WORKERS = NUM_WORKERS_SLOW
 MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
 
 # All furniture taxonomy IDs (parent + leaf) for filtering shop listings
@@ -264,7 +274,7 @@ def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, st
 
         if images:
             first = images[0]
-            return first["listing_image_id"], first["url_170x135"], None
+            return first["listing_image_id"], first["url_570xN"], None
         return None, None, "no_images"
     except httpx.HTTPStatusError as e:
         print(f"  Error fetching images for {listing_id}: {e.response.status_code}")
@@ -304,7 +314,7 @@ def get_batch_image_info(client: httpx.Client, listing_ids: list[int]) -> dict[i
             images = listing.get("images", [])
             if images:
                 first = images[0]
-                results[lid] = (first["listing_image_id"], first["url_170x135"])
+                results[lid] = (first["listing_image_id"], first["url_570xN"])
 
         return results
     except httpx.HTTPStatusError as e:
@@ -850,7 +860,7 @@ def sync_full_taxonomy(limit: int = 0):
     # so it can be used by both startup fix and main crawl
     global _active_download_queue
     metadata_lock = threading.Lock()
-    download_queue = ImageDownloadQueue(num_workers=4, metadata=metadata, metadata_lock=metadata_lock)
+    download_queue = ImageDownloadQueue(num_workers=NUM_WORKERS, metadata=metadata, metadata_lock=metadata_lock)
     download_queue.start()
     _active_download_queue = download_queue  # For signal handler cleanup
     print(f"Started {download_queue.num_workers} background download workers + scanner")
@@ -1250,7 +1260,26 @@ if __name__ == "__main__":
     parser.add_argument("input_file", nargs="?", help="File with listing IDs (one per line)")
     parser.add_argument("--test", action="store_true", help="Use test folders instead of production")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of listings to process (0 = no limit)")
+    parser.add_argument("--reset-shops", action="store_true", help="Clear synced_shops list to re-sync all shops")
+    speed_group = parser.add_mutually_exclusive_group()
+    speed_group.add_argument("--fast", action="store_true", help="Fast mode: ~95 QPS API, 15/sec CDN, 4 workers (for initial bulk sync)")
+    speed_group.add_argument("--slow", action="store_true", help="Slow mode: ~400k images over 30 days (default)")
     args = parser.parse_args()
+
+    # Set speed mode (default is slow)
+    if args.fast:
+        API_DELAY = API_DELAY_FAST
+        CDN_RATE_LIMIT = CDN_RATE_LIMIT_FAST
+        NUM_WORKERS = NUM_WORKERS_FAST
+        print("*** FAST MODE - bulk sync speeds ***\n")
+
+    # Handle --reset-shops flag
+    if args.reset_shops:
+        progress = load_progress()
+        progress["synced_shops"] = []
+        progress["last_shop_refresh"] = time.time()
+        save_progress(progress)
+        print("Cleared synced_shops list. All shops will be re-synced.")
 
     # Switch to test folders if --test flag
     if args.test:
