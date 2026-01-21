@@ -590,13 +590,16 @@ class ImageDownloadQueue:
 
 
 def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progress: dict,
-                       download_queue: ImageDownloadQueue = None, metadata_lock: threading.Lock = None) -> dict:
+                       download_queue: ImageDownloadQueue = None, metadata_lock: threading.Lock = None,
+                       limit: int = 0, current_count: int = 0) -> dict:
     """Fetch all furniture listings from a shop and download missing images.
 
     Args:
         download_queue: Optional async download queue. If provided, downloads are queued
                        instead of being done synchronously.
         metadata_lock: Required if download_queue is provided.
+        limit: Max total downloads (0 = no limit). Used with current_count.
+        current_count: How many have already been downloaded this session.
 
     Returns stats dict with downloaded/skipped/errors counts.
     """
@@ -679,8 +682,15 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
     for i in range(0, len(listings_needing_images), BATCH_SIZE):
         if progress["api_calls_today"] >= DAILY_LIMIT:
             break
+        # Check global limit
+        if limit > 0 and (current_count + stats["downloaded"]) >= limit:
+            break
 
         batch = listings_needing_images[i:i + BATCH_SIZE]
+        # Trim batch if it would exceed limit
+        if limit > 0:
+            remaining = limit - (current_count + stats["downloaded"])
+            batch = batch[:remaining]
 
         time.sleep(API_DELAY)
         image_info = get_batch_image_info(client, batch)
@@ -689,6 +699,10 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
 
         # Process results
         for listing_id in batch:
+            # Check limit before each download
+            if limit > 0 and (current_count + stats["downloaded"]) >= limit:
+                break
+
             listing_id_str = str(listing_id)
 
             if listing_id in image_info:
@@ -860,7 +874,7 @@ def sync_full_taxonomy(limit: int = 0):
     # so it can be used by both startup fix and main crawl
     global _active_download_queue
     metadata_lock = threading.Lock()
-    download_queue = ImageDownloadQueue(num_workers=NUM_WORKERS, metadata=metadata, metadata_lock=metadata_lock)
+    download_queue = ImageDownloadQueue(num_workers=NUM_WORKERS, metadata=metadata, metadata_lock=metadata_lock, rate_limit=CDN_RATE_LIMIT)
     download_queue.start()
     _active_download_queue = download_queue  # For signal handler cleanup
     print(f"Started {download_queue.num_workers} background download workers + scanner")
@@ -1045,8 +1059,8 @@ def sync_full_taxonomy(limit: int = 0):
 
         while crawl_unit_index < len(CRAWL_UNITS):
             # Check limits
-            if limit > 0 and stats["processed"] >= limit:
-                print(f"\nReached listing limit ({limit}).")
+            if limit > 0 and stats["downloaded"] >= limit:
+                print(f"\nReached download limit ({limit}).")
                 break
             if progress["api_calls_today"] >= DAILY_LIMIT:
                 print(f"\nReached daily limit ({progress['api_calls_today']} calls).")
@@ -1099,11 +1113,37 @@ def sync_full_taxonomy(limit: int = 0):
                 time.sleep(60)
                 continue
 
+            # 400 error often means offset is beyond available results for this taxonomy
+            if response.status_code == 400:
+                print(f"\n  Got 400 at offset {offset} - treating as exhausted")
+                exhausted.add(crawl_unit_index)
+                print(f"\n  Exhausted: {current_unit['name']} (API 400 error)")
+
+                # Run (B)/(C) after exhausting a unit
+                print(f"\n(B)/(C) Unit complete - fixing existing data...")
+                still_fixing = run_fix_existing_data(client, metadata, progress)
+                if still_fixing:
+                    progress["offset"] = 0
+                    progress["crawl_unit_index"] = crawl_unit_index + 1
+                    progress["exhausted"] = list(exhausted)
+                    save_progress(progress)
+                    return
+
+                # Move to next unit
+                crawl_unit_index += 1
+                progress["crawl_unit_index"] = crawl_unit_index
+                progress["offset"] = 0
+                progress["exhausted"] = list(exhausted)
+                save_progress(progress)
+                continue
+
             response.raise_for_status()
             data = response.json()
             results = data.get("results", [])
+            total_count = data.get("count", 0)
 
-            if not results or offset >= MAX_OFFSET:
+            # Check if we've fetched all available results
+            if not results or offset >= MAX_OFFSET or offset + batch_size >= total_count:
                 # No more results or hit offset limit - mark this unit as exhausted
                 exhausted.add(crawl_unit_index)
                 if not results:
@@ -1143,7 +1183,7 @@ def sync_full_taxonomy(limit: int = 0):
             for listing in results:
                 if progress["api_calls_today"] >= DAILY_LIMIT:
                     break
-                if limit > 0 and stats["processed"] >= limit:
+                if limit > 0 and stats["downloaded"] >= limit:
                     break
 
                 listing_id = listing["listing_id"]
@@ -1183,10 +1223,13 @@ def sync_full_taxonomy(limit: int = 0):
             for shop_id in shops_to_sync:
                 if progress["api_calls_today"] >= DAILY_LIMIT:
                     break
+                if limit > 0 and stats["downloaded"] >= limit:
+                    break
                 if shop_id in synced_shops:
                     continue
                 print(f"[{ts()}] (C) Syncing shop {shop_id}...")
-                shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
+                shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock,
+                                                limit=limit, current_count=stats["downloaded"])
                 if shop_stats.get("complete", False):
                     synced_shops.add(shop_id)
                 if shop_stats["downloaded"] > 0 or shop_stats["errors"] > 0:
