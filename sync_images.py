@@ -101,7 +101,7 @@ IMAGES_DIR.mkdir(exist_ok=True)
 # Rate limiting
 DAILY_LIMIT = 90000  # Leave 10k buffer for development
 API_DELAY = 0.011    # ~95 requests/second for sync (leave room for dev at 5 QPS)
-CDN_RATE_LIMIT = 10  # Max image downloads per second across all workers
+CDN_RATE_LIMIT = 15  # Max image downloads per second across all workers
 MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
 
 # All furniture taxonomy IDs (parent + leaf) for filtering shop listings
