@@ -403,15 +403,16 @@ class RateLimiter:
 class ImageDownloadQueue:
     """Background queue for downloading images without blocking API calls.
 
-    When add() is called, metadata is immediately set to a placeholder dict with
-    image_id and shop_id. The worker then downloads the image. If download fails,
-    metadata is updated to "cdn_error". This means skip checks can just look at
-    metadata - no need for separate queue tracking.
+    Workers continuously scan the images/ folder for empty files (size 0) and
+    download them. The folder IS the queue - empty files are pending downloads.
+
+    When add() is called, metadata is immediately set with image_id and shop_id,
+    and an empty placeholder file is created. Workers scan for these and download.
     """
 
     def __init__(self, num_workers: int = 4, metadata: dict = None, metadata_lock: threading.Lock = None,
                  rate_limit: float = CDN_RATE_LIMIT):
-        self.queue = queue.Queue()
+        self.queue = queue.Queue()  # Still used for in-session queuing
         self.workers = []
         self.num_workers = num_workers
         self.metadata = metadata
@@ -419,25 +420,76 @@ class ImageDownloadQueue:
         self.stats = {"downloaded": 0, "errors": 0}
         self.stats_lock = threading.Lock()
         self.running = True
-        self.rate_limiter = RateLimiter(rate_limit)  # Shared across all workers
+        self.rate_limiter = RateLimiter(rate_limit)
+        self.scanner_thread = None
+        self.in_progress = set()  # Track files currently being downloaded
+        self.in_progress_lock = threading.Lock()
 
     def start(self):
-        """Start worker threads."""
+        """Start worker threads and scanner thread."""
+        # Start download workers
         for i in range(self.num_workers):
             t = threading.Thread(target=self._worker, daemon=True)
             t.start()
             self.workers.append(t)
 
+        # Start scanner thread that watches for empty files
+        self.scanner_thread = threading.Thread(target=self._scanner, daemon=True)
+        self.scanner_thread.start()
+
+    def _scanner(self):
+        """Scanner thread that finds empty files and queues them for download.
+
+        Reads URLs from metadata - no API calls needed.
+        """
+        while self.running:
+            try:
+                # Find empty files not currently being processed
+                queued = 0
+                for f in IMAGES_DIR.glob("*.jpg"):
+                    if not self.running:
+                        break
+                    try:
+                        if f.stat().st_size == 0:
+                            listing_id = int(f.stem)
+                            with self.in_progress_lock:
+                                if listing_id in self.in_progress:
+                                    continue  # Already being processed
+                                self.in_progress.add(listing_id)
+
+                            # Get URL from metadata
+                            listing_id_str = str(listing_id)
+                            if self.metadata and self.metadata_lock:
+                                with self.metadata_lock:
+                                    entry = self.metadata.get(listing_id_str, {})
+                                    image_url = entry.get("url") if isinstance(entry, dict) else None
+
+                                if image_url:
+                                    self.queue.put((listing_id, image_url))
+                                    queued += 1
+                                else:
+                                    # No URL in metadata - can't download, remove from in_progress
+                                    with self.in_progress_lock:
+                                        self.in_progress.discard(listing_id)
+                    except (ValueError, OSError):
+                        pass
+
+                if queued > 0:
+                    print(f"    [Scanner] Queued {queued} pending downloads")
+
+                # Wait before scanning again
+                time.sleep(5.0)
+
+            except Exception as e:
+                print(f"    [Scanner] Error: {e}")
+                time.sleep(10.0)
+
     def _worker(self):
         """Worker thread that processes download jobs."""
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            was_empty = True  # Start assuming empty, so first check uses long timeout
             while self.running:
                 try:
-                    # If queue was empty last time, wait longer before checking again
-                    timeout = 10.0 if was_empty else 0.1
-                    job = self.queue.get(timeout=timeout)
-                    was_empty = False  # Got a job, so queue wasn't empty
+                    job = self.queue.get(timeout=5.0)
 
                     if job is None:  # Shutdown signal
                         break
@@ -461,28 +513,29 @@ class ImageDownloadQueue:
                         else:
                             self.stats["errors"] += 1
                             # Update metadata with FAILED_IMAGE_ID marker
-                            # When re-crawling, if Etsy returns a different image_id,
-                            # the image will be re-downloaded
                             if self.metadata is not None and self.metadata_lock is not None:
                                 with self.metadata_lock:
                                     existing = self.metadata.get(listing_id_str, {})
                                     shop_id = existing.get("shop_id") if isinstance(existing, dict) else None
                                     self.metadata[listing_id_str] = {"image_id": FAILED_IMAGE_ID, "shop_id": shop_id}
                             # Create white placeholder to prevent infinite retry loop
-                            # (file with size > 0 is considered "complete")
                             filepath = IMAGES_DIR / f"{listing_id}.jpg"
                             placeholder_size = create_white_placeholder(filepath)
                             _existing_images[listing_id] = placeholder_size
 
+                    # Remove from in_progress set so scanner doesn't skip it
+                    with self.in_progress_lock:
+                        self.in_progress.discard(listing_id)
+
                     self.queue.task_done()
                 except queue.Empty:
-                    was_empty = True  # Queue is empty, wait longer next time
-                    continue
+                    continue  # No jobs, loop and try again
 
     def add(self, listing_id: int, image_url: str, image_id: int, shop_id: int):
         """Add a download job to the queue.
 
-        Creates empty placeholder file in images/ folder and sets metadata.
+        Creates empty placeholder file in images/ folder and sets metadata
+        (including URL so scanner can resume without API calls).
         Worker downloads the actual image, overwriting the placeholder.
         On restart, empty files (size 0) indicate incomplete downloads.
         """
@@ -491,53 +544,15 @@ class ImageDownloadQueue:
         filepath = IMAGES_DIR / f"{listing_id}.jpg"
         filepath.touch()
         _existing_images[listing_id] = 0  # 0 = pending
-        # Set metadata
+        # Set metadata with URL for resume capability
         if self.metadata is not None and self.metadata_lock is not None:
             with self.metadata_lock:
-                self.metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+                self.metadata[listing_id_str] = {
+                    "image_id": image_id,
+                    "shop_id": shop_id,
+                    "url": image_url  # Store URL so scanner can resume without API
+                }
         self.queue.put((listing_id, image_url))
-
-    def resume_pending(self, client: httpx.Client, existing_images: dict, metadata: dict, progress: dict):
-        """Resume downloads for empty files (pending from previous run).
-
-        Scans for size-0 files and batch-fetches their image URLs from Etsy API.
-        """
-        pending_ids = [lid for lid, size in existing_images.items() if size == 0]
-        if not pending_ids:
-            return
-
-        print(f"Resuming {len(pending_ids)} pending downloads from previous run...")
-
-        BATCH_SIZE = 100
-        queued = 0
-
-        for i in range(0, len(pending_ids), BATCH_SIZE):
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                print(f"  Hit daily limit, {len(pending_ids) - queued} still pending")
-                break
-
-            batch = pending_ids[i:i + BATCH_SIZE]
-            time.sleep(API_DELAY)
-            image_info = get_batch_image_info(client, batch)
-            progress["api_calls_today"] += 1
-
-            for listing_id in batch:
-                if listing_id in image_info:
-                    image_id, image_url = image_info[listing_id]
-                    # Get shop_id from metadata if available
-                    listing_id_str = str(listing_id)
-                    existing = metadata.get(listing_id_str, {})
-                    shop_id = existing.get("shop_id") if isinstance(existing, dict) else None
-                    # Queue download (don't re-create placeholder, already exists)
-                    self.queue.put((listing_id, image_url))
-                    queued += 1
-                else:
-                    # Listing no longer exists or has no images - delete placeholder
-                    filepath = IMAGES_DIR / f"{listing_id}.jpg"
-                    filepath.unlink(missing_ok=True)
-                    existing_images.pop(listing_id, None)
-
-        print(f"  Queued {queued} downloads for resume")
 
     def pending(self) -> int:
         """Return number of pending downloads."""
@@ -837,13 +852,9 @@ def sync_full_taxonomy(limit: int = 0):
     download_queue = ImageDownloadQueue(num_workers=4, metadata=metadata, metadata_lock=metadata_lock)
     download_queue.start()
     _active_download_queue = download_queue  # For signal handler cleanup
-    print(f"Started {download_queue.num_workers} background download workers")
-
-    # Resume pending downloads from previous run (empty files in images/)
+    print(f"Started {download_queue.num_workers} background download workers + scanner")
     if pending_count > 0:
-        with httpx.Client(timeout=30.0, follow_redirects=True) as resume_client:
-            download_queue.resume_pending(resume_client, _existing_images, metadata, progress)
-        save_progress(progress)
+        print(f"  Scanner will automatically process {pending_count} pending files")
 
     def run_fix_existing_data(client, metadata, progress):
         """(B) and (C): Fix existing data - get shop_id for all listings, sync all shops.
