@@ -148,9 +148,53 @@ def load_metadata() -> dict:
     return {}
 
 
-def is_success(value) -> bool:
-    """Check if metadata value represents a successful download."""
-    return isinstance(value, dict)
+FAILED_IMAGE_ID = 9999999999  # Marker image_id for failed downloads
+
+
+def load_existing_images() -> dict[int, int]:
+    """Load dict of listing_id -> file_size for image files on disk.
+
+    This is called once at startup for fast lookup during skip checks.
+    - size 0 = pending/incomplete download (empty placeholder)
+    - size > 0 = download complete (real image or white placeholder for failed)
+
+    To detect failed downloads that should be retried, check if metadata
+    image_id == FAILED_IMAGE_ID (9999999999). When re-crawling, if Etsy
+    returns a different image_id, the image will be re-downloaded.
+    """
+    existing = {}
+    for f in IMAGES_DIR.glob("*.jpg"):
+        try:
+            listing_id = int(f.stem)
+            existing[listing_id] = f.stat().st_size
+        except ValueError:
+            pass
+    return existing
+
+
+# Global dict - loaded once at startup, updated as downloads complete
+# Maps listing_id -> file_size (0 = pending/incomplete, >0 = complete)
+_existing_images: dict[int, int] = {}
+
+
+def is_success(value, listing_id: int = None) -> bool:
+    """Check if metadata value represents a successful download.
+
+    If listing_id is provided, also verifies:
+    1. Image file exists on disk
+    2. File is not empty (size > 0, meaning download completed)
+
+    Note: Failed downloads have image_id=9999999999 in metadata. These will
+    be retried when Etsy returns a different image_id during re-crawl.
+    """
+    if not isinstance(value, dict):
+        return False
+    if listing_id is not None:
+        # Must have image file with size > 0 (not empty placeholder)
+        file_size = _existing_images.get(listing_id, 0)
+        if file_size == 0:
+            return False
+    return True
 
 
 def needs_shop_id(value) -> bool:
@@ -219,6 +263,50 @@ def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, st
     except httpx.HTTPStatusError as e:
         print(f"  Error fetching images for {listing_id}: {e.response.status_code}")
         return None, None, f"http_{e.response.status_code}"
+
+
+def create_white_placeholder(filepath: Path) -> int:
+    """Create a minimal white JPEG placeholder image.
+
+    Returns the file size of the created placeholder.
+    This is used when image download fails to prevent infinite retry loops.
+    """
+    # Minimal valid JPEG: 1x1 white pixel (119 bytes)
+    # This is a complete, valid JPEG file that displays as a white square
+    white_jpeg = bytes([
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+        0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+        0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+        0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+        0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
+        0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03,
+        0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
+        0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72,
+        0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
+        0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+        0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
+        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3,
+        0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+        0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
+        0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4,
+        0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01,
+        0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xDB, 0x20, 0xA8, 0xF1, 0x4F, 0xFF,
+        0xD9
+    ])
+    with open(filepath, "wb") as f:
+        f.write(white_jpeg)
+    return len(white_jpeg)
 
 
 def download_image(client: httpx.Client, url: str, listing_id: int) -> bool:
@@ -316,16 +404,28 @@ class ImageDownloadQueue:
                     with self.stats_lock:
                         if success:
                             self.stats["downloaded"] += 1
+                            # Update file size in dict (non-zero means complete)
+                            filepath = IMAGES_DIR / f"{listing_id}.jpg"
+                            _existing_images[listing_id] = filepath.stat().st_size
                             # Print progress every 1000 downloads
                             if self.stats["downloaded"] % 1000 == 0:
                                 pending = self.queue.qsize()
                                 print(f"    [Download workers] {self.stats['downloaded']:,} downloaded, {pending:,} pending")
                         else:
                             self.stats["errors"] += 1
-                            # Update metadata to error on failure
+                            # Update metadata with FAILED_IMAGE_ID marker
+                            # When re-crawling, if Etsy returns a different image_id,
+                            # the image will be re-downloaded
                             if self.metadata is not None and self.metadata_lock is not None:
                                 with self.metadata_lock:
-                                    self.metadata[listing_id_str] = "cdn_error"
+                                    existing = self.metadata.get(listing_id_str, {})
+                                    shop_id = existing.get("shop_id") if isinstance(existing, dict) else None
+                                    self.metadata[listing_id_str] = {"image_id": FAILED_IMAGE_ID, "shop_id": shop_id}
+                            # Create white placeholder to prevent infinite retry loop
+                            # (file with size > 0 is considered "complete")
+                            filepath = IMAGES_DIR / f"{listing_id}.jpg"
+                            placeholder_size = create_white_placeholder(filepath)
+                            _existing_images[listing_id] = placeholder_size
 
                     self.queue.task_done()
                 except queue.Empty:
@@ -335,12 +435,16 @@ class ImageDownloadQueue:
     def add(self, listing_id: int, image_url: str, image_id: int, shop_id: int):
         """Add a download job to the queue.
 
-        Immediately sets metadata to the final value (placeholder with image_id/shop_id).
-        Worker just downloads the image file. On failure, metadata is updated to error.
+        Creates empty placeholder file in images/ folder and sets metadata.
+        Worker downloads the actual image, overwriting the placeholder.
+        On restart, empty files (size 0) indicate incomplete downloads.
         """
         listing_id_str = str(listing_id)
-        # Set metadata immediately - this is the "placeholder" that makes the listing
-        # appear as already processed to skip checks
+        # Create empty placeholder file - marks this as pending
+        filepath = IMAGES_DIR / f"{listing_id}.jpg"
+        filepath.touch()
+        _existing_images[listing_id] = 0  # 0 = pending
+        # Set metadata
         if self.metadata is not None and self.metadata_lock is not None:
             with self.metadata_lock:
                 self.metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
@@ -426,9 +530,10 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
     already_have = 0
     need_download = 0
     for listing in all_furniture_listings:
-        listing_id_str = str(listing["listing_id"])
+        listing_id = listing["listing_id"]
+        listing_id_str = str(listing_id)
         existing = metadata.get(listing_id_str)
-        if existing is not None and is_success(existing):
+        if existing is not None and is_success(existing, listing_id):
             already_have += 1
         else:
             need_download += 1
@@ -448,7 +553,7 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
 
         existing = metadata.get(listing_id_str)
 
-        if existing is not None and is_success(existing):
+        if existing is not None and is_success(existing, listing_id):
             # Already have this one, but update shop_id if missing
             if needs_shop_id(existing):
                 existing["shop_id"] = shop_id
@@ -583,6 +688,15 @@ def sync_full_taxonomy(limit: int = 0):
         progress["api_calls_today"] = 0
         progress["last_reset"] = time.time()
 
+    # Load existing image files for fast skip checks
+    # File size 0 = pending/incomplete, size > 0 = complete
+    global _existing_images
+    print("Loading existing image files...")
+    _existing_images = load_existing_images()
+    complete_count = sum(1 for size in _existing_images.values() if size > 0)
+    pending_count = sum(1 for size in _existing_images.values() if size == 0)
+    print(f"Found {complete_count:,} complete images, {pending_count:,} pending (empty files)")
+
     # (A) Every 30 days, re-check synced shops for new listings
     THIRTY_DAYS = 30 * 24 * 60 * 60
     last_shop_refresh = progress.get("last_shop_refresh", 0)
@@ -592,6 +706,24 @@ def sync_full_taxonomy(limit: int = 0):
         progress["synced_shops"] = []
         progress["last_shop_refresh"] = time.time()
         save_progress(progress)
+
+        # Also retry failed downloads (image_id == FAILED_IMAGE_ID)
+        # Delete white placeholders so they'll be re-downloaded when encountered
+        failed_entries = [
+            lid for lid, v in metadata.items()
+            if isinstance(v, dict) and v.get("image_id") == FAILED_IMAGE_ID
+        ]
+        if failed_entries:
+            print(f"    Clearing {len(failed_entries)} failed downloads for retry...")
+            for lid_str in failed_entries:
+                listing_id = int(lid_str)
+                # Delete white placeholder image
+                placeholder = IMAGES_DIR / f"{listing_id}.jpg"
+                placeholder.unlink(missing_ok=True)
+                _existing_images.pop(listing_id, None)
+                # Clear from metadata so it will be re-downloaded
+                del metadata[lid_str]
+            save_metadata(metadata)
 
     # Count successes vs errors in metadata
     success_count = sum(1 for v in metadata.values() if is_success(v))
@@ -895,9 +1027,9 @@ def sync_full_taxonomy(limit: int = 0):
                 if shop_id and shop_id not in synced_shops:
                     shops_to_sync.add(shop_id)
 
-                # Skip if already in metadata (downloaded or queued - both set metadata immediately)
+                # Skip if already in metadata AND file exists on disk
                 existing = metadata.get(listing_id_str)
-                if existing is not None and is_success(existing):
+                if existing is not None and is_success(existing, listing_id):
                     if needs_shop_id(existing) and shop_id:
                         existing["shop_id"] = shop_id
                     stats["skipped"] += 1
