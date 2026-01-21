@@ -497,6 +497,48 @@ class ImageDownloadQueue:
                 self.metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
         self.queue.put((listing_id, image_url))
 
+    def resume_pending(self, client: httpx.Client, existing_images: dict, metadata: dict, progress: dict):
+        """Resume downloads for empty files (pending from previous run).
+
+        Scans for size-0 files and batch-fetches their image URLs from Etsy API.
+        """
+        pending_ids = [lid for lid, size in existing_images.items() if size == 0]
+        if not pending_ids:
+            return
+
+        print(f"Resuming {len(pending_ids)} pending downloads from previous run...")
+
+        BATCH_SIZE = 100
+        queued = 0
+
+        for i in range(0, len(pending_ids), BATCH_SIZE):
+            if progress["api_calls_today"] >= DAILY_LIMIT:
+                print(f"  Hit daily limit, {len(pending_ids) - queued} still pending")
+                break
+
+            batch = pending_ids[i:i + BATCH_SIZE]
+            time.sleep(API_DELAY)
+            image_info = get_batch_image_info(client, batch)
+            progress["api_calls_today"] += 1
+
+            for listing_id in batch:
+                if listing_id in image_info:
+                    image_id, image_url = image_info[listing_id]
+                    # Get shop_id from metadata if available
+                    listing_id_str = str(listing_id)
+                    existing = metadata.get(listing_id_str, {})
+                    shop_id = existing.get("shop_id") if isinstance(existing, dict) else None
+                    # Queue download (don't re-create placeholder, already exists)
+                    self.queue.put((listing_id, image_url))
+                    queued += 1
+                else:
+                    # Listing no longer exists or has no images - delete placeholder
+                    filepath = IMAGES_DIR / f"{listing_id}.jpg"
+                    filepath.unlink(missing_ok=True)
+                    existing_images.pop(listing_id, None)
+
+        print(f"  Queued {queued} downloads for resume")
+
     def pending(self) -> int:
         """Return number of pending downloads."""
         return self.queue.qsize()
@@ -796,6 +838,12 @@ def sync_full_taxonomy(limit: int = 0):
     download_queue.start()
     _active_download_queue = download_queue  # For signal handler cleanup
     print(f"Started {download_queue.num_workers} background download workers")
+
+    # Resume pending downloads from previous run (empty files in images/)
+    if pending_count > 0:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as resume_client:
+            download_queue.resume_pending(resume_client, _existing_images, metadata, progress)
+        save_progress(progress)
 
     def run_fix_existing_data(client, metadata, progress):
         """(B) and (C): Fix existing data - get shop_id for all listings, sync all shops.
