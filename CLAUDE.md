@@ -11,6 +11,11 @@
 ```
 (A) Every 10 days, clear synced_shops to re-check for new listings
 
+AT STARTUP (before crawling):
+  (B)/(C) Fix existing data first:
+    - For any listing without shop_id, call API to get shop_id
+    - For any shop not in synced_shops, sync all its FURNITURE listings
+
 For each leaf taxonomy:
   (D1) Crawl with sort=relevance until offset=10k or exhausted
   (D2) Reset offset=0, crawl with sort=created_desc until 10k or exhausted
@@ -19,8 +24,8 @@ For each leaf taxonomy:
   (D5) Reset offset=0, crawl with sort=price_asc until 10k or exhausted
 
   (B)/(C) AFTER all sorts exhausted for this leaf:
-    - For any listing without shop_id, call API to get shop_id
-    - For any shop not in synced_shops, sync all its FURNITURE listings
+    - Fix any new listings missing shop_id
+    - Sync any new unsynced shops
 
   Move to next leaf
 ```
