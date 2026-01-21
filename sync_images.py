@@ -29,64 +29,52 @@ load_dotenv()
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-# Leaf taxonomy IDs for furniture (deepest level categories)
-# This gives us 38 categories × 10,000 offset limit = 380,000 potential unique listings
-FURNITURE_TAXONOMIES = [
-    12455, 12456,  # Bed Frames, Headboards
-    970,   # Dressers & Armoires
-    972,   # Nightstands
-    971,   # Steps & Stools (bedroom)
-    12470, # Vanity Tables
-    974,   # Buffets & China Cabinets
-    975,   # Dining Chairs
-    976,   # Dining Sets
-    977,   # Kitchen & Dining Tables
-    11837, # Kitchen Islands
-    978,   # Stools & Banquettes
-    12403, # Hall Trees
-    12405, # Standing Coat Racks
-    12406, # Umbrella Stands
-    981,   # Bean Bag Chairs
-    982,   # Benches & Toy Boxes
-    983,   # Bookcases (kids)
-    985,   # Desks, Tables & Chairs (kids)
-    986,   # Dressers & Drawers (kids)
-    987,   # Steps & Stools (kids)
-    988,   # Toddler Beds
-    12369, # Benches
-    12370, # Trunks
-    991,   # Bookshelves
-    992,   # Chairs
-    12371, # Coffee Tables
-    12372, # End Tables
-    11355, # Console & Sofa Tables
-    11356, # TV Stands & Media Centers
-    998,   # Couches & Loveseats
-    996,   # Floor Pillows
-    12468, # Ottomans & Poufs
-    12216, # Room Dividers
-    997,   # Slipcovers
-    1000,  # Desk Chairs
-    1001,  # Desks
-    12408, # Filing Cabinets
-]
+# Load taxonomy config from JSON file
+# Each entry has: id, name, price_breaks (list of prices defining intervals)
+# Price breaks [0, 500, 1000000] creates intervals: [0, 500] and (500, 1000000]
+TAXONOMY_CONFIG_FILE = Path(__file__).parent / "furniture_taxonomy_config.json"
 
-# Human-readable names for progress display
-TAXONOMY_NAMES = {
-    12455: "Bed Frames", 12456: "Headboards", 970: "Dressers & Armoires",
-    972: "Nightstands", 971: "Steps & Stools (bedroom)", 12470: "Vanity Tables",
-    974: "Buffets & China Cabinets", 975: "Dining Chairs", 976: "Dining Sets",
-    977: "Kitchen & Dining Tables", 11837: "Kitchen Islands", 978: "Stools & Banquettes",
-    12403: "Hall Trees", 12405: "Standing Coat Racks", 12406: "Umbrella Stands",
-    981: "Bean Bag Chairs", 982: "Benches & Toy Boxes", 983: "Bookcases (kids)",
-    985: "Desks, Tables & Chairs (kids)", 986: "Dressers & Drawers (kids)",
-    987: "Steps & Stools (kids)", 988: "Toddler Beds", 12369: "Benches",
-    12370: "Trunks", 991: "Bookshelves", 992: "Chairs", 12371: "Coffee Tables",
-    12372: "End Tables", 11355: "Console & Sofa Tables", 11356: "TV Stands & Media Centers",
-    998: "Couches & Loveseats", 996: "Floor Pillows", 12468: "Ottomans & Poufs",
-    12216: "Room Dividers", 997: "Slipcovers", 1000: "Desk Chairs", 1001: "Desks",
-    12408: "Filing Cabinets",
-}
+
+def load_taxonomy_config():
+    """Load taxonomy configuration from JSON file.
+
+    Returns list of crawl units, where each unit is a dict with:
+    taxonomy_id, name, min_price, max_price
+    """
+    with open(TAXONOMY_CONFIG_FILE) as f:
+        config = json.load(f)
+
+    crawl_units = []
+    for entry in config["taxonomies"]:
+        tax_id = entry["id"]
+        name = entry["name"]
+        breaks = entry["price_breaks"]
+
+        # Create intervals from price breaks
+        # [0, 500, 1000000] -> [(0, 500), (500.01, 1000000)]
+        for i in range(len(breaks) - 1):
+            min_price = breaks[i] if i == 0 else breaks[i] + 0.01
+            max_price = breaks[i + 1]
+
+            # Create label for this interval
+            if len(breaks) == 2:
+                # Single interval, no price label needed
+                label = name
+            else:
+                label = f"{name} (${breaks[i]}-${breaks[i+1]})"
+
+            crawl_units.append({
+                "taxonomy_id": tax_id,
+                "name": label,
+                "min_price": min_price if i > 0 else None,  # None for first interval (API default)
+                "max_price": max_price if max_price < 1000000 else None,  # None for last interval
+            })
+
+    return crawl_units
+
+
+# Load crawl units at module level
+CRAWL_UNITS = load_taxonomy_config()
 
 # Paths
 BASE_DIR = Path(__file__).parent
@@ -106,15 +94,6 @@ DAILY_LIMIT = 90000  # Leave 10k buffer for development
 API_DELAY = 0.011    # ~95 requests/second for sync (leave room for dev at 5 QPS)
 CDN_DELAY = 0.05     # Throttle image downloads
 MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
-
-# Sort strategies - relevance first, then others for large categories
-SORT_STRATEGIES = [
-    {"sort_on": "score", "sort_order": "desc"},    # Relevance first
-    {"sort_on": "created", "sort_order": "desc"},  # Newest
-    {"sort_on": "created", "sort_order": "asc"},   # Oldest
-    {"sort_on": "price", "sort_order": "desc"},    # Most expensive
-    {"sort_on": "price", "sort_order": "asc"},     # Cheapest
-]
 
 # All furniture taxonomy IDs (parent + leaf) for filtering shop listings
 FURNITURE_TAXONOMY_IDS = {
@@ -175,10 +154,8 @@ def load_progress() -> dict:
         "offset": 0,
         "api_calls_today": 0,
         "last_reset": time.time(),
-        "taxonomy_index": 0,
-        "sort_index": 0,
-        "exhausted": [],  # List of "taxonomy_index:sort_index" combos fully crawled
-        "small_taxonomies": [],  # Taxonomy indices with < 10000 items (skip extra sorts)
+        "crawl_unit_index": 0,  # Index into CRAWL_UNITS
+        "exhausted": [],  # List of crawl unit indices that are fully crawled
         "synced_shops": [],  # Shop IDs that have been fully synced
         "last_shop_refresh": 0,  # Timestamp of last shop refresh (every 30 days)
     }
@@ -405,74 +382,8 @@ def sync_from_list(listing_ids: list[int]):
     print(f"\nDone! Downloaded: {stats['downloaded']}, Errors: {stats['errors']}")
 
 
-def ensure_complete(client: httpx.Client, metadata: dict, progress: dict) -> dict:
-    """(B) and (C): Ensure all listings have images and all shops are complete.
-
-    (B) For any listing without an image, download it.
-    (C) For any listing without a shop, get the shop, then get all furniture
-        listings for that shop.
-
-    Returns stats dict.
-    """
-    stats = {"downloaded": 0, "shops_synced": 0, "errors": 0}
-    synced_shops = set(progress.get("synced_shops", []))
-
-    # Find listings needing shop_id
-    listings_needing_shop = [
-        (lid, v) for lid, v in metadata.items()
-        if isinstance(v, dict) and v.get("shop_id") is None
-    ]
-
-    if not listings_needing_shop:
-        return stats
-
-    print(f"  Ensuring completeness: {len(listings_needing_shop)} listings need shop info...")
-
-    for listing_id_str, entry in listings_needing_shop:
-        if progress["api_calls_today"] >= DAILY_LIMIT:
-            break
-
-        listing_id = int(listing_id_str)
-
-        # Get listing details to find shop_id
-        time.sleep(API_DELAY)
-        try:
-            response = client.get(
-                f"{BASE_URL}/application/listings/{listing_id}",
-                headers={"x-api-key": ETSY_API_KEY},
-            )
-            progress["api_calls_today"] += 1
-
-            if response.status_code == 404:
-                continue
-            response.raise_for_status()
-
-            listing_data = response.json()
-            shop_id = listing_data.get("shop_id")
-
-            if shop_id:
-                # Update the metadata with shop_id
-                entry["shop_id"] = shop_id
-
-                # (C) Sync shop if not already done
-                if shop_id not in synced_shops:
-                    shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
-                    stats["downloaded"] += shop_stats["downloaded"]
-                    stats["errors"] += shop_stats["errors"]
-                    if shop_stats.get("complete", False):
-                        synced_shops.add(shop_id)
-                        stats["shops_synced"] += 1
-                        progress["synced_shops"] = list(synced_shops)
-
-        except Exception as e:
-            print(f"    Error getting listing {listing_id}: {e}")
-            stats["errors"] += 1
-
-    return stats
-
-
 def sync_full_taxonomy(limit: int = 0):
-    """Main sync loop following the specified algorithm.
+    """Main sync loop using price-based crawl units.
 
     Algorithm:
     (A) Every 30 days, clear synced_shops to re-check for new listings
@@ -482,16 +393,12 @@ def sync_full_taxonomy(limit: int = 0):
         - For any listing without shop_id, get the shop
         - For any shop not in synced_shops, sync all its furniture listings
 
-    For each leaf taxonomy:
-      (D1) Crawl listings with sort=relevance until 10k offset or exhausted
-      (D2) Reset offset, crawl with sort=created_desc until 10k or exhausted
-      (D3) Reset offset, crawl with sort=created_asc until 10k or exhausted
-      (D4) Reset offset, crawl with sort=price_desc until 10k or exhausted
-      (D5) Reset offset, crawl with sort=price_asc until 10k or exhausted
-      (B)/(C) After all sorts exhausted for this leaf:
+    For each crawl unit (taxonomy + price range):
+      Crawl listings until exhausted (no more results)
+      (B)/(C) After unit exhausted:
         - Fix any new listings missing shop_id
         - Sync any new unsynced shops
-      Move to next leaf
+      Move to next crawl unit
 
     When syncing a shop, only include furniture listings (taxonomy in FURNITURE_TAXONOMY_IDS).
 
@@ -528,6 +435,7 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"ETSY FURNITURE IMAGE SYNC")
     print(f"{'='*60}")
     print(f"Images in corpus: {success_count} | Errors: {error_count}")
+    print(f"Crawl units: {len(CRAWL_UNITS)}")
     print(f"API calls today: {progress['api_calls_today']}")
 
     def run_fix_existing_data(client, metadata, progress):
@@ -556,8 +464,6 @@ def sync_full_taxonomy(limit: int = 0):
 
         if listings_needing_shop:
             print(f"  (B) {len(listings_needing_shop)} listings need shop_id")
-        if shops_needing_sync:
-            print(f"  (C) {len(shops_needing_sync)} shops need syncing")
 
         fixed_count = 0
         shops_synced = 0
@@ -602,7 +508,12 @@ def sync_full_taxonomy(limit: int = 0):
 
                     # (C) Sync shop if not already done
                     if shop_id not in synced_shops:
-                        print(f"  (C) Syncing shop {shop_id}...")
+                        # Count remaining before sync
+                        remaining_need_shop = sum(
+                            1 for lid, v in metadata.items()
+                            if isinstance(v, dict) and v.get("shop_id") is None
+                        )
+                        print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
                         shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
                         if shop_stats.get("complete", False):
                             synced_shops.add(shop_id)
@@ -612,18 +523,13 @@ def sync_full_taxonomy(limit: int = 0):
                             print(f"      +{shop_stats['downloaded']} images from shop")
                             if not shop_stats.get("complete", False):
                                 print(f"      (incomplete - will resume next run)")
-
-                    # Save periodically
-                    if fixed_count % 100 == 0:
-                        print(f"  Progress: {fixed_count}/{len(listings_needing_shop)} listings fixed, {shops_synced} shops synced")
                         save_progress(progress)
                         save_metadata(metadata)
 
             except Exception as e:
                 print(f"    Error getting listing {listing_id}: {e}")
 
-        # (C) Sync any remaining shops that have shop_id but aren't synced yet
-        # (Some may have been synced during (B), so recheck)
+        # Sync any remaining shops that have shop_id but aren't synced yet
         for shop_id in shops_needing_sync:
             if progress["api_calls_today"] >= DAILY_LIMIT:
                 print(f"\nReached daily limit during shop sync.")
@@ -634,7 +540,11 @@ def sync_full_taxonomy(limit: int = 0):
             if shop_id in synced_shops:
                 continue  # Already synced during (B)
 
-            print(f"  (C) Syncing shop {shop_id}...")
+            remaining_need_shop = sum(
+                1 for lid, v in metadata.items()
+                if isinstance(v, dict) and v.get("shop_id") is None
+            )
+            print(f"  Syncing shop {shop_id}... ({remaining_need_shop} listings still need shop_id)")
             shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
             if shop_stats.get("complete", False):
                 synced_shops.add(shop_id)
@@ -644,6 +554,8 @@ def sync_full_taxonomy(limit: int = 0):
                 print(f"      +{shop_stats['downloaded']} images from shop")
                 if not shop_stats.get("complete", False):
                     print(f"      (incomplete - will resume next run)")
+            save_progress(progress)
+            save_metadata(metadata)
 
         print(f"\n(B)/(C) Complete: {fixed_count} listings fixed, {shops_synced} shops synced")
         save_progress(progress)
@@ -651,79 +563,30 @@ def sync_full_taxonomy(limit: int = 0):
         return False  # All done
 
     # =========================================================================
-    # (D) Now crawl new taxonomies
+    # Crawl using price-based units
     # =========================================================================
-    # Get current state
-    taxonomy_index = progress.get("taxonomy_index", 0)
-    sort_index = progress.get("sort_index", 0)
+    crawl_unit_index = progress.get("crawl_unit_index", 0)
     exhausted = set(progress.get("exhausted", []))
-    small_taxonomies = set(progress.get("small_taxonomies", []))
 
-    def combo_key(tax_idx, sort_idx):
-        return f"{tax_idx}:{sort_idx}"
+    # Find first non-exhausted unit
+    while crawl_unit_index in exhausted and crawl_unit_index < len(CRAWL_UNITS):
+        crawl_unit_index += 1
 
-    def find_next_combo(start_tax, start_sort):
-        """Find next taxonomy/sort combo that isn't exhausted.
-
-        Logic:
-        - For small taxonomies (< 10k items), only use sort_index=0 (relevance)
-        - For large taxonomies, try all sorts
-        """
-        tax_idx = start_tax
-        sort_idx = start_sort
-        checked = 0
-        total_combos = len(FURNITURE_TAXONOMIES) * len(SORT_STRATEGIES)
-
-        while checked < total_combos:
-            # Skip non-relevance sorts for small taxonomies
-            if tax_idx in small_taxonomies and sort_idx > 0:
-                sort_idx = 0
-                tax_idx = (tax_idx + 1) % len(FURNITURE_TAXONOMIES)
-                checked += len(SORT_STRATEGIES) - 1  # Skip all other sorts
-                continue
-
-            if combo_key(tax_idx, sort_idx) not in exhausted:
-                return tax_idx, sort_idx
-
-            # Move to next combo
-            sort_idx = (sort_idx + 1) % len(SORT_STRATEGIES)
-            if sort_idx == 0:
-                tax_idx = (tax_idx + 1) % len(FURNITURE_TAXONOMIES)
-            checked += 1
-
-        return None, None  # All exhausted
-
-    # Find first unexhausted combo
-    taxonomy_index, sort_index = find_next_combo(taxonomy_index, sort_index)
-    if taxonomy_index is None:
-        print("All taxonomy/sort combinations have been exhausted!")
+    if crawl_unit_index >= len(CRAWL_UNITS):
+        print("All crawl units have been exhausted!")
         print(f"Total images in corpus: {success_count}")
         return
-
-    current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
-    sort_strategy = SORT_STRATEGIES[sort_index]
 
     stats = {
         "skipped": 0,
         "downloaded": 0,
-        "updated": 0,
         "errors": 0,
         "processed": 0,
     }
 
-    def is_leaf_exhausted(tax_idx):
-        """Check if all sort strategies for a taxonomy have been exhausted."""
-        for s_idx in range(len(SORT_STRATEGIES)):
-            if combo_key(tax_idx, s_idx) not in exhausted:
-                return False
-        return True
-
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        offset = progress["offset"]
+        offset = progress.get("offset", 0)
         batch_size = 100
-
-        # Track the last taxonomy we completed (B)/(C) for
-        last_fixed_taxonomy = progress.get("last_fixed_taxonomy", -1)
 
         # =========================================================
         # (B)/(C) AT STARTUP: Fix existing data before crawling
@@ -731,96 +594,57 @@ def sync_full_taxonomy(limit: int = 0):
         print("\n(B)/(C) Startup - fixing existing data...")
         still_fixing = run_fix_existing_data(client, metadata, progress)
         if still_fixing:
-            # Hit daily limit while fixing - stop and resume tomorrow
             print("Daily limit hit during startup fix. Run again tomorrow.")
             return
 
-        while True:
-            # Check listing limit
+        while crawl_unit_index < len(CRAWL_UNITS):
+            # Check limits
             if limit > 0 and stats["processed"] >= limit:
                 print(f"\nReached listing limit ({limit}).")
                 break
-            # Check daily limit
             if progress["api_calls_today"] >= DAILY_LIMIT:
                 print(f"\nReached daily limit ({progress['api_calls_today']} calls).")
                 print("Run again after 24 hours to continue.")
                 break
 
-            # =========================================================
-            # Display status when starting a new taxonomy
-            # =========================================================
-            if sort_index == 0 and offset == 0:
+            current_unit = CRAWL_UNITS[crawl_unit_index]
+
+            # Display status when starting a new unit
+            if offset == 0:
                 success_count = sum(1 for v in metadata.values() if is_success(v))
                 error_count = len(metadata) - success_count
-                effective_exhausted = len(exhausted)
-                total_combos = len(FURNITURE_TAXONOMIES) * len(SORT_STRATEGIES)
-                skipped_from_small = len(small_taxonomies) * (len(SORT_STRATEGIES) - 1)
 
-                taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
                 print(f"\n{'='*60}")
-                print(f"CURRENT LEAF: {taxonomy_name} (ID: {current_taxonomy})")
-                print(f"             [{taxonomy_index + 1}/{len(FURNITURE_TAXONOMIES)} taxonomies]")
+                print(f"CRAWL UNIT: {current_unit['name']}")
+                print(f"            [{crawl_unit_index + 1}/{len(CRAWL_UNITS)} units]")
+                price_range = ""
+                if current_unit['min_price'] is not None or current_unit['max_price'] is not None:
+                    min_p = current_unit['min_price'] or 0
+                    max_p = current_unit['max_price'] or "∞"
+                    price_range = f" | Price: ${min_p}-${max_p}"
+                print(f"            Taxonomy ID: {current_unit['taxonomy_id']}{price_range}")
                 print(f"{'='*60}")
                 print(f"Images in corpus: {success_count} | Errors: {error_count}")
-                print(f"Small taxonomies (< 10k): {len(small_taxonomies)}")
-                print(f"Exhausted combos: {effective_exhausted}/{total_combos - skipped_from_small}")
+                print(f"Exhausted units: {len(exhausted)}/{len(CRAWL_UNITS)}")
                 print(f"API calls today: {progress['api_calls_today']}")
-                print(f"Starting sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
 
-            # Check offset limit BEFORE making request
-            if offset >= MAX_OFFSET:
-                # Hit 10k limit - mark this sort as exhausted
-                old_taxonomy_index = taxonomy_index
-                exhausted.add(combo_key(taxonomy_index, sort_index))
-                taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-                print(f"\n  Exhausted (offset limit): {taxonomy_name}, sort {sort_strategy['sort_on']}")
-
-                # Find next combo
-                taxonomy_index, sort_index = find_next_combo(taxonomy_index, sort_index + 1)
-                if taxonomy_index is None:
-                    print("\nAll taxonomy/sort combinations exhausted!")
-                    break
-
-                # Check if we finished all sorts for the old leaf
-                if is_leaf_exhausted(old_taxonomy_index) and old_taxonomy_index != last_fixed_taxonomy:
-                    print(f"\n(B)/(C) Leaf complete - fixing existing data...")
-                    still_fixing = run_fix_existing_data(client, metadata, progress)
-                    if still_fixing:
-                        # Save state and exit - will resume tomorrow
-                        progress["offset"] = 0
-                        progress["sort_index"] = sort_index
-                        progress["taxonomy_index"] = taxonomy_index
-                        progress["exhausted"] = list(exhausted)
-                        progress["small_taxonomies"] = list(small_taxonomies)
-                        save_progress(progress)
-                        return
-                    last_fixed_taxonomy = old_taxonomy_index
-                    progress["last_fixed_taxonomy"] = old_taxonomy_index
-
-                current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
-                sort_strategy = SORT_STRATEGIES[sort_index]
-                taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-                print(f"\nMOVING TO: {taxonomy_name}, sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
-                offset = 0
-                progress["offset"] = 0
-                progress["sort_index"] = sort_index
-                progress["taxonomy_index"] = taxonomy_index
-                progress["exhausted"] = list(exhausted)
-                progress["small_taxonomies"] = list(small_taxonomies)
-                save_progress(progress)
-                continue
+            # Build API params
+            params = {
+                "taxonomy_id": current_unit["taxonomy_id"],
+                "limit": batch_size,
+                "offset": offset,
+            }
+            if current_unit["min_price"] is not None:
+                params["min_price"] = current_unit["min_price"]
+            if current_unit["max_price"] is not None:
+                params["max_price"] = current_unit["max_price"]
 
             # Fetch batch of listings
             time.sleep(API_DELAY)
             response = client.get(
                 f"{BASE_URL}/application/listings/active",
                 headers={"x-api-key": ETSY_API_KEY},
-                params={
-                    "taxonomy_id": current_taxonomy,
-                    "limit": batch_size,
-                    "offset": offset,
-                    **sort_strategy,
-                },
+                params=params,
             )
             progress["api_calls_today"] += 1
 
@@ -833,57 +657,40 @@ def sync_full_taxonomy(limit: int = 0):
             data = response.json()
             results = data.get("results", [])
 
-            if not results:
-                # No more results - mark this sort as exhausted
-                old_taxonomy_index = taxonomy_index
-                exhausted.add(combo_key(taxonomy_index, sort_index))
-                taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-
-                # If this was relevance sort (index 0), mark as small taxonomy
-                if sort_index == 0:
-                    small_taxonomies.add(taxonomy_index)
-                    print(f"\n  Exhausted (small, < 10k): {taxonomy_name}")
+            if not results or offset >= MAX_OFFSET:
+                # No more results or hit offset limit - mark this unit as exhausted
+                exhausted.add(crawl_unit_index)
+                if not results:
+                    print(f"\n  Exhausted: {current_unit['name']} (no more results)")
                 else:
-                    print(f"\n  Exhausted (no more): {taxonomy_name}, sort {sort_strategy['sort_on']}")
+                    print(f"\n  Exhausted: {current_unit['name']} (offset limit)")
 
-                # Find next combo
-                taxonomy_index, sort_index = find_next_combo(taxonomy_index, sort_index + 1)
-                if taxonomy_index is None:
-                    print("\nAll taxonomy/sort combinations exhausted!")
-                    break
+                # Run (B)/(C) after exhausting a unit
+                print(f"\n(B)/(C) Unit complete - fixing existing data...")
+                still_fixing = run_fix_existing_data(client, metadata, progress)
+                if still_fixing:
+                    progress["offset"] = 0
+                    progress["crawl_unit_index"] = crawl_unit_index + 1
+                    progress["exhausted"] = list(exhausted)
+                    save_progress(progress)
+                    return
 
-                # Check if we finished all sorts for the old leaf
-                if is_leaf_exhausted(old_taxonomy_index) and old_taxonomy_index != last_fixed_taxonomy:
-                    print(f"\n(B)/(C) Leaf complete - fixing existing data...")
-                    still_fixing = run_fix_existing_data(client, metadata, progress)
-                    if still_fixing:
-                        # Save state and exit - will resume tomorrow
-                        progress["offset"] = 0
-                        progress["sort_index"] = sort_index
-                        progress["taxonomy_index"] = taxonomy_index
-                        progress["exhausted"] = list(exhausted)
-                        progress["small_taxonomies"] = list(small_taxonomies)
-                        save_progress(progress)
-                        return
-                    last_fixed_taxonomy = old_taxonomy_index
-                    progress["last_fixed_taxonomy"] = old_taxonomy_index
-
-                current_taxonomy = FURNITURE_TAXONOMIES[taxonomy_index]
-                sort_strategy = SORT_STRATEGIES[sort_index]
-                taxonomy_name = TAXONOMY_NAMES.get(current_taxonomy, str(current_taxonomy))
-                print(f"\nMOVING TO: {taxonomy_name}, sort: {sort_strategy['sort_on']} ({sort_strategy['sort_order']})")
+                # Move to next unit
+                crawl_unit_index += 1
                 offset = 0
                 progress["offset"] = 0
-                progress["sort_index"] = sort_index
-                progress["taxonomy_index"] = taxonomy_index
+                progress["crawl_unit_index"] = crawl_unit_index
                 progress["exhausted"] = list(exhausted)
-                progress["small_taxonomies"] = list(small_taxonomies)
                 save_progress(progress)
+
+                # Skip already exhausted units
+                while crawl_unit_index in exhausted and crawl_unit_index < len(CRAWL_UNITS):
+                    crawl_unit_index += 1
                 continue
 
             print(f"\nBatch at offset {offset} ({len(results)} listings)...")
 
-            # Track shops we encounter in this batch that need syncing
+            # Track shops we encounter in this batch
             synced_shops = set(progress.get("synced_shops", []))
             shops_to_sync = set()
 
@@ -901,11 +708,9 @@ def sync_full_taxonomy(limit: int = 0):
                 if shop_id and shop_id not in synced_shops:
                     shops_to_sync.add(shop_id)
 
-                # Skip if already downloaded (don't waste API call)
-                # But retry if it was an error (string value, not dict/int)
+                # Skip if already downloaded
                 existing = metadata.get(listing_id_str)
                 if existing is not None and is_success(existing):
-                    # Update shop_id if it was missing
                     if needs_shop_id(existing) and shop_id:
                         existing["shop_id"] = shop_id
                     stats["skipped"] += 1
@@ -934,7 +739,7 @@ def sync_full_taxonomy(limit: int = 0):
 
                 stats["processed"] += 1
 
-            # Sync any new shops from this batch that we haven't synced yet
+            # Sync any new shops from this batch
             for shop_id in shops_to_sync:
                 if progress["api_calls_today"] >= DAILY_LIMIT:
                     break
@@ -970,11 +775,10 @@ def sync_full_taxonomy(limit: int = 0):
     print("\n" + "=" * 50)
     print("Session complete!")
     print(f"  New downloads: {stats['downloaded']}")
-    print(f"  Updated: {stats['updated']}")
     print(f"  Skipped (unchanged): {stats['skipped']}")
     print(f"  Errors: {stats['errors']}")
     print(f"  API calls used: {progress['api_calls_today']}")
-    print(f"  Next offset: {progress['offset']}")
+    print(f"  Next offset: {progress.get('offset', 0)}")
     print(f"  Images stored in: {IMAGES_DIR}")
 
 
