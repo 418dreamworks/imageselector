@@ -507,20 +507,34 @@ def sync_full_taxonomy(limit: int = 0):
 
         Returns True if there's still work to do (hit daily limit), False if complete.
         """
-        # Check if we have listings needing shop_id
+        synced_shops = set(progress.get("synced_shops", []))
+
+        # (B) Check if we have listings needing shop_id
         listings_needing_shop = [
             (lid, v) for lid, v in metadata.items()
             if isinstance(v, dict) and v.get("shop_id") is None
         ]
 
-        if not listings_needing_shop:
+        # (C) Check for shops that have shop_id but aren't synced yet
+        shops_needing_sync = set()
+        for lid, v in metadata.items():
+            if isinstance(v, dict) and v.get("shop_id") is not None:
+                shop_id = v["shop_id"]
+                if shop_id not in synced_shops:
+                    shops_needing_sync.add(shop_id)
+
+        if not listings_needing_shop and not shops_needing_sync:
             return False  # Nothing to fix
 
-        print(f"\n(B)/(C) Fixing existing data: {len(listings_needing_shop)} listings need shop info...")
-        synced_shops = set(progress.get("synced_shops", []))
+        if listings_needing_shop:
+            print(f"  (B) {len(listings_needing_shop)} listings need shop_id")
+        if shops_needing_sync:
+            print(f"  (C) {len(shops_needing_sync)} shops need syncing")
+
         fixed_count = 0
         shops_synced = 0
 
+        # (B) Fix listings missing shop_id
         for listing_id_str, entry in listings_needing_shop:
             if progress["api_calls_today"] >= DAILY_LIMIT:
                 print(f"\nReached daily limit. {len(listings_needing_shop) - fixed_count} listings still need fixing.")
@@ -576,6 +590,26 @@ def sync_full_taxonomy(limit: int = 0):
 
             except Exception as e:
                 print(f"    Error getting listing {listing_id}: {e}")
+
+        # (C) Sync any remaining shops that have shop_id but aren't synced yet
+        # (Some may have been synced during (B), so recheck)
+        for shop_id in shops_needing_sync:
+            if progress["api_calls_today"] >= DAILY_LIMIT:
+                print(f"\nReached daily limit during shop sync.")
+                save_progress(progress)
+                save_metadata(metadata)
+                return True  # Still work to do
+
+            if shop_id in synced_shops:
+                continue  # Already synced during (B)
+
+            print(f"  (C) Syncing shop {shop_id}...")
+            shop_stats = sync_shop_listings(client, shop_id, metadata, progress)
+            synced_shops.add(shop_id)
+            shops_synced += 1
+            progress["synced_shops"] = list(synced_shops)
+            if shop_stats["downloaded"] > 0:
+                print(f"      +{shop_stats['downloaded']} images from shop")
 
         print(f"\n(B)/(C) Complete: {fixed_count} listings fixed, {shops_synced} shops synced")
         save_progress(progress)
