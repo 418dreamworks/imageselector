@@ -20,6 +20,7 @@ import sys
 import json
 import time
 import signal
+import re
 import httpx
 import threading
 import queue
@@ -31,6 +32,18 @@ from dotenv import load_dotenv
 def ts():
     """Return timestamp string for logging."""
     return datetime.now().strftime("%H:%M:%S")
+
+
+def extract_hex_suffix(url: str) -> tuple[str | None, str | None]:
+    """Extract hex and suffix from Etsy image URL.
+
+    URL format: https://i.etsystatic.com/{shop}/r/il/{hex}/{image_id}/il_{size}.{image_id}_{suffix}.jpg
+    Returns (hex, suffix) or (None, None) if parsing fails.
+    """
+    match = re.search(r'/il/([a-f0-9]+)/(\d+)/il_[^.]+\.\d+_([a-z0-9]+)\.jpg', url)
+    if match:
+        return match.group(1), match.group(3)
+    return None, None
 
 load_dotenv()
 
@@ -469,18 +482,26 @@ class ImageDownloadQueue:
                                     continue  # Already being processed
                                 self.in_progress.add(listing_id)
 
-                            # Get URL from metadata
+                            # Construct URL from metadata (hex/suffix)
                             listing_id_str = str(listing_id)
                             if self.metadata and self.metadata_lock:
                                 with self.metadata_lock:
                                     entry = self.metadata.get(listing_id_str, {})
-                                    image_url = entry.get("url") if isinstance(entry, dict) else None
+                                    if isinstance(entry, dict):
+                                        hex_val = entry.get("hex")
+                                        suffix = entry.get("suffix")
+                                        image_id = entry.get("image_id")
+                                        shop_id = entry.get("shop_id")
+                                    else:
+                                        hex_val, suffix, image_id, shop_id = None, None, None, None
 
-                                if image_url:
+                                if hex_val and suffix and image_id and shop_id:
+                                    # Construct URL for 570xN size
+                                    image_url = f"https://i.etsystatic.com/{shop_id}/r/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
                                     self.queue.put((listing_id, image_url))
                                     queued += 1
                                 else:
-                                    # No URL in metadata - can't download, remove from in_progress
+                                    # Missing metadata - can't download, remove from in_progress
                                     with self.in_progress_lock:
                                         self.in_progress.discard(listing_id)
                     except (ValueError, OSError):
@@ -525,12 +546,22 @@ class ImageDownloadQueue:
                                 print(f"    [Download workers] {self.stats['downloaded']:,} downloaded, {pending_on_disk:,} pending")
                         else:
                             self.stats["errors"] += 1
-                            # Update metadata with FAILED_IMAGE_ID marker
+                            # Update metadata with FAILED_IMAGE_ID marker, preserve hex/suffix
                             if self.metadata is not None and self.metadata_lock is not None:
                                 with self.metadata_lock:
                                     existing = self.metadata.get(listing_id_str, {})
-                                    shop_id = existing.get("shop_id") if isinstance(existing, dict) else None
-                                    self.metadata[listing_id_str] = {"image_id": FAILED_IMAGE_ID, "shop_id": shop_id}
+                                    if isinstance(existing, dict):
+                                        shop_id = existing.get("shop_id")
+                                        hex_val = existing.get("hex")
+                                        suffix = existing.get("suffix")
+                                    else:
+                                        shop_id, hex_val, suffix = None, None, None
+                                    self.metadata[listing_id_str] = {
+                                        "image_id": FAILED_IMAGE_ID,
+                                        "shop_id": shop_id,
+                                        "hex": hex_val,
+                                        "suffix": suffix,
+                                    }
                             # Create white placeholder to prevent infinite retry loop
                             filepath = IMAGES_DIR / f"{listing_id}.jpg"
                             placeholder_size = create_white_placeholder(filepath)
@@ -557,13 +588,15 @@ class ImageDownloadQueue:
         filepath = IMAGES_DIR / f"{listing_id}.jpg"
         filepath.touch()
         _existing_images[listing_id] = 0  # 0 = pending
-        # Set metadata with URL for resume capability
+        # Set metadata with hex/suffix for resume capability (can reconstruct URL for any size)
         if self.metadata is not None and self.metadata_lock is not None:
+            hex_val, suffix = extract_hex_suffix(image_url)
             with self.metadata_lock:
                 self.metadata[listing_id_str] = {
                     "image_id": image_id,
                     "shop_id": shop_id,
-                    "url": image_url  # Store URL so scanner can resume without API
+                    "hex": hex_val,
+                    "suffix": suffix,
                 }
         self.queue.put((listing_id, image_url))
 
@@ -719,7 +752,13 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
                     # Sync: download immediately (rare - only used when no queue provided)
                     time.sleep(1.0 / CDN_RATE_LIMIT)
                     if download_image(client, image_url, listing_id):
-                        metadata[listing_id_str] = {"image_id": image_id, "shop_id": shop_id}
+                        hex_val, suffix = extract_hex_suffix(image_url)
+                        metadata[listing_id_str] = {
+                            "image_id": image_id,
+                            "shop_id": shop_id,
+                            "hex": hex_val,
+                            "suffix": suffix,
+                        }
                         stats["downloaded"] += 1
                         downloaded_this_shop += 1
                     else:
