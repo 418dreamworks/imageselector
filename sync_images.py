@@ -501,7 +501,7 @@ class ImageDownloadQueue:
                                 else:
                                     hex_val, suffix, image_id, shop_id = None, None, None, None
 
-                            if hex_val and suffix and image_id and shop_id:
+                            if hex_val and suffix and image_id and shop_id and image_id != FAILED_IMAGE_ID:
                                 # Construct URL for 570xN size
                                 image_url = f"https://i.etsystatic.com/{shop_id}/r/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
                                 self.queue.put((listing_id, image_url))
