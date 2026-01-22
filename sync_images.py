@@ -460,7 +460,9 @@ class ImageDownloadQueue:
                     if not self.running:
                         break
                     try:
-                        if f.stat().st_size == 0:
+                        # Re-download if empty OR under 5KB (old smaller image size)
+                        file_size = f.stat().st_size
+                        if file_size == 0 or file_size < 5000:
                             listing_id = int(f.stem)
                             with self.in_progress_lock:
                                 if listing_id in self.in_progress:
