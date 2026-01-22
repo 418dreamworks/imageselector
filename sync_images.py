@@ -878,18 +878,16 @@ def sync_full_taxonomy(limit: int = 0):
     pending_count = sum(1 for size in _existing_images.values() if size == 0)
     print(f"Found {complete_count:,} complete images, {pending_count:,} pending (empty files)")
 
-    # (A) Every 30 days, re-check synced shops for new listings
+    # (A) Every 30 days, re-sync all known shops for new listings
     THIRTY_DAYS = 30 * 24 * 60 * 60
     last_shop_refresh = progress.get("last_shop_refresh", 0)
+    needs_shop_refresh = time.time() - last_shop_refresh > THIRTY_DAYS
 
-    if time.time() - last_shop_refresh > THIRTY_DAYS:
-        print("(A) 30 days passed - clearing synced_shops to re-check for updates...")
-        progress["synced_shops"] = []
-        progress["last_shop_refresh"] = time.time()
-        save_progress(progress)
+    if needs_shop_refresh:
+        print("(A) 30 days passed - will re-sync all known shops...")
 
-        # Also retry failed downloads (image_id == FAILED_IMAGE_ID)
-        # Delete white placeholders so they'll be re-downloaded when encountered
+        # Retry failed downloads (image_id == FAILED_IMAGE_ID)
+        # Delete white placeholders so they'll be re-downloaded
         failed_entries = [
             lid for lid, v in metadata.items()
             if isinstance(v, dict) and v.get("image_id") == FAILED_IMAGE_ID
@@ -927,6 +925,57 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"Started {download_queue.num_workers} background download workers + scanner")
     if pending_count > 0:
         print(f"  Scanner will automatically process {pending_count} pending files")
+
+    def run_shop_refresh(client, metadata, progress):
+        """(A) 30-day refresh: Re-sync all known shops from metadata.
+
+        Iterates through all unique shop_ids and fetches their current listings,
+        adding any new ones to the download queue.
+
+        Returns True if hit daily limit (still work to do), False if complete.
+        """
+        # Get all unique shop_ids from metadata
+        all_shop_ids = set()
+        for v in metadata.values():
+            if isinstance(v, dict) and v.get("shop_id"):
+                all_shop_ids.add(v["shop_id"])
+
+        if not all_shop_ids:
+            print("  No shops to refresh")
+            return False
+
+        print(f"  Re-syncing {len(all_shop_ids)} shops...")
+        shops_synced = 0
+        total_queued = 0
+
+        for shop_id in all_shop_ids:
+            if progress["api_calls_today"] >= DAILY_LIMIT:
+                print(f"\n  Reached daily limit. {len(all_shop_ids) - shops_synced} shops remaining.")
+                save_progress(progress)
+                with metadata_lock:
+                    save_metadata(metadata)
+                return True  # Still work to do
+
+            shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
+            shops_synced += 1
+            total_queued += shop_stats["downloaded"]
+
+            if shop_stats["downloaded"] > 0:
+                print(f"[{ts()}] Shop {shop_id}: {shop_stats['have']} have, +{shop_stats['downloaded']} new")
+
+            # Save periodically
+            if shops_synced % 100 == 0:
+                print(f"  Progress: {shops_synced}/{len(all_shop_ids)} shops, {total_queued} new images queued")
+                save_progress(progress)
+                with metadata_lock:
+                    save_metadata(metadata)
+
+        print(f"\n(A) Shop refresh complete: {shops_synced} shops synced, {total_queued} new images queued")
+        progress["last_shop_refresh"] = time.time()
+        save_progress(progress)
+        with metadata_lock:
+            save_metadata(metadata)
+        return False
 
     def run_fix_existing_data(client, metadata, progress):
         """(B) and (C): Fix existing data - get shop_id for all listings, sync all shops.
@@ -1090,19 +1139,19 @@ def sync_full_taxonomy(limit: int = 0):
         batch_size = 100
 
         # =========================================================
-        # (B)/(C) AT STARTUP: Fix existing data before crawling
+        # (A) 30-day refresh: Re-sync all known shops
         # =========================================================
-        print("\n(B)/(C) Startup - fixing existing data...")
-        still_fixing = run_fix_existing_data(client, metadata, progress)
-        if still_fixing:
-            print("Daily limit hit during startup fix. Run again tomorrow.")
-            # Wait for pending downloads before exiting
-            pending = download_queue.pending()
-            if pending > 0:
-                print(f"Waiting for {pending} pending downloads...")
-                download_queue.wait_for_completion()
-            download_queue.shutdown()
-            return
+        if needs_shop_refresh:
+            print("\n(A) Starting 30-day shop refresh...")
+            still_refreshing = run_shop_refresh(client, metadata, progress)
+            if still_refreshing:
+                print("Daily limit hit during shop refresh. Run again tomorrow.")
+                pending = download_queue.pending()
+                if pending > 0:
+                    print(f"Waiting for {pending} pending downloads...")
+                    download_queue.wait_for_completion()
+                download_queue.shutdown()
+                return
 
         while crawl_unit_index < len(CRAWL_UNITS):
             # Check limits
@@ -1166,16 +1215,6 @@ def sync_full_taxonomy(limit: int = 0):
                 exhausted.add(crawl_unit_index)
                 print(f"\n  Exhausted: {current_unit['name']} (API 400 error)")
 
-                # Run (B)/(C) after exhausting a unit
-                print(f"\n(B)/(C) Unit complete - fixing existing data...")
-                still_fixing = run_fix_existing_data(client, metadata, progress)
-                if still_fixing:
-                    progress["offset"] = 0
-                    progress["crawl_unit_index"] = crawl_unit_index + 1
-                    progress["exhausted"] = list(exhausted)
-                    save_progress(progress)
-                    return
-
                 # Move to next unit
                 crawl_unit_index += 1
                 progress["crawl_unit_index"] = crawl_unit_index
@@ -1198,16 +1237,6 @@ def sync_full_taxonomy(limit: int = 0):
                 else:
                     print(f"\n  Exhausted: {current_unit['name']} (offset limit)")
 
-                # Run (B)/(C) after exhausting a unit
-                print(f"\n(B)/(C) Unit complete - fixing existing data...")
-                still_fixing = run_fix_existing_data(client, metadata, progress)
-                if still_fixing:
-                    progress["offset"] = 0
-                    progress["crawl_unit_index"] = crawl_unit_index + 1
-                    progress["exhausted"] = list(exhausted)
-                    save_progress(progress)
-                    return
-
                 # Move to next unit
                 crawl_unit_index += 1
                 offset = 0
@@ -1223,10 +1252,6 @@ def sync_full_taxonomy(limit: int = 0):
 
             print(f"\nBatch at offset {offset} ({len(results)} listings)...")
 
-            # Track shops we encounter in this batch
-            synced_shops = set(progress.get("synced_shops", []))
-            shops_to_sync = set()
-
             for listing in results:
                 if progress["api_calls_today"] >= DAILY_LIMIT:
                     break
@@ -1236,10 +1261,6 @@ def sync_full_taxonomy(limit: int = 0):
                 listing_id = listing["listing_id"]
                 listing_id_str = str(listing_id)
                 shop_id = listing.get("shop_id")
-
-                # Track this shop for later syncing
-                if shop_id and shop_id not in synced_shops:
-                    shops_to_sync.add(shop_id)
 
                 # Skip if already in metadata AND file exists on disk
                 existing = metadata.get(listing_id_str)
@@ -1266,27 +1287,6 @@ def sync_full_taxonomy(limit: int = 0):
                 stats["downloaded"] += 1  # Optimistic - queue will update metadata on completion
                 stats["processed"] += 1
 
-            # Sync any new shops from this batch
-            for shop_id in shops_to_sync:
-                if progress["api_calls_today"] >= DAILY_LIMIT:
-                    break
-                if limit > 0 and stats["downloaded"] >= limit:
-                    break
-                if shop_id in synced_shops:
-                    continue
-                print(f"[{ts()}] (C) Syncing shop {shop_id}...")
-                shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock,
-                                                limit=limit, current_count=stats["downloaded"])
-                if shop_stats.get("complete", False):
-                    synced_shops.add(shop_id)
-                if shop_stats["downloaded"] > 0 or shop_stats["errors"] > 0:
-                    print(f"[{ts()}]   Shop {shop_id}: +{shop_stats['downloaded']} queued, {shop_stats['errors']} errors")
-                    if not shop_stats.get("complete", False):
-                        print(f"[{ts()}]   (incomplete - will resume next run)")
-                stats["downloaded"] += shop_stats["downloaded"]
-                stats["errors"] += shop_stats["errors"]
-                progress["synced_shops"] = list(synced_shops)
-
             # Save progress after each batch
             offset += batch_size
             progress["offset"] = offset
@@ -1299,7 +1299,6 @@ def sync_full_taxonomy(limit: int = 0):
                   f"Downloaded: {queue_stats['downloaded']} | "
                   f"Pending: {download_queue.pending()} | "
                   f"Skipped: {stats['skipped']} | "
-                  f"Shops: {len(synced_shops)} | "
                   f"API: {progress['api_calls_today']}")
 
     # Wait for all pending downloads to complete
