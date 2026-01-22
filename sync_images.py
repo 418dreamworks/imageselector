@@ -461,49 +461,55 @@ class ImageDownloadQueue:
         self.scanner_thread.start()
 
     def _scanner(self):
-        """Scanner thread that finds empty files and queues them for download.
+        """Scanner thread that finds small/empty files and queues them for download.
 
+        Uses system find command for efficient file discovery.
         Reads URLs from metadata - no API calls needed.
         """
+        import subprocess
+
         while self.running:
             try:
-                # Find empty files not currently being processed
+                # Use find to get small files (<5KB) efficiently - no Python stat calls
+                result = subprocess.run(
+                    ["find", str(IMAGES_DIR), "-maxdepth", "1", "-name", "*.jpg", "-size", "-5k"],
+                    capture_output=True, text=True, timeout=60
+                )
+                small_files = [Path(f) for f in result.stdout.strip().split("\n") if f]
+
                 queued = 0
-                for f in IMAGES_DIR.glob("*.jpg"):
+                for f in small_files:
                     if not self.running:
                         break
                     try:
-                        # Re-download if empty OR under 5KB (old smaller image size)
-                        file_size = f.stat().st_size
-                        if file_size == 0 or file_size < 5000:
-                            listing_id = int(f.stem)
-                            with self.in_progress_lock:
-                                if listing_id in self.in_progress:
-                                    continue  # Already being processed
-                                self.in_progress.add(listing_id)
+                        listing_id = int(f.stem)
+                        with self.in_progress_lock:
+                            if listing_id in self.in_progress:
+                                continue  # Already being processed
+                            self.in_progress.add(listing_id)
 
-                            # Construct URL from metadata (hex/suffix)
-                            listing_id_str = str(listing_id)
-                            if self.metadata and self.metadata_lock:
-                                with self.metadata_lock:
-                                    entry = self.metadata.get(listing_id_str, {})
-                                    if isinstance(entry, dict):
-                                        hex_val = entry.get("hex")
-                                        suffix = entry.get("suffix")
-                                        image_id = entry.get("image_id")
-                                        shop_id = entry.get("shop_id")
-                                    else:
-                                        hex_val, suffix, image_id, shop_id = None, None, None, None
-
-                                if hex_val and suffix and image_id and shop_id:
-                                    # Construct URL for 570xN size
-                                    image_url = f"https://i.etsystatic.com/{shop_id}/r/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
-                                    self.queue.put((listing_id, image_url))
-                                    queued += 1
+                        # Construct URL from metadata (hex/suffix)
+                        listing_id_str = str(listing_id)
+                        if self.metadata and self.metadata_lock:
+                            with self.metadata_lock:
+                                entry = self.metadata.get(listing_id_str, {})
+                                if isinstance(entry, dict):
+                                    hex_val = entry.get("hex")
+                                    suffix = entry.get("suffix")
+                                    image_id = entry.get("image_id")
+                                    shop_id = entry.get("shop_id")
                                 else:
-                                    # Missing metadata - can't download, remove from in_progress
-                                    with self.in_progress_lock:
-                                        self.in_progress.discard(listing_id)
+                                    hex_val, suffix, image_id, shop_id = None, None, None, None
+
+                            if hex_val and suffix and image_id and shop_id:
+                                # Construct URL for 570xN size
+                                image_url = f"https://i.etsystatic.com/{shop_id}/r/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
+                                self.queue.put((listing_id, image_url))
+                                queued += 1
+                            else:
+                                # Missing metadata - can't download, remove from in_progress
+                                with self.in_progress_lock:
+                                    self.in_progress.discard(listing_id)
                     except (ValueError, OSError):
                         pass
 
