@@ -961,7 +961,7 @@ def sync_full_taxonomy(limit: int = 0):
             total_queued += shop_stats["downloaded"]
 
             if shop_stats["downloaded"] > 0:
-                print(f"[{ts()}] Shop {shop_id}: {shop_stats['have']} have, +{shop_stats['downloaded']} new")
+                print(f"[{ts()}] Shop {shop_id}: +{shop_stats['downloaded']} new, {shop_stats['skipped']} skipped")
 
             # Save periodically
             if shops_synced % 100 == 0:
