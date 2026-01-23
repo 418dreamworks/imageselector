@@ -32,8 +32,13 @@ BASE_DIR = Path(__file__).parent
 DB_FILE = BASE_DIR / "etsy_data.db"
 DB_FILE_TEST = BASE_DIR / "etsy_data_test.db"
 
-# Rate limiting
-API_DELAY = 0.011  # ~90 QPS
+# Rate limiting (will be set by --fast/--slow flag)
+API_DELAY = 0.011  # Default: ~90 QPS (fast mode)
+API_DELAY_FAST = 0.011  # ~90 QPS - use all available quota
+API_DELAY_SLOW = 1.0  # ~1 QPS - spread over ~10 days
+
+# Sync interval: 14 days in seconds
+SYNC_INTERVAL = 14 * 24 * 60 * 60
 
 
 def ts():
@@ -335,36 +340,25 @@ def insert_shop_dynamic(conn: sqlite3.Connection, shop_data: dict, snapshot_time
         "review_count": shop_data.get("review_count"),
     }
 
-    # If no previous data, write all; otherwise only write changed fields
-    if last is None:
-        values = current
-    else:
-        values = {}
-        for key, val in current.items():
-            if last.get(key) != val:
-                values[key] = val
-            else:
-                values[key] = None  # unchanged, store NULL
-
-    # Only insert if at least one field changed (or first time)
-    if last is None or any(v is not None for v in values.values()):
-        conn.execute("""
-            INSERT INTO shops_dynamic (
-                shop_id, snapshot_timestamp, update_date, listing_active_count,
-                accepts_custom_requests, num_favorers, transaction_sold_count,
-                review_average, review_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            shop_id,
-            snapshot_timestamp,
-            values.get("update_date"),
-            values.get("listing_active_count"),
-            values.get("accepts_custom_requests"),
-            values.get("num_favorers"),
-            values.get("transaction_sold_count"),
-            values.get("review_average"),
-            values.get("review_count"),
-        ))
+    # Always store all values (clearer than NULLs for unchanged)
+    values = current
+    conn.execute("""
+        INSERT INTO shops_dynamic (
+            shop_id, snapshot_timestamp, update_date, listing_active_count,
+            accepts_custom_requests, num_favorers, transaction_sold_count,
+            review_average, review_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        shop_id,
+        snapshot_timestamp,
+        values.get("update_date"),
+        values.get("listing_active_count"),
+        values.get("accepts_custom_requests"),
+        values.get("num_favorers"),
+        values.get("transaction_sold_count"),
+        values.get("review_average"),
+        values.get("review_count"),
+    ))
 
 
 def insert_listing_static(conn: sqlite3.Connection, listing: dict):
@@ -425,33 +419,22 @@ def insert_listing_dynamic(conn: sqlite3.Connection, listing: dict, snapshot_tim
         "views": listing.get("views"),
     }
 
-    # If no previous data, write all; otherwise only write changed fields
-    if last is None:
-        values = current
-    else:
-        values = {}
-        for key, val in current.items():
-            if last.get(key) != val:
-                values[key] = val
-            else:
-                values[key] = None  # unchanged, store NULL
-
-    # Only insert if at least one field changed (or first time)
-    if last is None or any(v is not None for v in values.values()):
-        conn.execute("""
-            INSERT INTO listings_dynamic (
-                listing_id, snapshot_timestamp, state, ending_timestamp,
-                quantity, num_favorers, views
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            listing_id,
-            snapshot_timestamp,
-            values.get("state"),
-            values.get("ending_timestamp"),
-            values.get("quantity"),
-            values.get("num_favorers"),
-            values.get("views"),
-        ))
+    # Always store all values (clearer than NULLs for unchanged)
+    values = current
+    conn.execute("""
+        INSERT INTO listings_dynamic (
+            listing_id, snapshot_timestamp, state, ending_timestamp,
+            quantity, num_favorers, views
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        listing_id,
+        snapshot_timestamp,
+        values.get("state"),
+        values.get("ending_timestamp"),
+        values.get("quantity"),
+        values.get("num_favorers"),
+        values.get("views"),
+    ))
 
 
 def insert_review(conn: sqlite3.Connection, review: dict):
@@ -475,10 +458,101 @@ def insert_review(conn: sqlite3.Connection, review: dict):
         pass  # Duplicate, skip
 
 
-def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
-    """Main sync function."""
+def run_continuous_sync(db_path: Path):
+    """Run sync continuously, checking for stale shops and syncing slowly."""
+    conn = init_db(db_path)
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        while True:
+            # Re-read metadata each iteration to pick up new shops
+            shop_counts = get_shop_ids_from_metadata()
+            if not shop_counts:
+                print(f"[{ts()}] No shops in metadata, sleeping 1 hour...")
+                time.sleep(3600)
+                continue
+
+            # Get sync state
+            last_shop_sync = get_sync_state(conn, "last_shop_sync", {})
+            last_review_timestamps = get_sync_state(conn, "last_review_timestamps", {})
+
+            # Find shops that need syncing (never synced or > 14 days old)
+            now = int(time.time())
+            stale_shops = []
+            for shop_id, listing_count in shop_counts.items():
+                last_sync = last_shop_sync.get(str(shop_id), 0)
+                if now - last_sync >= SYNC_INTERVAL:
+                    stale_shops.append((shop_id, listing_count))
+
+            if not stale_shops:
+                print(f"[{ts()}] All {len(shop_counts)} shops up to date, sleeping 1 hour...")
+                time.sleep(3600)
+                continue
+
+            # Sort by listing count (largest first) and pick one
+            stale_shops.sort(key=lambda x: x[1], reverse=True)
+            shop_id, listing_count = stale_shops[0]
+            snapshot_timestamp = int(time.time())
+
+            print(f"[{ts()}] Syncing shop {shop_id} ({len(stale_shops)} stale of {len(shop_counts)} total)...")
+
+            # Check if new shop
+            is_new_shop = conn.execute(
+                "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
+            ).fetchone() is None
+
+            # Fetch and store shop data
+            shop_data = fetch_shop(client, shop_id)
+            if shop_data:
+                if is_new_shop:
+                    insert_shop_static(conn, shop_data)
+                insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
+
+            # Fetch and store listings
+            listings = fetch_shop_listings(client, shop_id)
+            new_listings = 0
+            for listing in listings:
+                listing_id = listing.get("listing_id")
+                is_new = conn.execute(
+                    "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
+                ).fetchone() is None
+                if is_new:
+                    insert_listing_static(conn, listing)
+                    new_listings += 1
+                insert_listing_dynamic(conn, listing, snapshot_timestamp)
+
+            # Fetch reviews (incremental)
+            shop_id_str = str(shop_id)
+            last_ts = last_review_timestamps.get(shop_id_str, 0)
+            reviews = fetch_shop_reviews(client, shop_id, last_ts)
+            if reviews:
+                newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
+                last_review_timestamps[shop_id_str] = newest_ts
+                for review in reviews:
+                    insert_review(conn, review)
+
+            # Mark as synced
+            last_shop_sync[shop_id_str] = snapshot_timestamp
+
+            # Commit
+            conn.commit()
+            set_sync_state(conn, "last_shop_sync", last_shop_sync)
+            set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
+
+            print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
+
+
+def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False):
+    """Main sync function.
+
+    If continuous=True, runs forever, checking for stale shops and syncing slowly.
+    """
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
+        return
+
+    if continuous:
+        print(f"[{ts()}] Starting continuous sync mode...")
+        run_continuous_sync(db_path)
         return
 
     snapshot_timestamp = int(time.time())
@@ -501,8 +575,9 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
     # Initialize database
     conn = init_db(db_path)
 
-    # Get last review timestamps
+    # Get last review timestamps and last shop sync times
     last_review_timestamps = get_sync_state(conn, "last_review_timestamps", {})
+    last_shop_sync = get_sync_state(conn, "last_shop_sync", {})
 
     stats = {
         "shops_static": 0,
@@ -511,22 +586,32 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
         "listings_dynamic": 0,
         "reviews": 0,
         "api_calls": 0,
+        "skipped": 0,
     }
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         for i, shop_id in enumerate(shop_ids):
+            shop_id_str = str(shop_id)
+
+            # Check if shop was synced recently (within sync interval)
+            last_sync_time = last_shop_sync.get(shop_id_str, 0)
+            if snapshot_timestamp - last_sync_time < SYNC_INTERVAL:
+                stats["skipped"] += 1
+                continue
+
             print(f"\n[{ts()}] Shop {shop_id} ({i+1}/{len(shop_ids)})...")
+
+            # Check if this is a new shop (for static insert)
+            is_new_shop = conn.execute(
+                "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
+            ).fetchone() is None
 
             # Fetch shop data
             shop_data = fetch_shop(client, shop_id)
             stats["api_calls"] += 1
 
             if shop_data:
-                # Check if this is a new shop (for static insert)
-                existing = conn.execute(
-                    "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-                ).fetchone()
-                if not existing:
+                if is_new_shop:
                     insert_shop_static(conn, shop_data)
                     stats["shops_static"] += 1
 
@@ -540,10 +625,11 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
             for listing in listings:
                 listing_id = listing.get("listing_id")
                 # Check if this is a new listing (for static insert)
-                existing = conn.execute(
+                is_new_listing = conn.execute(
                     "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
-                ).fetchone()
-                if not existing:
+                ).fetchone() is None
+
+                if is_new_listing:
                     insert_listing_static(conn, listing)
                     stats["listings_static"] += 1
 
@@ -551,7 +637,6 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
                 stats["listings_dynamic"] += 1
 
             # Fetch reviews (incremental)
-            shop_id_str = str(shop_id)
             last_ts = last_review_timestamps.get(shop_id_str, 0)
             reviews = fetch_shop_reviews(client, shop_id, last_ts)
             stats["api_calls"] += 1
@@ -566,19 +651,25 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE):
 
             print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
 
+            # Mark shop as synced
+            last_shop_sync[shop_id_str] = snapshot_timestamp
+
             # Commit periodically
             if (i + 1) % 10 == 0:
                 conn.commit()
                 set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
+                set_sync_state(conn, "last_shop_sync", last_shop_sync)
 
     # Final commit
     conn.commit()
     set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
+    set_sync_state(conn, "last_shop_sync", last_shop_sync)
     set_sync_state(conn, "last_sync", snapshot_timestamp)
     conn.close()
 
     print("\n" + "=" * 50)
     print("Sync complete!")
+    print(f"  Skipped (recently synced): {stats['skipped']}")
     print(f"  New shops (static): {stats['shops_static']}")
     print(f"  Shop snapshots (dynamic): {stats['shops_dynamic']}")
     print(f"  New listings (static): {stats['listings_static']}")
@@ -593,10 +684,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sync Etsy shop/listing/review data")
     parser.add_argument("--top", type=int, default=0, help="Only sync top N shops by listing count")
     parser.add_argument("--test", action="store_true", help="Use test database")
+    parser.add_argument("--fast", action="store_true", help="Fast mode: ~90 QPS (use all API quota)")
+    parser.add_argument("--slow", action="store_true", help="Slow mode: ~1 QPS (spread over ~10 days)")
+    parser.add_argument("--continuous", action="store_true", help="Run continuously, syncing stale shops")
     args = parser.parse_args()
+
+    # Set API delay based on mode (default is fast)
+    if args.slow or args.continuous:
+        API_DELAY = API_DELAY_SLOW
+        print("*** SLOW MODE (~1 QPS) ***\n")
+    elif args.fast:
+        API_DELAY = API_DELAY_FAST
+        print("*** FAST MODE (~90 QPS) ***\n")
 
     db_path = DB_FILE_TEST if args.test else DB_FILE
     if args.test:
         print("*** TEST MODE ***\n")
 
-    sync_data(top_n=args.top, db_path=db_path)
+    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous)
