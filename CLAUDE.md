@@ -1,39 +1,91 @@
 # Etsy Furniture Image Sync
 
-## Algorithm
+## Remote Server
+
+This code runs on a remote computer accessible via:
+```bash
+ssh imac
+# or: ssh tzuohannlaw@192.168.68.106
+```
+No password or passphrase required from this machine.
+
+## Project State
+
+Two main scripts share the Etsy API quota:
+
+1. **sync_images.py** - Downloads furniture listing images from Etsy CDN
+   - Run continuously in slow mode on remote server
+   - Uses API to discover listings, CDN to download images
+   - Stores images + metadata (shop_id, listing_id, image URLs)
+
+2. **sync_data.py** - Collects shop/listing/review data to SQLite
+   - Run after image sync completes (shares API quota)
+   - Reads `image_metadata.json` to know which shops to sync
+   - Skips shops synced within last 14 days
+
+## Algorithm (sync_images.py)
 
 ```
-(A) Every 30 days, clear synced_shops to re-check for new listings
-(B) For listings missing shop_id, call API to get it
-(C) For shops not in synced_shops, sync ALL their furniture listings
-(D) Crawl each (taxonomy_id, min_price, max_price) interval from furniture_taxonomy_config.json
+(A) Every 30 days, re-sync all known shops from metadata
+(B) For each shop: get all furniture listings, queue new images
+(C) Crawl each (taxonomy_id, min_price, max_price) interval from furniture_taxonomy_config.json
+(D) Background workers download queued images from CDN
 ```
 
 ## Usage
 
+### Image Sync (sync_images.py)
+
 ```bash
-python sync_images.py              # Run sync (default: slow mode)
-python sync_images.py --fast       # Fast mode: ~95 QPS API, 15/sec CDN, 4 workers
-python sync_images.py --slow       # Slow mode: ~400k images over 30 days (default)
-python sync_images.py --reset-shops  # Clear synced_shops list, then run
-python sync_images.py --test       # Use test folders instead of production
-python sync_images.py --limit N    # Limit to N listings (for testing)
-python sync_images.py ids.txt      # Sync specific listing IDs from file
+# Production: run with caffeinate to prevent Mac sleep
+cd ~/Documents/418Dreamworks/imageselector
+nohup caffeinate -i ./venv/bin/python -u sync_images.py --slow > sync_output.log 2>&1 &
+
+# Fast mode: use when API quota is available and need quick sync
+nohup caffeinate -i ./venv/bin/python -u sync_images.py --fast > sync_output.log 2>&1 &
+
+# Other options
+./venv/bin/python sync_images.py --reset-shops  # Clear synced_shops list, then run
+./venv/bin/python sync_images.py --test         # Use test folders instead of production
+./venv/bin/python sync_images.py --limit N      # Limit to N listings (for testing)
+./venv/bin/python sync_images.py ids.txt        # Sync specific listing IDs from file
 ```
+
+**Important:** Use `caffeinate -i` to prevent Mac from sleeping while running.
+
+**Recommendation:** Run `--slow` (default) for daily operation. Only use `--fast` when you need to catch up or rebuild data quickly.
 
 ### Data Sync (sync_data.py)
 
 ```bash
-python sync_data.py                # Sync all shops from metadata
-python sync_data.py --top 3        # Only sync top 3 shops by listing count
-python sync_data.py --test         # Use test folders
+# Initial collection: run fast to get all data quickly
+./venv/bin/python sync_data.py --fast         # ~90 QPS, sync all shops once
+
+# Ongoing: run continuously in slow mode (with caffeinate)
+nohup caffeinate -i ./venv/bin/python -u sync_data.py --continuous > data_sync.log 2>&1 &
+
+# Other options
+python sync_data.py --slow         # ~1 QPS, one-shot sync
+python sync_data.py --top N        # Only sync top N shops by listing count
+python sync_data.py --test         # Use test database
 ```
 
-Output files:
-- `shops_data.json` - Shop snapshots
-- `listings_data.json` - Listing snapshots
-- `reviews_data.json` - Reviews (append-only)
-- `data_sync_state.json` - Tracks last review timestamps per shop
+**Workflow:**
+1. First run `--fast` to collect all data quickly (uses full API quota)
+2. Then run `--continuous` which runs forever in slow mode (~1 QPS), checking for shops that need updating (>14 days since last sync)
+
+**Sync Logic:**
+- New shop (not in DB): fetch all data, insert static + dynamic
+- Existing shop (last sync > 14 days): fetch all data, insert dynamic only
+- Existing shop (last sync < 14 days): skip entirely (no API call)
+
+**Output:** SQLite database `etsy_data.db` with tables:
+- `shops` - Static shop data (written once)
+- `shops_dynamic` - Dynamic shop data (appended each sync)
+- `listings` - Static listing data (written once)
+- `listings_dynamic` - Dynamic listing data (appended each sync)
+- `reviews` - Reviews (append-only, incremental fetch)
+- `sync_state` - Tracks last sync times per shop
 
 ## Data Collection
 

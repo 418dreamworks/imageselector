@@ -47,6 +47,19 @@ def extract_hex_suffix(url: str) -> tuple[str | None, str | None]:
 
 load_dotenv()
 
+
+def retry_on_timeout(func, *args, max_retries=3, delay=5, **kwargs):
+    """Retry a function on timeout/network errors."""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as e:
+            if attempt < max_retries - 1:
+                print(f"  [Retry {attempt + 1}/{max_retries}] {type(e).__name__}, waiting {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+
 # Config
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
@@ -656,11 +669,16 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             break
 
         time.sleep(API_DELAY)
-        response = client.get(
-            f"{BASE_URL}/application/shops/{shop_id}/listings/active",
-            headers={"x-api-key": ETSY_API_KEY},
-            params={"limit": batch_size, "offset": offset},
-        )
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/shops/{shop_id}/listings/active",
+                headers={"x-api-key": ETSY_API_KEY},
+                params={"limit": batch_size, "offset": offset},
+            )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as e:
+            print(f"  [Error] Shop {shop_id}: {type(e).__name__}, skipping...")
+            stats["errors"] += 1
+            break
         progress["api_calls_today"] += 1
         stats["api_calls"] += 1
 
@@ -930,7 +948,7 @@ def sync_full_taxonomy(limit: int = 0):
         """(A) 30-day refresh: Re-sync all known shops from metadata.
 
         Iterates through all unique shop_ids and fetches their current listings,
-        adding any new ones to the download queue.
+        adding any new ones to the download queue. Skips shops already synced this refresh.
 
         Returns True if hit daily limit (still work to do), False if complete.
         """
@@ -944,11 +962,21 @@ def sync_full_taxonomy(limit: int = 0):
             print("  No shops to refresh")
             return False
 
-        print(f"  Re-syncing {len(all_shop_ids)} shops...")
+        # Skip shops already synced in this refresh cycle
+        synced_shops = set(progress.get("synced_shops", []))
+        remaining_shops = all_shop_ids - synced_shops
+
+        if not remaining_shops:
+            print(f"  All {len(all_shop_ids)} shops already synced")
+            progress["last_shop_refresh"] = time.time()
+            save_progress(progress)
+            return False
+
+        print(f"  Re-syncing {len(remaining_shops)} shops ({len(synced_shops)} already done)...")
         shops_synced = 0
         total_queued = 0
 
-        for shop_id in all_shop_ids:
+        for shop_id in remaining_shops:
             if progress["api_calls_today"] >= DAILY_LIMIT:
                 print(f"\n  Reached daily limit. {len(all_shop_ids) - shops_synced} shops remaining.")
                 save_progress(progress)
@@ -960,12 +988,16 @@ def sync_full_taxonomy(limit: int = 0):
             shops_synced += 1
             total_queued += shop_stats["downloaded"]
 
+            # Mark shop as synced so we can resume on restart
+            synced_shops.add(shop_id)
+            progress["synced_shops"] = list(synced_shops)
+
             if shop_stats["downloaded"] > 0:
                 print(f"[{ts()}] Shop {shop_id}: +{shop_stats['downloaded']} new, {shop_stats['skipped']} skipped")
 
             # Save periodically
             if shops_synced % 100 == 0:
-                print(f"  Progress: {shops_synced}/{len(all_shop_ids)} shops, {total_queued} new images queued")
+                print(f"  Progress: {shops_synced}/{len(remaining_shops)} shops, {total_queued} new images queued")
                 save_progress(progress)
                 with metadata_lock:
                     save_metadata(metadata)
