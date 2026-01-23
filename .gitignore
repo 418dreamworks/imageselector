@@ -25,3 +25,6 @@ __pycache__/
 
 # Claude
 .claude/
+etsy_data.db
+data_sync_state.json
+*_data.json
