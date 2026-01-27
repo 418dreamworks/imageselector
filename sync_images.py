@@ -125,19 +125,13 @@ PROGRESS_FILE_TEST = BASE_DIR / "sync_progress_test.json"
 IMAGES_DIR.mkdir(exist_ok=True)
 
 # Rate limiting - defaults to slow mode, use --fast for initial bulk sync
-DAILY_LIMIT = 90000  # Leave 10k buffer for development
-# Slow mode: ~400k images over 30 days = 1 every 6.5 sec
-API_DELAY_SLOW = 0.33
-CDN_RATE_LIMIT_SLOW = 0.15
-NUM_WORKERS_SLOW = 1
-# Fast mode: ~95 QPS API, 15/sec CDN (original speeds)
-API_DELAY_FAST = 0.011
-CDN_RATE_LIMIT_FAST = 15
-NUM_WORKERS_FAST = 4
-# Active settings (set by --fast/--slow flags, default slow)
-API_DELAY = API_DELAY_SLOW
-CDN_RATE_LIMIT = CDN_RATE_LIMIT_SLOW
-NUM_WORKERS = NUM_WORKERS_SLOW
+# API rate limiting (--fast/--slow flag)
+API_DELAY_SLOW = 0.5    # 2 QPS
+API_DELAY_FAST = 0.25   # 4 QPS
+API_DELAY = API_DELAY_SLOW  # Default slow, set by flag
+# CDN workers (always 5/sec)
+CDN_RATE_LIMIT = 5
+NUM_WORKERS = 4
 MAX_OFFSET = 10000   # Etsy API doesn't allow offset > 10000
 
 # All furniture taxonomy IDs (parent + leaf) for filtering shop listings
@@ -146,6 +140,16 @@ FURNITURE_TAXONOMY_IDS = {
     11837, 978, 979, 12403, 12405, 12406, 980, 981, 982, 983, 985, 986, 987, 988,
     989, 990, 12369, 12370, 991, 992, 993, 12371, 12372, 994, 11355, 11356, 998,
     996, 12468, 12216, 997, 999, 1000, 1001, 12408
+}
+
+# Allowed when_made values - excludes vintage/antique items (before 2000)
+ALLOWED_WHEN_MADE = {
+    "made_to_order",
+    "2020_2026",
+    "2010_2019",
+    "2000_2009",
+    "2000_2006",
+    "2007_2009",
 }
 
 # Global reference for signal handler cleanup
@@ -272,7 +276,33 @@ def save_progress(progress: dict):
         json.dump(progress, f)
 
 
-def get_remaining_calls(client: httpx.Client) -> int:
+def update_api_usage_from_headers(response: httpx.Response, progress: dict):
+    """Update API usage stats from Etsy response headers.
+
+    Etsy returns these headers on every response:
+    - x-limit-per-day: Daily quota (e.g., 10000)
+    - x-remaining-today: Remaining calls in 24h sliding window
+    """
+    try:
+        remaining = int(response.headers.get("x-remaining-today", 0))
+        limit = int(response.headers.get("x-limit-per-day", 10000))
+        progress["api_remaining"] = remaining
+        progress["api_limit"] = limit
+        progress["api_used"] = limit - remaining
+    except (ValueError, TypeError):
+        pass  # Headers not present or invalid
+
+
+def print_rate_limit_headers(response: httpx.Response):
+    """Print all rate/limit related headers from an Etsy response."""
+    print("\n=== RATE LIMIT HEADERS ===")
+    for key, value in response.headers.items():
+        if any(k in key.lower() for k in ["rate", "limit", "remaining", "retry", "reset"]):
+            print(f"  {key}: {value}")
+    print("==========================\n")
+
+
+def get_remaining_calls(client: httpx.Client, progress: dict = None) -> int:
     """Check remaining API calls from response headers."""
     response = client.get(
         f"{BASE_URL}/application/listings/active",
@@ -280,10 +310,12 @@ def get_remaining_calls(client: httpx.Client) -> int:
         params={"limit": 1},
     )
     remaining = int(response.headers.get("x-remaining-today", 0))
+    if progress is not None:
+        update_api_usage_from_headers(response, progress)
     return remaining
 
 
-def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, str, None] | tuple[None, None, str]:
+def get_first_image_info(client: httpx.Client, listing_id: int, progress: dict = None) -> tuple[int, str, None] | tuple[None, None, str]:
     """Get the first image's ID and URL for a listing.
 
     Returns (image_id, url, None) on success, or (None, None, error_reason) on failure.
@@ -293,6 +325,8 @@ def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, st
             f"{BASE_URL}/application/listings/{listing_id}/images",
             headers={"x-api-key": ETSY_API_KEY},
         )
+        if progress is not None:
+            update_api_usage_from_headers(response, progress)
         if response.status_code == 404:
             return None, None, "404"
         response.raise_for_status()
@@ -307,7 +341,7 @@ def get_first_image_info(client: httpx.Client, listing_id: int) -> tuple[int, st
         return None, None, f"http_{e.response.status_code}"
 
 
-def get_batch_image_info(client: httpx.Client, listing_ids: list[int]) -> dict[int, tuple[int, str]]:
+def get_batch_image_info(client: httpx.Client, listing_ids: list[int], progress: dict = None) -> dict[int, tuple[int, str]]:
     """Get first image info for multiple listings in one API call.
 
     Uses the batch endpoint with includes=Images to fetch up to 100 listings
@@ -315,6 +349,7 @@ def get_batch_image_info(client: httpx.Client, listing_ids: list[int]) -> dict[i
 
     Args:
         listing_ids: List of listing IDs (max 100)
+        progress: Optional progress dict to update API usage from headers
 
     Returns:
         Dict mapping listing_id -> (image_id, url) for listings that have images.
@@ -332,6 +367,8 @@ def get_batch_image_info(client: httpx.Client, listing_ids: list[int]) -> dict[i
             headers={"x-api-key": ETSY_API_KEY},
             params={"listing_ids": ids_param, "includes": "Images"},
         )
+        if progress is not None:
+            update_api_usage_from_headers(response, progress)
         response.raise_for_status()
 
         results = {}
@@ -665,9 +702,6 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
     batch_size = 100
 
     while True:
-        if progress["api_calls_today"] >= DAILY_LIMIT:
-            break
-
         time.sleep(API_DELAY)
         try:
             response = client.get(
@@ -679,14 +713,15 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             print(f"  [Error] Shop {shop_id}: {type(e).__name__}, skipping...")
             stats["errors"] += 1
             break
-        progress["api_calls_today"] += 1
+        update_api_usage_from_headers(response, progress)
         stats["api_calls"] += 1
 
         if response.status_code == 404:
             break
         if response.status_code == 429:
-            time.sleep(60)
-            continue
+            print(f"\n429 Rate Limited while syncing shop {shop_id}")
+            print_rate_limit_headers(response)
+            break
 
         response.raise_for_status()
         listings = response.json().get("results", [])
@@ -696,7 +731,8 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
 
         for listing in listings:
             taxonomy_id = listing.get("taxonomy_id")
-            if taxonomy_id in FURNITURE_TAXONOMY_IDS:
+            when_made = listing.get("when_made", "")
+            if taxonomy_id in FURNITURE_TAXONOMY_IDS and when_made in ALLOWED_WHEN_MADE:
                 all_furniture_listings.append(listing)
 
         offset += batch_size
@@ -739,8 +775,6 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
     BATCH_SIZE = 100
 
     for i in range(0, len(listings_needing_images), BATCH_SIZE):
-        if progress["api_calls_today"] >= DAILY_LIMIT:
-            break
         # Check global limit
         if limit > 0 and (current_count + stats["downloaded"]) >= limit:
             break
@@ -752,8 +786,7 @@ def sync_shop_listings(client: httpx.Client, shop_id: int, metadata: dict, progr
             batch = batch[:remaining]
 
         time.sleep(API_DELAY)
-        image_info = get_batch_image_info(client, batch)
-        progress["api_calls_today"] += 1
+        image_info = get_batch_image_info(client, batch, progress)
         stats["api_calls"] += 1
 
         # Process results
@@ -882,10 +915,10 @@ def sync_full_taxonomy(limit: int = 0):
     metadata = load_metadata()
     progress = load_progress()
 
-    # Check if 24h has passed since last reset
-    if time.time() - progress.get("last_reset", 0) > 86400:
-        progress["api_calls_today"] = 0
-        progress["last_reset"] = time.time()
+    # Initialize API usage tracking (will be updated from Etsy headers)
+    progress.setdefault("api_used", 0)
+    progress.setdefault("api_limit", 10000)
+    progress.setdefault("api_remaining", 10000)
 
     # Load existing image files for fast skip checks
     # File size 0 = pending/incomplete, size > 0 = complete
@@ -911,16 +944,14 @@ def sync_full_taxonomy(limit: int = 0):
             if isinstance(v, dict) and v.get("image_id") == FAILED_IMAGE_ID
         ]
         if failed_entries:
-            print(f"    Clearing {len(failed_entries)} failed downloads for retry...")
+            print(f"    Clearing {len(failed_entries)} failed placeholder images for retry...")
             for lid_str in failed_entries:
                 listing_id = int(lid_str)
-                # Delete white placeholder image
+                # Delete white placeholder image so it will be re-downloaded
                 placeholder = IMAGES_DIR / f"{listing_id}.jpg"
                 placeholder.unlink(missing_ok=True)
                 _existing_images.pop(listing_id, None)
-                # Clear from metadata so it will be re-downloaded
-                del metadata[lid_str]
-            save_metadata(metadata)
+                # Keep metadata entry - never delete metadata
 
     # Count successes vs errors in metadata
     success_count = sum(1 for v in metadata.values() if is_success(v))
@@ -931,7 +962,7 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"{'='*60}")
     print(f"Images in corpus: {success_count} | Errors: {error_count}")
     print(f"Crawl units: {len(CRAWL_UNITS)}")
-    print(f"API calls today: {progress['api_calls_today']}")
+    print(f"API used/limit: {progress.get('api_used', '?')}/{progress.get('api_limit', '?')}")
 
     # Create thread-safe metadata access and download queue early
     # so it can be used by both startup fix and main crawl
@@ -977,13 +1008,6 @@ def sync_full_taxonomy(limit: int = 0):
         total_queued = 0
 
         for shop_id in remaining_shops:
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                print(f"\n  Reached daily limit. {len(all_shop_ids) - shops_synced} shops remaining.")
-                save_progress(progress)
-                with metadata_lock:
-                    save_metadata(metadata)
-                return True  # Still work to do
-
             shop_stats = sync_shop_listings(client, shop_id, metadata, progress, download_queue, metadata_lock)
             shops_synced += 1
             total_queued += shop_stats["downloaded"]
@@ -1041,12 +1065,6 @@ def sync_full_taxonomy(limit: int = 0):
 
         # (B) Fix listings missing shop_id
         for listing_id_str, entry in listings_needing_shop:
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                print(f"\nReached daily limit. {len(listings_needing_shop) - fixed_count} listings still need fixing.")
-                save_progress(progress)
-                save_metadata(metadata)
-                return True  # Still work to do
-
             # Skip if shop_id was already filled in by a previous shop sync
             if entry.get("shop_id") is not None:
                 fixed_count += 1
@@ -1061,7 +1079,7 @@ def sync_full_taxonomy(limit: int = 0):
                     f"{BASE_URL}/application/listings/{listing_id}",
                     headers={"x-api-key": ETSY_API_KEY},
                 )
-                progress["api_calls_today"] += 1
+                update_api_usage_from_headers(response, progress)
 
                 if response.status_code == 404:
                     # Listing no longer exists, mark as error
@@ -1069,9 +1087,11 @@ def sync_full_taxonomy(limit: int = 0):
                     fixed_count += 1
                     continue
                 if response.status_code == 429:
-                    print("Rate limited. Waiting 60 seconds...")
-                    time.sleep(60)
-                    continue
+                    print(f"\n429 Rate Limited while fixing listing {listing_id}")
+                    print_rate_limit_headers(response)
+                    save_progress(progress)
+                    save_metadata(metadata)
+                    return True
                 response.raise_for_status()
 
                 listing_data = response.json()
@@ -1110,12 +1130,6 @@ def sync_full_taxonomy(limit: int = 0):
 
         # Sync any remaining shops that have shop_id but aren't synced yet
         for shop_id in shops_needing_sync:
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                print(f"\nReached daily limit during shop sync.")
-                save_progress(progress)
-                save_metadata(metadata)
-                return True  # Still work to do
-
             if shop_id in synced_shops:
                 continue  # Already synced during (B)
 
@@ -1167,6 +1181,10 @@ def sync_full_taxonomy(limit: int = 0):
     }
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        # Get initial API usage from Etsy
+        get_remaining_calls(client, progress)
+        print(f"API used/limit: {progress.get('api_used', '?')}/{progress.get('api_limit', '?')}")
+
         offset = progress.get("offset", 0)
         batch_size = 100
 
@@ -1190,10 +1208,6 @@ def sync_full_taxonomy(limit: int = 0):
             if limit > 0 and stats["downloaded"] >= limit:
                 print(f"\nReached download limit ({limit}).")
                 break
-            if progress["api_calls_today"] >= DAILY_LIMIT:
-                print(f"\nReached daily limit ({progress['api_calls_today']} calls).")
-                print("Run again after 24 hours to continue.")
-                break
 
             current_unit = CRAWL_UNITS[crawl_unit_index]
 
@@ -1214,7 +1228,7 @@ def sync_full_taxonomy(limit: int = 0):
                 print(f"{'='*60}")
                 print(f"Images in corpus: {success_count} | Errors: {error_count}")
                 print(f"Exhausted units: {len(exhausted)}/{len(CRAWL_UNITS)}")
-                print(f"API calls today: {progress['api_calls_today']}")
+                print(f"API used/limit: {progress.get('api_used', '?')}/{progress.get('api_limit', '?')}")
 
             # Build API params
             params = {
@@ -1234,12 +1248,15 @@ def sync_full_taxonomy(limit: int = 0):
                 headers={"x-api-key": ETSY_API_KEY},
                 params=params,
             )
-            progress["api_calls_today"] += 1
+            update_api_usage_from_headers(response, progress)
 
             if response.status_code == 429:
-                print("Rate limited. Waiting 60 seconds...")
-                time.sleep(60)
-                continue
+                print(f"\n429 Rate Limited at crawl unit {crawl_unit_index}, offset {offset}")
+                print_rate_limit_headers(response)
+                save_progress(progress)
+                with metadata_lock:
+                    save_metadata(metadata)
+                break
 
             # 400 error often means offset is beyond available results for this taxonomy
             if response.status_code == 400:
@@ -1285,10 +1302,14 @@ def sync_full_taxonomy(limit: int = 0):
             print(f"\nBatch at offset {offset} ({len(results)} listings)...")
 
             for listing in results:
-                if progress["api_calls_today"] >= DAILY_LIMIT:
-                    break
                 if limit > 0 and stats["downloaded"] >= limit:
                     break
+
+                # Skip vintage/antique items
+                when_made = listing.get("when_made", "")
+                if when_made not in ALLOWED_WHEN_MADE:
+                    stats["processed"] += 1
+                    continue
 
                 listing_id = listing["listing_id"]
                 listing_id_str = str(listing_id)
@@ -1305,8 +1326,7 @@ def sync_full_taxonomy(limit: int = 0):
 
                 # Get image info
                 time.sleep(API_DELAY)
-                image_id, image_url, error = get_first_image_info(client, listing_id)
-                progress["api_calls_today"] += 1
+                image_id, image_url, error = get_first_image_info(client, listing_id, progress)
 
                 if error:
                     metadata[listing_id_str] = error
@@ -1331,7 +1351,7 @@ def sync_full_taxonomy(limit: int = 0):
                   f"Downloaded: {queue_stats['downloaded']} | "
                   f"Pending: {download_queue.pending()} | "
                   f"Skipped: {stats['skipped']} | "
-                  f"API: {progress['api_calls_today']}")
+                  f"API: {progress.get('api_used', '?')}/{progress.get('api_limit', '?')}")
 
     # Wait for all pending downloads to complete
     pending = download_queue.pending()
@@ -1354,7 +1374,7 @@ def sync_full_taxonomy(limit: int = 0):
     print(f"  Images downloaded: {queue_stats['downloaded']}")
     print(f"  Download errors: {queue_stats['errors']}")
     print(f"  Skipped (unchanged): {stats['skipped']}")
-    print(f"  API calls used: {progress['api_calls_today']}")
+    print(f"  API used/limit: {progress.get('api_used', '?')}/{progress.get('api_limit', '?')}")
     print(f"  Next offset: {progress.get('offset', 0)}")
     print(f"  Images stored in: {IMAGES_DIR}")
 
@@ -1383,16 +1403,14 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=0, help="Limit number of listings to process (0 = no limit)")
     parser.add_argument("--reset-shops", action="store_true", help="Clear synced_shops list to re-sync all shops")
     speed_group = parser.add_mutually_exclusive_group()
-    speed_group.add_argument("--fast", action="store_true", help="Fast mode: ~95 QPS API, 15/sec CDN, 4 workers (for initial bulk sync)")
-    speed_group.add_argument("--slow", action="store_true", help="Slow mode: ~400k images over 30 days (default)")
+    speed_group.add_argument("--fast", action="store_true", help="Fast mode: 4 QPS API (for bulk sync)")
+    speed_group.add_argument("--slow", action="store_true", help="Slow mode: 2 QPS API (default)")
     args = parser.parse_args()
 
     # Set speed mode (default is slow)
     if args.fast:
         API_DELAY = API_DELAY_FAST
-        CDN_RATE_LIMIT = CDN_RATE_LIMIT_FAST
-        NUM_WORKERS = NUM_WORKERS_FAST
-        print("*** FAST MODE - bulk sync speeds ***\n")
+        print("*** FAST MODE - 4 QPS API ***\n")
 
     # Handle --reset-shops flag
     if args.reset_shops:

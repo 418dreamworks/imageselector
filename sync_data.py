@@ -33,9 +33,9 @@ DB_FILE = BASE_DIR / "etsy_data.db"
 DB_FILE_TEST = BASE_DIR / "etsy_data_test.db"
 
 # Rate limiting (will be set by --fast/--slow flag)
-API_DELAY = 0.011  # Default: ~90 QPS (fast mode)
-API_DELAY_FAST = 0.011  # ~90 QPS - use all available quota
-API_DELAY_SLOW = 1.0  # ~1 QPS - spread over ~10 days
+API_DELAY = 0.08  # Default: ~5 QPS effective (sleep + API latency)
+API_DELAY_FAST = 0.08  # ~5 QPS effective (MAX allowed)
+API_DELAY_SLOW = 1.0  # ~1 QPS
 
 # Sync interval: 14 days in seconds
 SYNC_INTERVAL = 14 * 24 * 60 * 60
@@ -55,6 +55,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         -- Shops static table (written once per shop)
         CREATE TABLE IF NOT EXISTS shops (
             shop_id INTEGER PRIMARY KEY,
+            snapshot_timestamp INTEGER,
             create_date INTEGER,
             url TEXT,
             is_shop_us_based INTEGER,
@@ -81,6 +82,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         -- Listings static table (written once per listing)
         CREATE TABLE IF NOT EXISTS listings (
             listing_id INTEGER PRIMARY KEY,
+            snapshot_timestamp INTEGER,
             shop_id INTEGER NOT NULL,
             title TEXT,
             creation_timestamp INTEGER,
@@ -124,9 +126,10 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_listings_dynamic_listing_id ON listings_dynamic(listing_id);
         CREATE INDEX IF NOT EXISTS idx_listings_dynamic_timestamp ON listings_dynamic(snapshot_timestamp);
 
-        -- Reviews table (append-only, no snapshots needed)
+        -- Reviews table (append-only)
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_timestamp INTEGER,
             shop_id INTEGER NOT NULL,
             listing_id INTEGER NOT NULL,
             buyer_user_id INTEGER,
@@ -307,15 +310,16 @@ def get_last_listing_dynamic(conn: sqlite3.Connection, listing_id: int) -> dict 
     return None
 
 
-def insert_shop_static(conn: sqlite3.Connection, shop_data: dict):
+def insert_shop_static(conn: sqlite3.Connection, shop_data: dict, snapshot_timestamp: int):
     """Insert shop static data (ignore if exists)."""
     conn.execute("""
         INSERT OR IGNORE INTO shops (
-            shop_id, create_date, url, is_shop_us_based,
+            shop_id, snapshot_timestamp, create_date, url, is_shop_us_based,
             shipping_from_country_iso, shop_location_country_iso
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         shop_data.get("shop_id"),
+        snapshot_timestamp,
         shop_data.get("create_date"),
         shop_data.get("url"),
         1 if shop_data.get("is_shop_us_based") else 0,
@@ -361,21 +365,22 @@ def insert_shop_dynamic(conn: sqlite3.Connection, shop_data: dict, snapshot_time
     ))
 
 
-def insert_listing_static(conn: sqlite3.Connection, listing: dict):
+def insert_listing_static(conn: sqlite3.Connection, listing: dict, snapshot_timestamp: int):
     """Insert listing static data (ignore if exists)."""
     price = listing.get("price", {})
     conn.execute("""
         INSERT OR IGNORE INTO listings (
-            listing_id, shop_id, title, creation_timestamp, url,
+            listing_id, snapshot_timestamp, shop_id, title, creation_timestamp, url,
             is_customizable, is_personalizable, listing_type, tags, materials,
             processing_min, processing_max, who_made, when_made,
             item_weight, item_weight_unit, item_length, item_width,
             item_height, item_dimensions_unit, should_auto_renew, language,
             price_amount, price_divisor, price_currency, taxonomy_id,
             production_partners
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         listing.get("listing_id"),
+        snapshot_timestamp,
         listing.get("shop_id"),
         listing.get("title"),
         listing.get("creation_timestamp"),
@@ -437,15 +442,16 @@ def insert_listing_dynamic(conn: sqlite3.Connection, listing: dict, snapshot_tim
     ))
 
 
-def insert_review(conn: sqlite3.Connection, review: dict):
+def insert_review(conn: sqlite3.Connection, review: dict, snapshot_timestamp: int):
     """Insert review (skip if duplicate)."""
     try:
         conn.execute("""
             INSERT OR IGNORE INTO reviews (
-                shop_id, listing_id, buyer_user_id, rating, review,
+                snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
                 language, create_timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            snapshot_timestamp,
             review.get("shop_id"),
             review.get("listing_id"),
             review.get("buyer_user_id"),
@@ -504,7 +510,7 @@ def run_continuous_sync(db_path: Path):
             shop_data = fetch_shop(client, shop_id)
             if shop_data:
                 if is_new_shop:
-                    insert_shop_static(conn, shop_data)
+                    insert_shop_static(conn, shop_data, snapshot_timestamp)
                 insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
 
             # Fetch and store listings
@@ -516,7 +522,7 @@ def run_continuous_sync(db_path: Path):
                     "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
                 ).fetchone() is None
                 if is_new:
-                    insert_listing_static(conn, listing)
+                    insert_listing_static(conn, listing, snapshot_timestamp)
                     new_listings += 1
                 insert_listing_dynamic(conn, listing, snapshot_timestamp)
 
@@ -528,7 +534,7 @@ def run_continuous_sync(db_path: Path):
                 newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
                 last_review_timestamps[shop_id_str] = newest_ts
                 for review in reviews:
-                    insert_review(conn, review)
+                    insert_review(conn, review, snapshot_timestamp)
 
             # Mark as synced
             last_shop_sync[shop_id_str] = snapshot_timestamp
@@ -541,10 +547,11 @@ def run_continuous_sync(db_path: Path):
             print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
 
 
-def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False):
+def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False):
     """Main sync function.
 
     If continuous=True, runs forever, checking for stale shops and syncing slowly.
+    If shops_only=True, only fetches shop data (skips listings and reviews).
     """
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
@@ -612,44 +619,45 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False)
 
             if shop_data:
                 if is_new_shop:
-                    insert_shop_static(conn, shop_data)
+                    insert_shop_static(conn, shop_data, snapshot_timestamp)
                     stats["shops_static"] += 1
 
                 insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
                 stats["shops_dynamic"] += 1
 
-            # Fetch listings
-            listings = fetch_shop_listings(client, shop_id)
-            stats["api_calls"] += (len(listings) // 100) + 1
+            if not shops_only:
+                # Fetch listings
+                listings = fetch_shop_listings(client, shop_id)
+                stats["api_calls"] += (len(listings) // 100) + 1
 
-            for listing in listings:
-                listing_id = listing.get("listing_id")
-                # Check if this is a new listing (for static insert)
-                is_new_listing = conn.execute(
-                    "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
-                ).fetchone() is None
+                for listing in listings:
+                    listing_id = listing.get("listing_id")
+                    # Check if this is a new listing (for static insert)
+                    is_new_listing = conn.execute(
+                        "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
+                    ).fetchone() is None
 
-                if is_new_listing:
-                    insert_listing_static(conn, listing)
-                    stats["listings_static"] += 1
+                    if is_new_listing:
+                        insert_listing_static(conn, listing, snapshot_timestamp)
+                        stats["listings_static"] += 1
 
-                insert_listing_dynamic(conn, listing, snapshot_timestamp)
-                stats["listings_dynamic"] += 1
+                    insert_listing_dynamic(conn, listing, snapshot_timestamp)
+                    stats["listings_dynamic"] += 1
 
-            # Fetch reviews (incremental)
-            last_ts = last_review_timestamps.get(shop_id_str, 0)
-            reviews = fetch_shop_reviews(client, shop_id, last_ts)
-            stats["api_calls"] += 1
+                # Fetch reviews (incremental)
+                last_ts = last_review_timestamps.get(shop_id_str, 0)
+                reviews = fetch_shop_reviews(client, shop_id, last_ts)
+                stats["api_calls"] += 1
 
-            if reviews:
-                newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
-                last_review_timestamps[shop_id_str] = newest_ts
+                if reviews:
+                    newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
+                    last_review_timestamps[shop_id_str] = newest_ts
 
-                for review in reviews:
-                    insert_review(conn, review)
-                    stats["reviews"] += 1
+                    for review in reviews:
+                        insert_review(conn, review, snapshot_timestamp)
+                        stats["reviews"] += 1
 
-            print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
+                print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
 
             # Mark shop as synced
             last_shop_sync[shop_id_str] = snapshot_timestamp
@@ -687,6 +695,7 @@ if __name__ == "__main__":
     parser.add_argument("--fast", action="store_true", help="Fast mode: ~90 QPS (use all API quota)")
     parser.add_argument("--slow", action="store_true", help="Slow mode: ~1 QPS (spread over ~10 days)")
     parser.add_argument("--continuous", action="store_true", help="Run continuously, syncing stale shops")
+    parser.add_argument("--shops-only", action="store_true", help="Only sync shop data (skip listings and reviews)")
     args = parser.parse_args()
 
     # Set API delay based on mode (default is fast)
@@ -695,10 +704,12 @@ if __name__ == "__main__":
         print("*** SLOW MODE (~1 QPS) ***\n")
     elif args.fast:
         API_DELAY = API_DELAY_FAST
-        print("*** FAST MODE (~90 QPS) ***\n")
+        print("*** FAST MODE (5 QPS) ***\n")
 
     db_path = DB_FILE_TEST if args.test else DB_FILE
     if args.test:
         print("*** TEST MODE ***\n")
+    if args.shops_only:
+        print("*** SHOPS ONLY (skipping listings and reviews) ***\n")
 
-    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous)
+    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only)
