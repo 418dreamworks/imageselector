@@ -602,28 +602,33 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
 
             # Check if shop was synced recently (within sync interval)
             last_sync_time = last_shop_sync.get(shop_id_str, 0)
-            if snapshot_timestamp - last_sync_time < SYNC_INTERVAL:
+            shop_recently_synced = snapshot_timestamp - last_sync_time < SYNC_INTERVAL
+
+            if shop_recently_synced and shops_only:
                 stats["skipped"] += 1
                 continue
 
             print(f"\n[{ts()}] Shop {shop_id} ({i+1}/{len(shop_ids)})...")
 
-            # Check if this is a new shop (for static insert)
-            is_new_shop = conn.execute(
-                "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-            ).fetchone() is None
+            if not shop_recently_synced:
+                # Check if this is a new shop (for static insert)
+                is_new_shop = conn.execute(
+                    "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
+                ).fetchone() is None
 
-            # Fetch shop data
-            shop_data = fetch_shop(client, shop_id)
-            stats["api_calls"] += 1
+                # Fetch shop data
+                shop_data = fetch_shop(client, shop_id)
+                stats["api_calls"] += 1
 
-            if shop_data:
-                if is_new_shop:
-                    insert_shop_static(conn, shop_data, snapshot_timestamp)
-                    stats["shops_static"] += 1
+                if shop_data:
+                    if is_new_shop:
+                        insert_shop_static(conn, shop_data, snapshot_timestamp)
+                        stats["shops_static"] += 1
 
-                insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
-                stats["shops_dynamic"] += 1
+                    insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
+                    stats["shops_dynamic"] += 1
+            else:
+                stats["skipped"] += 1
 
             if not shops_only:
                 # Fetch listings
