@@ -5,7 +5,7 @@
 This code runs on a remote computer accessible via:
 ```bash
 ssh imac
-# or: ssh tzuohannlaw@192.168.68.106
+# or: ssh tzuohannlaw@192.168.68.200
 ```
 No password or passphrase required from this machine.
 
