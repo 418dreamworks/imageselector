@@ -547,11 +547,12 @@ def run_continuous_sync(db_path: Path):
             print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
 
 
-def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False):
+def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False, listings_only: bool = False):
     """Main sync function.
 
     If continuous=True, runs forever, checking for stale shops and syncing slowly.
     If shops_only=True, only fetches shop data (skips listings and reviews).
+    If listings_only=True, only fetches listings (skips shop data and reviews).
     """
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
@@ -610,25 +611,26 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
 
             print(f"\n[{ts()}] Shop {shop_id} ({i+1}/{len(shop_ids)})...")
 
-            if not shop_recently_synced:
-                # Check if this is a new shop (for static insert)
-                is_new_shop = conn.execute(
-                    "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-                ).fetchone() is None
+            if not listings_only:
+                if not shop_recently_synced:
+                    # Check if this is a new shop (for static insert)
+                    is_new_shop = conn.execute(
+                        "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
+                    ).fetchone() is None
 
-                # Fetch shop data
-                shop_data = fetch_shop(client, shop_id)
-                stats["api_calls"] += 1
+                    # Fetch shop data
+                    shop_data = fetch_shop(client, shop_id)
+                    stats["api_calls"] += 1
 
-                if shop_data:
-                    if is_new_shop:
-                        insert_shop_static(conn, shop_data, snapshot_timestamp)
-                        stats["shops_static"] += 1
+                    if shop_data:
+                        if is_new_shop:
+                            insert_shop_static(conn, shop_data, snapshot_timestamp)
+                            stats["shops_static"] += 1
 
-                    insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
-                    stats["shops_dynamic"] += 1
-            else:
-                stats["skipped"] += 1
+                        insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
+                        stats["shops_dynamic"] += 1
+                else:
+                    stats["skipped"] += 1
 
             if not shops_only:
                 # Fetch listings
@@ -649,20 +651,23 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
                     insert_listing_dynamic(conn, listing, snapshot_timestamp)
                     stats["listings_dynamic"] += 1
 
-                # Fetch reviews (incremental)
-                last_ts = last_review_timestamps.get(shop_id_str, 0)
-                reviews = fetch_shop_reviews(client, shop_id, last_ts)
-                stats["api_calls"] += 1
+                if not listings_only:
+                    # Fetch reviews (incremental)
+                    last_ts = last_review_timestamps.get(shop_id_str, 0)
+                    reviews = fetch_shop_reviews(client, shop_id, last_ts)
+                    stats["api_calls"] += 1
 
-                if reviews:
-                    newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
-                    last_review_timestamps[shop_id_str] = newest_ts
+                    if reviews:
+                        newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
+                        last_review_timestamps[shop_id_str] = newest_ts
 
-                    for review in reviews:
-                        insert_review(conn, review, snapshot_timestamp)
-                        stats["reviews"] += 1
+                        for review in reviews:
+                            insert_review(conn, review, snapshot_timestamp)
+                            stats["reviews"] += 1
 
-                print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
+                    print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
+                else:
+                    print(f"  Listings: {len(listings)}")
 
             # Mark shop as synced
             last_shop_sync[shop_id_str] = snapshot_timestamp
@@ -701,6 +706,7 @@ if __name__ == "__main__":
     parser.add_argument("--slow", action="store_true", help="Slow mode: ~1 QPS (spread over ~10 days)")
     parser.add_argument("--continuous", action="store_true", help="Run continuously, syncing stale shops")
     parser.add_argument("--shops-only", action="store_true", help="Only sync shop data (skip listings and reviews)")
+    parser.add_argument("--listings-only", action="store_true", help="Only sync listings (skip shop data and reviews)")
     args = parser.parse_args()
 
     # Set API delay based on mode (default is fast)
@@ -716,5 +722,7 @@ if __name__ == "__main__":
         print("*** TEST MODE ***\n")
     if args.shops_only:
         print("*** SHOPS ONLY (skipping listings and reviews) ***\n")
+    if args.listings_only:
+        print("*** LISTINGS ONLY (skipping shop data and reviews) ***\n")
 
-    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only)
+    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only, listings_only=args.listings_only)
