@@ -239,6 +239,43 @@ def fetch_shop_listings(client: httpx.Client, shop_id: int) -> list[dict]:
     return listings
 
 
+def fetch_listing(client: httpx.Client, listing_id: int) -> dict | None:
+    """Fetch a single listing by ID."""
+    time.sleep(API_DELAY)
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/listings/{listing_id}",
+            headers={"x-api-key": ETSY_API_KEY},
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"  Error fetching listing {listing_id}: {e}")
+        return None
+
+
+def get_listing_ids_from_metadata() -> list[int]:
+    """Get listing IDs from image_metadata.json."""
+    metadata_file = BASE_DIR / "image_metadata.json"
+    if not metadata_file.exists():
+        return []
+
+    with open(metadata_file) as f:
+        metadata = json.load(f)
+
+    listing_ids = []
+    for listing_id_str, entry in metadata.items():
+        if isinstance(entry, dict) and entry.get("shop_id"):
+            try:
+                listing_ids.append(int(listing_id_str))
+            except ValueError:
+                pass
+
+    return listing_ids
+
+
 def fetch_shop_reviews(client: httpx.Client, shop_id: int, last_timestamp: int = 0) -> list[dict]:
     """Fetch reviews for a shop, stopping at last_timestamp."""
     reviews = []
@@ -547,12 +584,67 @@ def run_continuous_sync(db_path: Path):
             print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
 
 
-def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False, listings_only: bool = False):
+def sync_listings_only(db_path: Path = DB_FILE):
+    """Fetch individual listings from metadata and store in DB."""
+    if not ETSY_API_KEY:
+        print("Error: ETSY_API_KEY not set in .env")
+        return
+
+    listing_ids = get_listing_ids_from_metadata()
+    if not listing_ids:
+        print("No listing IDs found in image_metadata.json")
+        return
+
+    conn = init_db(db_path)
+
+    # Skip listings already in DB
+    existing = set()
+    for row in conn.execute("SELECT listing_id FROM listings").fetchall():
+        existing.add(row[0])
+
+    to_fetch = [lid for lid in listing_ids if lid not in existing]
+    print(f"Found {len(listing_ids)} listings in metadata, {len(existing)} already in DB, {len(to_fetch)} to fetch")
+
+    if not to_fetch:
+        print("Nothing to do")
+        conn.close()
+        return
+
+    snapshot_timestamp = int(time.time())
+    stats = {"fetched": 0, "not_found": 0, "errors": 0, "api_calls": 0}
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        for i, listing_id in enumerate(to_fetch):
+            listing = fetch_listing(client, listing_id)
+            stats["api_calls"] += 1
+
+            if listing is None:
+                stats["not_found"] += 1
+            else:
+                insert_listing_static(conn, listing, snapshot_timestamp)
+                insert_listing_dynamic(conn, listing, snapshot_timestamp)
+                stats["fetched"] += 1
+
+            if (i + 1) % 100 == 0:
+                conn.commit()
+                print(f"[{ts()}] {i+1}/{len(to_fetch)} — fetched: {stats['fetched']}, not found: {stats['not_found']}")
+
+    conn.commit()
+    conn.close()
+
+    print("\n" + "=" * 50)
+    print("Listings sync complete!")
+    print(f"  Fetched: {stats['fetched']}")
+    print(f"  Not found: {stats['not_found']}")
+    print(f"  API calls: {stats['api_calls']}")
+    print(f"\nDatabase: {db_path}")
+
+
+def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False):
     """Main sync function.
 
     If continuous=True, runs forever, checking for stale shops and syncing slowly.
     If shops_only=True, only fetches shop data (skips listings and reviews).
-    If listings_only=True, only fetches listings (skips shop data and reviews).
     """
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
@@ -611,26 +703,25 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
 
             print(f"\n[{ts()}] Shop {shop_id} ({i+1}/{len(shop_ids)})...")
 
-            if not listings_only:
-                if not shop_recently_synced:
-                    # Check if this is a new shop (for static insert)
-                    is_new_shop = conn.execute(
-                        "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-                    ).fetchone() is None
+            if not shop_recently_synced:
+                # Check if this is a new shop (for static insert)
+                is_new_shop = conn.execute(
+                    "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
+                ).fetchone() is None
 
-                    # Fetch shop data
-                    shop_data = fetch_shop(client, shop_id)
-                    stats["api_calls"] += 1
+                # Fetch shop data
+                shop_data = fetch_shop(client, shop_id)
+                stats["api_calls"] += 1
 
-                    if shop_data:
-                        if is_new_shop:
-                            insert_shop_static(conn, shop_data, snapshot_timestamp)
-                            stats["shops_static"] += 1
+                if shop_data:
+                    if is_new_shop:
+                        insert_shop_static(conn, shop_data, snapshot_timestamp)
+                        stats["shops_static"] += 1
 
-                        insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
-                        stats["shops_dynamic"] += 1
-                else:
-                    stats["skipped"] += 1
+                    insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
+                    stats["shops_dynamic"] += 1
+            else:
+                stats["skipped"] += 1
 
             if not shops_only:
                 # Fetch listings
@@ -639,7 +730,6 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
 
                 for listing in listings:
                     listing_id = listing.get("listing_id")
-                    # Check if this is a new listing (for static insert)
                     is_new_listing = conn.execute(
                         "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
                     ).fetchone() is None
@@ -651,23 +741,20 @@ def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False,
                     insert_listing_dynamic(conn, listing, snapshot_timestamp)
                     stats["listings_dynamic"] += 1
 
-                if not listings_only:
-                    # Fetch reviews (incremental)
-                    last_ts = last_review_timestamps.get(shop_id_str, 0)
-                    reviews = fetch_shop_reviews(client, shop_id, last_ts)
-                    stats["api_calls"] += 1
+                # Fetch reviews (incremental)
+                last_ts = last_review_timestamps.get(shop_id_str, 0)
+                reviews = fetch_shop_reviews(client, shop_id, last_ts)
+                stats["api_calls"] += 1
 
-                    if reviews:
-                        newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
-                        last_review_timestamps[shop_id_str] = newest_ts
+                if reviews:
+                    newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
+                    last_review_timestamps[shop_id_str] = newest_ts
 
-                        for review in reviews:
-                            insert_review(conn, review, snapshot_timestamp)
-                            stats["reviews"] += 1
+                    for review in reviews:
+                        insert_review(conn, review, snapshot_timestamp)
+                        stats["reviews"] += 1
 
-                    print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
-                else:
-                    print(f"  Listings: {len(listings)}")
+                print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
 
             # Mark shop as synced
             last_shop_sync[shop_id_str] = snapshot_timestamp
@@ -723,6 +810,9 @@ if __name__ == "__main__":
     if args.shops_only:
         print("*** SHOPS ONLY (skipping listings and reviews) ***\n")
     if args.listings_only:
-        print("*** LISTINGS ONLY (skipping shop data and reviews) ***\n")
+        print("*** LISTINGS ONLY (fetching individual listings from metadata) ***\n")
 
-    sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only, listings_only=args.listings_only)
+    if args.listings_only:
+        sync_listings_only(db_path=db_path)
+    else:
+        sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only)
