@@ -6,3 +6,5 @@
 4. Before proposing a deletion, verify what will be affected (e.g., check if software is installed before assuming a folder is leftover data).
 5. Never fabricate or assume facts about what is or isn't installed — always check first.
 6. Any operation involving more than 500 MB of data — whether move, copy, or delete — must be treated as a deletion-level operation and requires explicit two-layer permission (two separate confirmations) before executing.
+7. Git push and pull operations require explicit confirmation before executing. Ask once and require one "YES" (all caps) confirmation. Any other response does NOT count as confirmation.
+8. Running commands on a remote server (e.g., via ssh) requires explicit confirmation before executing. Ask for confirmation TWICE (two separate confirmations), each requiring "YES" in all caps. Any other response does NOT count as confirmation.
