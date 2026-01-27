@@ -239,21 +239,20 @@ def fetch_shop_listings(client: httpx.Client, shop_id: int) -> list[dict]:
     return listings
 
 
-def fetch_listing(client: httpx.Client, listing_id: int) -> dict | None:
-    """Fetch a single listing by ID."""
+def fetch_listings_batch(client: httpx.Client, listing_ids: list[int]) -> list[dict]:
+    """Fetch up to 100 listings at once via batch endpoint."""
     time.sleep(API_DELAY)
     try:
         response = client.get(
-            f"{BASE_URL}/application/listings/{listing_id}",
+            f"{BASE_URL}/application/listings/batch",
             headers={"x-api-key": ETSY_API_KEY},
+            params={"listing_ids": ",".join(str(lid) for lid in listing_ids)},
         )
-        if response.status_code == 404:
-            return None
         response.raise_for_status()
-        return response.json()
+        return response.json().get("results", [])
     except Exception as e:
-        print(f"  Error fetching listing {listing_id}: {e}")
-        return None
+        print(f"  Error fetching batch of {len(listing_ids)} listings: {e}")
+        return []
 
 
 def get_listing_ids_from_metadata() -> list[int]:
@@ -585,7 +584,7 @@ def run_continuous_sync(db_path: Path):
 
 
 def sync_listings_only(db_path: Path = DB_FILE):
-    """Fetch individual listings from metadata and store in DB."""
+    """Fetch listings from metadata in batches and store in DB."""
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
         return
@@ -611,25 +610,28 @@ def sync_listings_only(db_path: Path = DB_FILE):
         return
 
     snapshot_timestamp = int(time.time())
-    stats = {"fetched": 0, "not_found": 0, "errors": 0, "api_calls": 0}
+    stats = {"fetched": 0, "not_found": 0, "api_calls": 0}
+    batch_size = 100
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        for i, listing_id in enumerate(to_fetch):
-            listing = fetch_listing(client, listing_id)
+        for batch_start in range(0, len(to_fetch), batch_size):
+            batch = to_fetch[batch_start:batch_start + batch_size]
+            results = fetch_listings_batch(client, batch)
             stats["api_calls"] += 1
 
-            if listing is None:
-                stats["not_found"] += 1
-            else:
+            fetched_ids = set()
+            for listing in results:
                 insert_listing_static(conn, listing, snapshot_timestamp)
                 insert_listing_dynamic(conn, listing, snapshot_timestamp)
+                fetched_ids.add(listing.get("listing_id"))
                 stats["fetched"] += 1
 
-            if (i + 1) % 100 == 0:
-                conn.commit()
-                print(f"[{ts()}] {i+1}/{len(to_fetch)} — fetched: {stats['fetched']}, not found: {stats['not_found']}")
+            stats["not_found"] += len(batch) - len(fetched_ids)
 
-    conn.commit()
+            conn.commit()
+            done = batch_start + len(batch)
+            print(f"[{ts()}] {done}/{len(to_fetch)} — fetched: {stats['fetched']}, not found: {stats['not_found']}")
+
     conn.close()
 
     print("\n" + "=" * 50)
