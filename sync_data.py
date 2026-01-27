@@ -85,6 +85,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             snapshot_timestamp INTEGER,
             shop_id INTEGER NOT NULL,
             title TEXT,
+            description TEXT,
             creation_timestamp INTEGER,
             url TEXT,
             is_customizable INTEGER,
@@ -149,6 +150,13 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             value TEXT
         );
     """)
+
+    # Migration: add description column to existing listings tables
+    try:
+        conn.execute("ALTER TABLE listings ADD COLUMN description TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
     return conn
 
@@ -406,19 +414,21 @@ def insert_listing_static(conn: sqlite3.Connection, listing: dict, snapshot_time
     price = listing.get("price", {})
     conn.execute("""
         INSERT OR IGNORE INTO listings (
-            listing_id, snapshot_timestamp, shop_id, title, creation_timestamp, url,
+            listing_id, snapshot_timestamp, shop_id, title, description,
+            creation_timestamp, url,
             is_customizable, is_personalizable, listing_type, tags, materials,
             processing_min, processing_max, who_made, when_made,
             item_weight, item_weight_unit, item_length, item_width,
             item_height, item_dimensions_unit, should_auto_renew, language,
             price_amount, price_divisor, price_currency, taxonomy_id,
             production_partners
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         listing.get("listing_id"),
         snapshot_timestamp,
         listing.get("shop_id"),
         listing.get("title"),
+        listing.get("description"),
         listing.get("creation_timestamp"),
         listing.get("url"),
         1 if listing.get("is_customizable") else 0,
@@ -583,7 +593,7 @@ def run_continuous_sync(db_path: Path):
             print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
 
 
-def sync_listings_only(db_path: Path = DB_FILE):
+def sync_listings_only(db_path: Path = DB_FILE, limit: int = 0):
     """Fetch listings from metadata in batches and store in DB."""
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
@@ -602,6 +612,8 @@ def sync_listings_only(db_path: Path = DB_FILE):
         existing.add(row[0])
 
     to_fetch = [lid for lid in listing_ids if lid not in existing]
+    if limit > 0:
+        to_fetch = to_fetch[:limit]
     print(f"Found {len(listing_ids)} listings in metadata, {len(existing)} already in DB, {len(to_fetch)} to fetch")
 
     if not to_fetch:
@@ -815,6 +827,6 @@ if __name__ == "__main__":
         print("*** LISTINGS ONLY (fetching individual listings from metadata) ***\n")
 
     if args.listings_only:
-        sync_listings_only(db_path=db_path)
+        sync_listings_only(db_path=db_path, limit=args.top)
     else:
         sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only)
