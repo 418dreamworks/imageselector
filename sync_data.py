@@ -35,7 +35,7 @@ NUM_WORKERS = 1        # 1 download worker
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
 FAILED_IMAGE_ID = 9999999999
-MIN_PRICE = 50             # Skip listings under $50
+MIN_PRICE = 50             # Only for image downloads (not DB inserts)
 
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
@@ -86,12 +86,8 @@ def load_taxonomy_config():
             min_price = breaks[i] if i == 0 else breaks[i] + 0.01
             max_price = breaks[i + 1]
 
-            # Skip price ranges entirely below MIN_PRICE
-            if max_price <= MIN_PRICE:
-                continue
-            # Clamp lower bound to MIN_PRICE
-            if min_price < MIN_PRICE:
-                min_price = MIN_PRICE
+            # No price filtering - crawl all price ranges
+            # (MIN_PRICE filter only applies to image downloads, not DB)
 
             if len(breaks) == 2:
                 label = name
@@ -858,7 +854,7 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
                          snapshot_ts, seen_in_crawl, stats):
     """Process a batch of listings from the taxonomy crawl."""
 
-    new_need_images = []  # listings needing image fetch + DB insert
+    new_listings = []  # listings not yet in metadata (need DB insert + possibly image)
 
     for listing in results:
         lid = listing["listing_id"]
@@ -867,51 +863,65 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
         shop_id = listing.get("shop_id")
         is_2000_plus = when_made in ALLOWED_WHEN_MADE
 
+        # Get price for image download decision
+        price_data = listing.get("price", {})
+        price_amount = price_data.get("amount", 0)
+        price_divisor = price_data.get("divisor", 100)
+        price = price_amount / price_divisor if price_divisor else 0
+
         seen_in_crawl.add(lid)
 
         if lid_str in metadata:
-            # Already known listing
-            if is_2000_plus:
-                # Check if listing needs dynamic update
-                if lid in existing_listings:
-                    last_ts = listing_last_ts.get(lid, 0)
-                    if snapshot_ts - last_ts > ONE_WEEK:
-                        insert_listing_dynamic(conn, listing, snapshot_ts)
-                        listing_last_ts[lid] = snapshot_ts
-                        stats["existing_updated"] += 1
-                    else:
-                        stats["skipped"] += 1
-                else:
-                    # In metadata but not DB — insert
-                    insert_listing_static(conn, listing, snapshot_ts)
+            # Already known listing — update DB dynamic if needed
+            if lid in existing_listings:
+                last_ts = listing_last_ts.get(lid, 0)
+                if snapshot_ts - last_ts > ONE_WEEK:
                     insert_listing_dynamic(conn, listing, snapshot_ts)
-                    existing_listings.add(lid)
                     listing_last_ts[lid] = snapshot_ts
                     stats["existing_updated"] += 1
-
-                # Handle shop
-                if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
-                    stats["shops_fetched"] += 1
+                else:
+                    stats["skipped"] += 1
             else:
-                stats["skipped"] += 1
+                # In metadata but not DB — insert (was pre-2000 before filter removal)
+                insert_listing_static(conn, listing, snapshot_ts)
+                insert_listing_dynamic(conn, listing, snapshot_ts)
+                existing_listings.add(lid)
+                listing_last_ts[lid] = snapshot_ts
+                stats["existing_updated"] += 1
+
+            # Handle shop for all listings
+            if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
+                stats["shops_fetched"] += 1
             continue
 
-        # New listing (not in metadata)
-        if not is_2000_plus:
-            # when_made < 2000: metadata only, no image, no DB
-            metadata[lid_str] = {"shop_id": shop_id, "when_made": when_made}
-            stats["new_pre2000"] += 1
-            continue
+        # New listing (not in metadata) — collect for processing
+        new_listings.append(listing)
 
-        # New, when_made >= 2000: collect for batch image fetch
-        new_need_images.append(listing)
+    # Process new listings: all go to DB, only some get images
+    if new_listings:
+        # Separate into those needing images vs not
+        need_images = []
+        no_images = []
+        for listing in new_listings:
+            wm = listing.get("when_made", "")
+            price_data = listing.get("price", {})
+            price_amount = price_data.get("amount", 0)
+            price_divisor = price_data.get("divisor", 100)
+            price = price_amount / price_divisor if price_divisor else 0
 
-    # Batch fetch images for new listings
-    if new_need_images:
-        batch_ids = [l["listing_id"] for l in new_need_images]
-        image_info = get_batch_image_info(client, batch_ids)
+            if wm in ALLOWED_WHEN_MADE and price >= MIN_PRICE:
+                need_images.append(listing)
+            else:
+                no_images.append(listing)
 
-        for listing in new_need_images:
+        # Batch fetch images for listings that need them
+        image_info = {}
+        if need_images:
+            batch_ids = [l["listing_id"] for l in need_images]
+            image_info = get_batch_image_info(client, batch_ids)
+
+        # Process listings that need images
+        for listing in need_images:
             lid = listing["listing_id"]
             lid_str = str(lid)
             shop_id = listing["shop_id"]
@@ -939,19 +949,39 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
 
             stats["new_2000plus"] += 1
 
+        # Process listings that don't need images (pre-2000 or under $50)
+        for listing in no_images:
+            lid = listing["listing_id"]
+            lid_str = str(lid)
+            shop_id = listing["shop_id"]
+            wm = listing.get("when_made", "")
+
+            # Add to metadata (no image info)
+            metadata[lid_str] = {"shop_id": shop_id, "when_made": wm}
+
+            # Insert listing into DB (ALL listings go to DB now)
+            insert_listing_static(conn, listing, snapshot_ts)
+            insert_listing_dynamic(conn, listing, snapshot_ts)
+            existing_listings.add(lid)
+            listing_last_ts[lid] = snapshot_ts
+
+            # Handle shop
+            if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
+                stats["shops_fetched"] += 1
+
+            stats["new_pre2000"] += 1
+
 
 # ─── Phase 4: Mop-Up Pass ───────────────────────────────────────────────────
 
 def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
                 listing_last_ts, shop_last_ts, snapshot_ts, seen_in_crawl):
 
-    # Find listings in metadata with when_made >= 2000 not seen in crawl
+    # Find ALL listings in metadata that were not seen in this crawl cycle
+    # (may have changed taxonomy/price since last crawl)
     mopup_ids = []
     for lid_str, entry in metadata.items():
         if not isinstance(entry, dict):
-            continue
-        wm = entry.get("when_made", "")
-        if wm not in ALLOWED_WHEN_MADE:
             continue
         try:
             lid = int(lid_str)
@@ -998,12 +1028,13 @@ def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
 def phase_sync_check(metadata, conn, existing_listings, existing_shops):
     issues = []
 
-    # Check 1: Every metadata entry with when_made >= 2000 has image + DB
+    # Check 1: Every metadata entry with image_id should have image on disk
+    # (only entries with image_id were supposed to download images)
     for lid_str, entry in metadata.items():
         if not isinstance(entry, dict):
             continue
-        wm = entry.get("when_made", "")
-        if wm not in ALLOWED_WHEN_MADE:
+        if "image_id" not in entry:
+            # No image_id means no image was supposed to be downloaded
             continue
 
         try:
@@ -1011,30 +1042,24 @@ def phase_sync_check(metadata, conn, existing_listings, existing_shops):
         except ValueError:
             continue
 
-        # Check image
+        # Check image exists (only for entries that have image_id)
         img_path = IMAGES_DIR / f"{lid}.jpg"
         if not img_path.exists() or img_path.stat().st_size == 0:
             issues.append(f"Missing/empty image: {lid}")
-
-        # Check listing in DB
-        if lid not in existing_listings:
-            issues.append(f"Missing listing in DB: {lid}")
-
-        # Check shop in DB
-        shop_id = entry.get("shop_id")
-        if shop_id and shop_id not in existing_shops:
-            issues.append(f"Missing shop {shop_id} in DB (listing {lid})")
 
     # Check 2: Every DB listing has metadata entry
     for lid in existing_listings:
         if str(lid) not in metadata:
             issues.append(f"DB listing {lid} has no metadata entry")
 
-    # Check 3: No when_made < 2000 in DB
-    for lid in existing_listings:
-        entry = metadata.get(str(lid))
-        if isinstance(entry, dict) and entry.get("when_made") not in ALLOWED_WHEN_MADE:
-            issues.append(f"Listing {lid} in DB with pre-2000 when_made: {entry.get('when_made')}")
+    # Check 3: Every metadata entry has a listing in DB
+    for lid_str in metadata:
+        try:
+            lid = int(lid_str)
+        except ValueError:
+            continue
+        if lid not in existing_listings:
+            issues.append(f"Metadata listing {lid} not in DB")
 
     if issues:
         print(f"\n[{ts()}] Sync check: {len(issues)} issues found")
@@ -1050,14 +1075,13 @@ def phase_sync_check(metadata, conn, existing_listings, existing_shops):
 
 # ─── Phase 6: Reviews ───────────────────────────────────────────────────────
 
-def phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts):
+def phase_reviews(client, conn, existing_shops, snapshot_ts):
     shop_ids = sorted(existing_shops)
     last_review_ts = get_sync_state(conn, "last_review_timestamps", {})
     # Jan 1, 2000 as default
     default_ts = 946684800
 
     total_reviews = 0
-    skipped_reviews = 0
     print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops")
 
     for i, shop_id in enumerate(shop_ids):
@@ -1068,14 +1092,12 @@ def phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts):
         if reviews:
             newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
             last_review_ts[sid_str] = newest_ts
+            # Insert ALL reviews (no listing_id filter — needed for sales ratio analysis)
             for review in reviews:
-                if review.get("listing_id") not in existing_listings:
-                    skipped_reviews += 1
-                    continue
                 insert_review(conn, review, snapshot_ts)
-            total_reviews += sum(1 for r in reviews if r.get("listing_id") in existing_listings)
+            total_reviews += len(reviews)
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 10 == 0:
             conn.commit()
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
             print(f"  Reviews: {i+1}/{len(shop_ids)} shops, {total_reviews} new reviews "
@@ -1083,8 +1105,7 @@ def phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts):
 
     conn.commit()
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
-    print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops "
-          f"(skipped {skipped_reviews} non-matching)")
+    print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -1181,7 +1202,7 @@ def main():
         # Phase 6: Reviews
         if current_phase == "reviews":
             print(f"\n--- Phase 6: Reviews ---")
-            phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts)
+            phase_reviews(client, conn, existing_shops, snapshot_ts)
             progress["phase"] = "complete"
             save_progress(progress)
 
