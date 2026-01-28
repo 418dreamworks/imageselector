@@ -1,21 +1,22 @@
 """
-Sync Etsy shop, listing, and review data to SQLite.
+sync_data.py — Merged Etsy furniture data sync.
 
-Collects metadata from shops/listings discovered by sync_images.py.
-Uses static/dynamic table split to minimize storage:
-- Static tables: written once with INSERT OR IGNORE
-- Dynamic tables: only store changed fields (NULL for unchanged), forward-fill when querying
+Crawls taxonomy categories, downloads images, and populates SQLite database.
+Replaces both sync_images.py and the old sync_data.py.
 
 Usage:
-    python sync_data.py                    # Sync all data
-    python sync_data.py --top N            # Only sync top N shops by listing count
-    python sync_data.py --test             # Use test database
+    python sync_data_new.py
 """
 
 import os
+import sys
 import json
 import time
+import signal
+import re
 import sqlite3
+import threading
+import queue
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -23,36 +24,100 @@ import httpx
 
 load_dotenv()
 
-# Config
+# ─── Config ─────────────────────────────────────────────────────────────────
+
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-# Paths
+API_DELAY = 0.2        # 5 QPS max
+CDN_RATE_LIMIT = 5     # CDN downloads per second
+NUM_WORKERS = 1        # 1 download worker
+MAX_OFFSET = 10000     # Etsy API offset limit
+ONE_WEEK = 7 * 24 * 3600
+FAILED_IMAGE_ID = 9999999999
+MIN_PRICE = 50             # Skip listings under $50
+
 BASE_DIR = Path(__file__).parent
+IMAGES_DIR = BASE_DIR / "images"
+METADATA_FILE = BASE_DIR / "image_metadata.json"
+PROGRESS_FILE = BASE_DIR / "sync_progress.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
-DB_FILE_TEST = BASE_DIR / "etsy_data_test.db"
+TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
 
-# Rate limiting (will be set by --fast/--slow flag)
-API_DELAY = 0.08  # Default: ~5 QPS effective (sleep + API latency)
-API_DELAY_FAST = 0.08  # ~5 QPS effective (MAX allowed)
-API_DELAY_SLOW = 1.0  # ~1 QPS
+FURNITURE_TAXONOMY_IDS = {
+    967, 968, 969, 12455, 12456, 970, 972, 971, 12470, 973, 974, 975, 976, 977,
+    11837, 978, 979, 12403, 12405, 12406, 980, 981, 982, 983, 985, 986, 987, 988,
+    989, 990, 12369, 12370, 991, 992, 993, 12371, 12372, 994, 11355, 11356, 998,
+    996, 12468, 12216, 997, 999, 1000, 1001, 12408
+}
 
-# Sync interval: 14 days in seconds
-SYNC_INTERVAL = 14 * 24 * 60 * 60
+ALLOWED_WHEN_MADE = {
+    "made_to_order", "2020_2026", "2010_2019",
+    "2000_2009", "2000_2006", "2007_2009",
+}
 
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
 
 def ts():
-    """Return timestamp string for logging."""
     return datetime.now().strftime("%H:%M:%S")
 
 
+def extract_hex_suffix(url: str) -> tuple[str | None, str | None]:
+    match = re.search(r'/il/([a-f0-9]+)/(\d+)/il_[^.]+\.\d+_([a-z0-9]+)\.jpg', url)
+    if match:
+        return match.group(1), match.group(3)
+    return None, None
+
+
+# ─── Taxonomy Config ─────────────────────────────────────────────────────────
+
+def load_taxonomy_config():
+    with open(TAXONOMY_CONFIG_FILE) as f:
+        config = json.load(f)
+
+    crawl_units = []
+    for entry in config["taxonomies"]:
+        tax_id = entry["id"]
+        name = entry["name"]
+        breaks = entry["price_breaks"]
+
+        for i in range(len(breaks) - 1):
+            min_price = breaks[i] if i == 0 else breaks[i] + 0.01
+            max_price = breaks[i + 1]
+
+            # Skip price ranges entirely below MIN_PRICE
+            if max_price <= MIN_PRICE:
+                continue
+            # Clamp lower bound to MIN_PRICE
+            if min_price < MIN_PRICE:
+                min_price = MIN_PRICE
+
+            if len(breaks) == 2:
+                label = name
+            else:
+                label = f"{name} (${breaks[i]}-${breaks[i+1]})"
+
+            crawl_units.append({
+                "taxonomy_id": tax_id,
+                "name": label,
+                "min_price": min_price,
+                "max_price": max_price if max_price < 1000000 else None,
+            })
+
+    return crawl_units
+
+
+CRAWL_UNITS = load_taxonomy_config()
+
+
+# ─── Database ────────────────────────────────────────────────────────────────
+
 def init_db(db_path: Path) -> sqlite3.Connection:
-    """Initialize SQLite database with static/dynamic tables."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     conn.executescript("""
-        -- Shops static table (written once per shop)
         CREATE TABLE IF NOT EXISTS shops (
             shop_id INTEGER PRIMARY KEY,
             snapshot_timestamp INTEGER,
@@ -63,7 +128,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             shop_location_country_iso TEXT
         );
 
-        -- Shops dynamic table (only changed fields per snapshot)
         CREATE TABLE IF NOT EXISTS shops_dynamic (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             shop_id INTEGER NOT NULL,
@@ -79,7 +143,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_shops_dynamic_shop_id ON shops_dynamic(shop_id);
         CREATE INDEX IF NOT EXISTS idx_shops_dynamic_timestamp ON shops_dynamic(snapshot_timestamp);
 
-        -- Listings static table (written once per listing)
         CREATE TABLE IF NOT EXISTS listings (
             listing_id INTEGER PRIMARY KEY,
             snapshot_timestamp INTEGER,
@@ -91,8 +154,8 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             is_customizable INTEGER,
             is_personalizable INTEGER,
             listing_type TEXT,
-            tags TEXT,  -- JSON array
-            materials TEXT,  -- JSON array
+            tags TEXT,
+            materials TEXT,
             processing_min INTEGER,
             processing_max INTEGER,
             who_made TEXT,
@@ -109,11 +172,10 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             price_divisor INTEGER,
             price_currency TEXT,
             taxonomy_id INTEGER,
-            production_partners TEXT  -- JSON array
+            production_partners TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_listings_shop_id ON listings(shop_id);
 
-        -- Listings dynamic table (only changed fields per snapshot)
         CREATE TABLE IF NOT EXISTS listings_dynamic (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             listing_id INTEGER NOT NULL,
@@ -127,7 +189,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_listings_dynamic_listing_id ON listings_dynamic(listing_id);
         CREATE INDEX IF NOT EXISTS idx_listings_dynamic_timestamp ON listings_dynamic(snapshot_timestamp);
 
-        -- Reviews table (append-only)
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             snapshot_timestamp INTEGER,
@@ -144,33 +205,23 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_reviews_create_timestamp ON reviews(create_timestamp);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_unique ON reviews(shop_id, listing_id, create_timestamp);
 
-        -- Sync state table
         CREATE TABLE IF NOT EXISTS sync_state (
             key TEXT PRIMARY KEY,
             value TEXT
         );
     """)
-
-    # Migration: add description column to existing listings tables
-    try:
-        conn.execute("ALTER TABLE listings ADD COLUMN description TEXT")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
     conn.commit()
     return conn
 
 
-def get_sync_state(conn: sqlite3.Connection, key: str, default=None):
-    """Get sync state value."""
+def get_sync_state(conn, key, default=None):
     row = conn.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
     if row:
         return json.loads(row[0])
     return default
 
 
-def set_sync_state(conn: sqlite3.Connection, key: str, value):
-    """Set sync state value."""
+def set_sync_state(conn, key, value):
     conn.execute(
         "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?, ?)",
         (key, json.dumps(value))
@@ -178,184 +229,9 @@ def set_sync_state(conn: sqlite3.Connection, key: str, value):
     conn.commit()
 
 
-def get_shop_ids_from_metadata() -> dict[int, int]:
-    """Get shop_ids and their listing counts from image_metadata.json."""
-    metadata_file = BASE_DIR / "image_metadata.json"
-    if not metadata_file.exists():
-        return {}
+# ─── DB Insert Functions ─────────────────────────────────────────────────────
 
-    with open(metadata_file) as f:
-        metadata = json.load(f)
-
-    shop_counts = {}
-    for entry in metadata.values():
-        if isinstance(entry, dict) and entry.get("shop_id"):
-            shop_id = entry["shop_id"]
-            shop_counts[shop_id] = shop_counts.get(shop_id, 0) + 1
-
-    return shop_counts
-
-
-def fetch_shop(client: httpx.Client, shop_id: int) -> dict | None:
-    """Fetch shop data from API."""
-    time.sleep(API_DELAY)
-    try:
-        response = client.get(
-            f"{BASE_URL}/application/shops/{shop_id}",
-            headers={"x-api-key": ETSY_API_KEY},
-        )
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"  Error fetching shop {shop_id}: {e}")
-        return None
-
-
-def fetch_shop_listings(client: httpx.Client, shop_id: int) -> list[dict]:
-    """Fetch all active listings for a shop."""
-    listings = []
-    offset = 0
-    batch_size = 100
-
-    while True:
-        time.sleep(API_DELAY)
-        try:
-            response = client.get(
-                f"{BASE_URL}/application/shops/{shop_id}/listings/active",
-                headers={"x-api-key": ETSY_API_KEY},
-                params={"limit": batch_size, "offset": offset},
-            )
-            if response.status_code == 404:
-                break
-            response.raise_for_status()
-
-            results = response.json().get("results", [])
-            if not results:
-                break
-
-            listings.extend(results)
-            offset += batch_size
-
-            if offset >= 10000:  # API limit
-                break
-        except Exception as e:
-            print(f"  Error fetching listings for shop {shop_id}: {e}")
-            break
-
-    return listings
-
-
-def fetch_listings_batch(client: httpx.Client, listing_ids: list[int]) -> list[dict]:
-    """Fetch up to 100 listings at once via batch endpoint."""
-    time.sleep(API_DELAY)
-    try:
-        response = client.get(
-            f"{BASE_URL}/application/listings/batch",
-            headers={"x-api-key": ETSY_API_KEY},
-            params={"listing_ids": ",".join(str(lid) for lid in listing_ids)},
-        )
-        response.raise_for_status()
-        return response.json().get("results", [])
-    except Exception as e:
-        print(f"  Error fetching batch of {len(listing_ids)} listings: {e}")
-        return []
-
-
-def get_listing_ids_from_metadata() -> list[int]:
-    """Get listing IDs from image_metadata.json."""
-    metadata_file = BASE_DIR / "image_metadata.json"
-    if not metadata_file.exists():
-        return []
-
-    with open(metadata_file) as f:
-        metadata = json.load(f)
-
-    listing_ids = []
-    for listing_id_str, entry in metadata.items():
-        if isinstance(entry, dict) and entry.get("shop_id"):
-            try:
-                listing_ids.append(int(listing_id_str))
-            except ValueError:
-                pass
-
-    return listing_ids
-
-
-def fetch_shop_reviews(client: httpx.Client, shop_id: int, last_timestamp: int = 0) -> list[dict]:
-    """Fetch reviews for a shop, stopping at last_timestamp."""
-    reviews = []
-    offset = 0
-    batch_size = 100
-
-    while True:
-        time.sleep(API_DELAY)
-        try:
-            response = client.get(
-                f"{BASE_URL}/application/shops/{shop_id}/reviews",
-                headers={"x-api-key": ETSY_API_KEY},
-                params={"limit": batch_size, "offset": offset},
-            )
-            if response.status_code == 404:
-                break
-            response.raise_for_status()
-
-            results = response.json().get("results", [])
-            if not results:
-                break
-
-            found_old = False
-            for review in results:
-                if review.get("create_timestamp", 0) <= last_timestamp:
-                    found_old = True
-                    break
-                reviews.append(review)
-
-            if found_old:
-                break
-
-            offset += batch_size
-            if offset >= 10000:
-                break
-        except Exception as e:
-            print(f"  Error fetching reviews for shop {shop_id}: {e}")
-            break
-
-    return reviews
-
-
-def get_last_shop_dynamic(conn: sqlite3.Connection, shop_id: int) -> dict | None:
-    """Get the most recent dynamic data for a shop."""
-    row = conn.execute("""
-        SELECT update_date, listing_active_count, accepts_custom_requests,
-               num_favorers, transaction_sold_count, review_average, review_count
-        FROM shops_dynamic
-        WHERE shop_id = ?
-        ORDER BY snapshot_timestamp DESC
-        LIMIT 1
-    """, (shop_id,)).fetchone()
-    if row:
-        return dict(row)
-    return None
-
-
-def get_last_listing_dynamic(conn: sqlite3.Connection, listing_id: int) -> dict | None:
-    """Get the most recent dynamic data for a listing."""
-    row = conn.execute("""
-        SELECT state, ending_timestamp, quantity, num_favorers, views
-        FROM listings_dynamic
-        WHERE listing_id = ?
-        ORDER BY snapshot_timestamp DESC
-        LIMIT 1
-    """, (listing_id,)).fetchone()
-    if row:
-        return dict(row)
-    return None
-
-
-def insert_shop_static(conn: sqlite3.Connection, shop_data: dict, snapshot_timestamp: int):
-    """Insert shop static data (ignore if exists)."""
+def insert_shop_static(conn, shop_data, snapshot_ts):
     conn.execute("""
         INSERT OR IGNORE INTO shops (
             shop_id, snapshot_timestamp, create_date, url, is_shop_us_based,
@@ -363,7 +239,7 @@ def insert_shop_static(conn: sqlite3.Connection, shop_data: dict, snapshot_times
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         shop_data.get("shop_id"),
-        snapshot_timestamp,
+        snapshot_ts,
         shop_data.get("create_date"),
         shop_data.get("url"),
         1 if shop_data.get("is_shop_us_based") else 0,
@@ -372,24 +248,7 @@ def insert_shop_static(conn: sqlite3.Connection, shop_data: dict, snapshot_times
     ))
 
 
-def insert_shop_dynamic(conn: sqlite3.Connection, shop_data: dict, snapshot_timestamp: int):
-    """Insert shop dynamic data, only storing changed fields."""
-    shop_id = shop_data.get("shop_id")
-    last = get_last_shop_dynamic(conn, shop_id)
-
-    # Current values
-    current = {
-        "update_date": shop_data.get("update_date"),
-        "listing_active_count": shop_data.get("listing_active_count"),
-        "accepts_custom_requests": 1 if shop_data.get("accepts_custom_requests") else 0,
-        "num_favorers": shop_data.get("num_favorers"),
-        "transaction_sold_count": shop_data.get("transaction_sold_count"),
-        "review_average": shop_data.get("review_average"),
-        "review_count": shop_data.get("review_count"),
-    }
-
-    # Always store all values (clearer than NULLs for unchanged)
-    values = current
+def insert_shop_dynamic(conn, shop_data, snapshot_ts):
     conn.execute("""
         INSERT INTO shops_dynamic (
             shop_id, snapshot_timestamp, update_date, listing_active_count,
@@ -397,20 +256,19 @@ def insert_shop_dynamic(conn: sqlite3.Connection, shop_data: dict, snapshot_time
             review_average, review_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        shop_id,
-        snapshot_timestamp,
-        values.get("update_date"),
-        values.get("listing_active_count"),
-        values.get("accepts_custom_requests"),
-        values.get("num_favorers"),
-        values.get("transaction_sold_count"),
-        values.get("review_average"),
-        values.get("review_count"),
+        shop_data.get("shop_id"),
+        snapshot_ts,
+        shop_data.get("update_date"),
+        shop_data.get("listing_active_count"),
+        1 if shop_data.get("accepts_custom_requests") else 0,
+        shop_data.get("num_favorers"),
+        shop_data.get("transaction_sold_count"),
+        shop_data.get("review_average"),
+        shop_data.get("review_count"),
     ))
 
 
-def insert_listing_static(conn: sqlite3.Connection, listing: dict, snapshot_timestamp: int):
-    """Insert listing static data (ignore if exists)."""
+def insert_listing_static(conn, listing, snapshot_ts):
     price = listing.get("price", {})
     conn.execute("""
         INSERT OR IGNORE INTO listings (
@@ -425,7 +283,7 @@ def insert_listing_static(conn: sqlite3.Connection, listing: dict, snapshot_time
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         listing.get("listing_id"),
-        snapshot_timestamp,
+        snapshot_ts,
         listing.get("shop_id"),
         listing.get("title"),
         listing.get("description"),
@@ -456,40 +314,24 @@ def insert_listing_static(conn: sqlite3.Connection, listing: dict, snapshot_time
     ))
 
 
-def insert_listing_dynamic(conn: sqlite3.Connection, listing: dict, snapshot_timestamp: int):
-    """Insert listing dynamic data, only storing changed fields."""
-    listing_id = listing.get("listing_id")
-    last = get_last_listing_dynamic(conn, listing_id)
-
-    # Current values
-    current = {
-        "state": listing.get("state"),
-        "ending_timestamp": listing.get("ending_timestamp"),
-        "quantity": listing.get("quantity"),
-        "num_favorers": listing.get("num_favorers"),
-        "views": listing.get("views"),
-    }
-
-    # Always store all values (clearer than NULLs for unchanged)
-    values = current
+def insert_listing_dynamic(conn, listing, snapshot_ts):
     conn.execute("""
         INSERT INTO listings_dynamic (
             listing_id, snapshot_timestamp, state, ending_timestamp,
             quantity, num_favorers, views
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        listing_id,
-        snapshot_timestamp,
-        values.get("state"),
-        values.get("ending_timestamp"),
-        values.get("quantity"),
-        values.get("num_favorers"),
-        values.get("views"),
+        listing.get("listing_id"),
+        snapshot_ts,
+        listing.get("state"),
+        listing.get("ending_timestamp"),
+        listing.get("quantity"),
+        listing.get("num_favorers"),
+        listing.get("views"),
     ))
 
 
-def insert_review(conn: sqlite3.Connection, review: dict, snapshot_timestamp: int):
-    """Insert review (skip if duplicate)."""
+def insert_review(conn, review, snapshot_ts):
     try:
         conn.execute("""
             INSERT OR IGNORE INTO reviews (
@@ -497,7 +339,7 @@ def insert_review(conn: sqlite3.Connection, review: dict, snapshot_timestamp: in
                 language, create_timestamp
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            snapshot_timestamp,
+            snapshot_ts,
             review.get("shop_id"),
             review.get("listing_id"),
             review.get("buyer_user_id"),
@@ -507,326 +349,869 @@ def insert_review(conn: sqlite3.Connection, review: dict, snapshot_timestamp: in
             review.get("create_timestamp"),
         ))
     except sqlite3.IntegrityError:
-        pass  # Duplicate, skip
+        pass
 
 
-def run_continuous_sync(db_path: Path):
-    """Run sync continuously, checking for stale shops and syncing slowly."""
-    conn = init_db(db_path)
+# ─── API Functions ───────────────────────────────────────────────────────────
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        while True:
-            # Re-read metadata each iteration to pick up new shops
-            shop_counts = get_shop_ids_from_metadata()
-            if not shop_counts:
-                print(f"[{ts()}] No shops in metadata, sleeping 1 hour...")
-                time.sleep(3600)
-                continue
-
-            # Get sync state
-            last_shop_sync = get_sync_state(conn, "last_shop_sync", {})
-            last_review_timestamps = get_sync_state(conn, "last_review_timestamps", {})
-
-            # Find shops that need syncing (never synced or > 14 days old)
-            now = int(time.time())
-            stale_shops = []
-            for shop_id, listing_count in shop_counts.items():
-                last_sync = last_shop_sync.get(str(shop_id), 0)
-                if now - last_sync >= SYNC_INTERVAL:
-                    stale_shops.append((shop_id, listing_count))
-
-            if not stale_shops:
-                print(f"[{ts()}] All {len(shop_counts)} shops up to date, sleeping 1 hour...")
-                time.sleep(3600)
-                continue
-
-            # Sort by listing count (largest first) and pick one
-            stale_shops.sort(key=lambda x: x[1], reverse=True)
-            shop_id, listing_count = stale_shops[0]
-            snapshot_timestamp = int(time.time())
-
-            print(f"[{ts()}] Syncing shop {shop_id} ({len(stale_shops)} stale of {len(shop_counts)} total)...")
-
-            # Check if new shop
-            is_new_shop = conn.execute(
-                "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-            ).fetchone() is None
-
-            # Fetch and store shop data
-            shop_data = fetch_shop(client, shop_id)
-            if shop_data:
-                if is_new_shop:
-                    insert_shop_static(conn, shop_data, snapshot_timestamp)
-                insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
-
-            # Fetch and store listings
-            listings = fetch_shop_listings(client, shop_id)
-            new_listings = 0
-            for listing in listings:
-                listing_id = listing.get("listing_id")
-                is_new = conn.execute(
-                    "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
-                ).fetchone() is None
-                if is_new:
-                    insert_listing_static(conn, listing, snapshot_timestamp)
-                    new_listings += 1
-                insert_listing_dynamic(conn, listing, snapshot_timestamp)
-
-            # Fetch reviews (incremental)
-            shop_id_str = str(shop_id)
-            last_ts = last_review_timestamps.get(shop_id_str, 0)
-            reviews = fetch_shop_reviews(client, shop_id, last_ts)
-            if reviews:
-                newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
-                last_review_timestamps[shop_id_str] = newest_ts
-                for review in reviews:
-                    insert_review(conn, review, snapshot_timestamp)
-
-            # Mark as synced
-            last_shop_sync[shop_id_str] = snapshot_timestamp
-
-            # Commit
-            conn.commit()
-            set_sync_state(conn, "last_shop_sync", last_shop_sync)
-            set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
-
-            print(f"  Listings: {len(listings)} ({new_listings} new), Reviews: {len(reviews)}")
+_api_stats = {"used": 0, "limit": 10000, "remaining": 10000}
 
 
-def sync_listings_only(db_path: Path = DB_FILE, limit: int = 0):
-    """Fetch listings from metadata in batches and store in DB."""
-    if not ETSY_API_KEY:
-        print("Error: ETSY_API_KEY not set in .env")
-        return
+def update_api_usage(response):
+    try:
+        remaining = int(response.headers.get("x-remaining-today", 0))
+        limit = int(response.headers.get("x-limit-per-day", 10000))
+        _api_stats["remaining"] = remaining
+        _api_stats["limit"] = limit
+        _api_stats["used"] = limit - remaining
+    except (ValueError, TypeError):
+        pass
 
-    listing_ids = get_listing_ids_from_metadata()
+
+def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price=None):
+    """Fetch a batch of active listings for a taxonomy + price range."""
+    time.sleep(API_DELAY)
+    params = {"taxonomy_id": taxonomy_id, "limit": 100, "offset": offset}
+    if min_price is not None:
+        params["min_price"] = min_price
+    if max_price is not None:
+        params["max_price"] = max_price
+
+    response = client.get(
+        f"{BASE_URL}/application/listings/active",
+        headers={"x-api-key": ETSY_API_KEY},
+        params=params,
+    )
+    update_api_usage(response)
+
+    if response.status_code == 429:
+        print(f"[{ts()}] 429 Rate Limited!")
+        return None, "rate_limited"
+    if response.status_code == 400:
+        return None, "bad_request"
+    response.raise_for_status()
+
+    data = response.json()
+    return data.get("results", []), data.get("count", 0)
+
+
+def fetch_shop(client, shop_id):
+    """Fetch full shop data from API."""
+    time.sleep(API_DELAY)
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/shops/{shop_id}",
+            headers={"x-api-key": ETSY_API_KEY},
+        )
+        update_api_usage(response)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"  Error fetching shop {shop_id}: {e}")
+        return None
+
+
+def fetch_listings_batch(client, listing_ids):
+    """Fetch up to 100 listings via batch endpoint."""
+    time.sleep(API_DELAY)
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/listings/batch",
+            headers={"x-api-key": ETSY_API_KEY},
+            params={"listing_ids": ",".join(str(lid) for lid in listing_ids)},
+        )
+        update_api_usage(response)
+        response.raise_for_status()
+        return response.json().get("results", [])
+    except Exception as e:
+        print(f"  Error fetching batch of {len(listing_ids)} listings: {e}")
+        return []
+
+
+def get_batch_image_info(client, listing_ids):
+    """Get first image info for up to 100 listings in one API call."""
     if not listing_ids:
-        print("No listing IDs found in image_metadata.json")
-        return
+        return {}
 
-    conn = init_db(db_path)
+    time.sleep(API_DELAY)
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/listings/batch",
+            headers={"x-api-key": ETSY_API_KEY},
+            params={
+                "listing_ids": ",".join(str(lid) for lid in listing_ids),
+                "includes": "Images",
+            },
+        )
+        update_api_usage(response)
+        response.raise_for_status()
 
-    # Skip listings already in DB
-    existing = set()
-    for row in conn.execute("SELECT listing_id FROM listings").fetchall():
-        existing.add(row[0])
-
-    to_fetch = [lid for lid in listing_ids if lid not in existing]
-    if limit > 0:
-        to_fetch = to_fetch[:limit]
-    print(f"Found {len(listing_ids)} listings in metadata, {len(existing)} already in DB, {len(to_fetch)} to fetch")
-
-    if not to_fetch:
-        print("Nothing to do")
-        conn.close()
-        return
-
-    snapshot_timestamp = int(time.time())
-    stats = {"fetched": 0, "not_found": 0, "api_calls": 0}
-    batch_size = 100
-
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        for batch_start in range(0, len(to_fetch), batch_size):
-            batch = to_fetch[batch_start:batch_start + batch_size]
-            results = fetch_listings_batch(client, batch)
-            stats["api_calls"] += 1
-
-            fetched_ids = set()
-            for listing in results:
-                insert_listing_static(conn, listing, snapshot_timestamp)
-                insert_listing_dynamic(conn, listing, snapshot_timestamp)
-                fetched_ids.add(listing.get("listing_id"))
-                stats["fetched"] += 1
-
-            stats["not_found"] += len(batch) - len(fetched_ids)
-
-            conn.commit()
-            done = batch_start + len(batch)
-            print(f"[{ts()}] {done}/{len(to_fetch)} — fetched: {stats['fetched']}, not found: {stats['not_found']}")
-
-    conn.close()
-
-    print("\n" + "=" * 50)
-    print("Listings sync complete!")
-    print(f"  Fetched: {stats['fetched']}")
-    print(f"  Not found: {stats['not_found']}")
-    print(f"  API calls: {stats['api_calls']}")
-    print(f"\nDatabase: {db_path}")
+        results = {}
+        for listing in response.json().get("results", []):
+            lid = listing.get("listing_id")
+            images = listing.get("images", [])
+            if images:
+                first = images[0]
+                results[lid] = (first["listing_image_id"], first["url_570xN"])
+        return results
+    except Exception as e:
+        print(f"  Error in batch image fetch: {e}")
+        return {}
 
 
-def sync_data(top_n: int = 0, db_path: Path = DB_FILE, continuous: bool = False, shops_only: bool = False):
-    """Main sync function.
+def fetch_shop_reviews(client, shop_id, last_timestamp=0):
+    """Fetch reviews for a shop newer than last_timestamp."""
+    reviews = []
+    offset = 0
 
-    If continuous=True, runs forever, checking for stale shops and syncing slowly.
-    If shops_only=True, only fetches shop data (skips listings and reviews).
-    """
-    if not ETSY_API_KEY:
-        print("Error: ETSY_API_KEY not set in .env")
-        return
+    while True:
+        time.sleep(API_DELAY)
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/shops/{shop_id}/reviews",
+                headers={"x-api-key": ETSY_API_KEY},
+                params={"limit": 100, "offset": offset},
+            )
+            update_api_usage(response)
+            if response.status_code == 404:
+                break
+            response.raise_for_status()
 
-    if continuous:
-        print(f"[{ts()}] Starting continuous sync mode...")
-        run_continuous_sync(db_path)
-        return
+            results = response.json().get("results", [])
+            if not results:
+                break
 
-    snapshot_timestamp = int(time.time())
+            found_old = False
+            for review in results:
+                if review.get("create_timestamp", 0) <= last_timestamp:
+                    found_old = True
+                    break
+                reviews.append(review)
 
-    # Get shop IDs from metadata
-    shop_counts = get_shop_ids_from_metadata()
-    if not shop_counts:
-        print("No shops found in image_metadata.json")
-        return
+            if found_old:
+                break
 
-    # Sort by listing count and optionally limit
-    sorted_shops = sorted(shop_counts.items(), key=lambda x: x[1], reverse=True)
-    if top_n > 0:
-        sorted_shops = sorted_shops[:top_n]
-        print(f"Syncing top {top_n} shops by listing count")
+            offset += 100
+            if offset >= 10000:
+                break
+        except Exception as e:
+            print(f"  Error fetching reviews for shop {shop_id}: {e}")
+            break
 
-    shop_ids = [shop_id for shop_id, _ in sorted_shops]
-    print(f"Found {len(shop_ids)} shops to sync")
+    return reviews
 
-    # Initialize database
-    conn = init_db(db_path)
 
-    # Get last review timestamps and last shop sync times
-    last_review_timestamps = get_sync_state(conn, "last_review_timestamps", {})
-    last_shop_sync = get_sync_state(conn, "last_shop_sync", {})
+# ─── Metadata ────────────────────────────────────────────────────────────────
 
-    stats = {
-        "shops_static": 0,
-        "shops_dynamic": 0,
-        "listings_static": 0,
-        "listings_dynamic": 0,
-        "reviews": 0,
-        "api_calls": 0,
-        "skipped": 0,
+def load_metadata() -> dict:
+    if METADATA_FILE.exists():
+        with open(METADATA_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_metadata(metadata, lock=None):
+    if lock:
+        with lock:
+            with open(METADATA_FILE, "w") as f:
+                json.dump(metadata, f)
+    else:
+        with open(METADATA_FILE, "w") as f:
+            json.dump(metadata, f)
+
+
+# ─── Image Files ─────────────────────────────────────────────────────────────
+
+_existing_images: dict[int, int] = {}
+
+
+def load_existing_images() -> dict[int, int]:
+    existing = {}
+    for f in IMAGES_DIR.glob("*.jpg"):
+        try:
+            listing_id = int(f.stem)
+            existing[listing_id] = f.stat().st_size
+        except ValueError:
+            pass
+    return existing
+
+
+def download_image(client, url, listing_id) -> bool:
+    try:
+        response = client.get(url)
+        response.raise_for_status()
+        filepath = IMAGES_DIR / f"{listing_id}.jpg"
+        with open(filepath, "wb") as f:
+            f.write(response.content)
+        return True
+    except Exception as e:
+        print(f"  Error downloading image for {listing_id}: {e}")
+        return False
+
+
+def create_white_placeholder(filepath: Path) -> int:
+    white_jpeg = bytes([
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+        0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+        0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+        0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+        0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
+        0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03,
+        0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
+        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
+        0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72,
+        0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
+        0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+        0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
+        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3,
+        0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+        0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
+        0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4,
+        0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01,
+        0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xDB, 0x20, 0xA8, 0xF1, 0x4F, 0xFF,
+        0xD9
+    ])
+    with open(filepath, "wb") as f:
+        f.write(white_jpeg)
+    return len(white_jpeg)
+
+
+# ─── Download Queue ──────────────────────────────────────────────────────────
+
+class RateLimiter:
+    def __init__(self, rate):
+        self.min_interval = 1.0 / rate
+        self.lock = threading.Lock()
+        self.last_time = 0.0
+
+    def acquire(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_time
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_time = time.time()
+
+
+class ImageDownloadQueue:
+    def __init__(self, metadata, metadata_lock):
+        self.queue = queue.Queue()
+        self.metadata = metadata
+        self.metadata_lock = metadata_lock
+        self.stats = {"downloaded": 0, "errors": 0}
+        self.stats_lock = threading.Lock()
+        self.running = True
+        self.rate_limiter = RateLimiter(CDN_RATE_LIMIT)
+        self.worker = None
+
+    def start(self):
+        self.worker = threading.Thread(target=self._run_worker, daemon=True)
+        self.worker.start()
+
+    def _run_worker(self):
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            while self.running:
+                try:
+                    job = self.queue.get(timeout=5.0)
+                    if job is None:
+                        break
+
+                    listing_id, image_url = job
+                    self.rate_limiter.acquire()
+                    success = download_image(client, image_url, listing_id)
+
+                    with self.stats_lock:
+                        if success:
+                            self.stats["downloaded"] += 1
+                            filepath = IMAGES_DIR / f"{listing_id}.jpg"
+                            _existing_images[listing_id] = filepath.stat().st_size
+                        else:
+                            self.stats["errors"] += 1
+                            filepath = IMAGES_DIR / f"{listing_id}.jpg"
+                            _existing_images[listing_id] = create_white_placeholder(filepath)
+                            with self.metadata_lock:
+                                entry = self.metadata.get(str(listing_id), {})
+                                if isinstance(entry, dict):
+                                    entry["image_id"] = FAILED_IMAGE_ID
+
+                    self.queue.task_done()
+                except queue.Empty:
+                    continue
+
+    def add(self, listing_id, image_url, image_id, shop_id, when_made):
+        lid_str = str(listing_id)
+        filepath = IMAGES_DIR / f"{listing_id}.jpg"
+        filepath.touch()
+        _existing_images[listing_id] = 0
+
+        hex_val, suffix = extract_hex_suffix(image_url)
+        with self.metadata_lock:
+            self.metadata[lid_str] = {
+                "image_id": image_id,
+                "shop_id": shop_id,
+                "hex": hex_val,
+                "suffix": suffix,
+                "when_made": when_made,
+            }
+        self.queue.put((listing_id, image_url))
+
+    def pending(self):
+        return self.queue.qsize()
+
+    def get_stats(self):
+        with self.stats_lock:
+            return dict(self.stats)
+
+    def wait_for_completion(self):
+        self.queue.join()
+
+    def shutdown(self):
+        self.running = False
+        self.queue.put(None)
+        if self.worker:
+            self.worker.join(timeout=10.0)
+
+
+# ─── Progress ────────────────────────────────────────────────────────────────
+
+def load_progress() -> dict:
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
+    return {
+        "phase": "crawl",
+        "crawl_unit_index": 0,
+        "offset": 0,
+        "exhausted": [],
     }
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        for i, shop_id in enumerate(shop_ids):
-            shop_id_str = str(shop_id)
 
-            # Check if shop was synced recently (within sync interval)
-            last_sync_time = last_shop_sync.get(shop_id_str, 0)
-            shop_recently_synced = snapshot_timestamp - last_sync_time < SYNC_INTERVAL
+def save_progress(progress):
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(progress, f)
 
-            if shop_recently_synced and shops_only:
-                stats["skipped"] += 1
-                continue
 
-            print(f"\n[{ts()}] Shop {shop_id} ({i+1}/{len(shop_ids)})...")
+# ─── Signal Handling ─────────────────────────────────────────────────────────
 
-            if not shop_recently_synced:
-                # Check if this is a new shop (for static insert)
-                is_new_shop = conn.execute(
-                    "SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)
-                ).fetchone() is None
+_download_queue = None
 
-                # Fetch shop data
-                shop_data = fetch_shop(client, shop_id)
-                stats["api_calls"] += 1
 
-                if shop_data:
-                    if is_new_shop:
-                        insert_shop_static(conn, shop_data, snapshot_timestamp)
-                        stats["shops_static"] += 1
+def _signal_handler(signum, frame):
+    print("\n\nInterrupted! Shutting down...")
+    if _download_queue is not None:
+        _download_queue.shutdown()
+    sys.exit(0)
 
-                    insert_shop_dynamic(conn, shop_data, snapshot_timestamp)
-                    stats["shops_dynamic"] += 1
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ─── Shop Handler ────────────────────────────────────────────────────────────
+
+def handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
+    """Fetch shop if new or stale. Returns True if an API call was made."""
+    if shop_id not in existing_shops:
+        shop_data = fetch_shop(client, shop_id)
+        if shop_data:
+            insert_shop_static(conn, shop_data, snapshot_ts)
+            insert_shop_dynamic(conn, shop_data, snapshot_ts)
+            existing_shops.add(shop_id)
+            shop_last_ts[shop_id] = snapshot_ts
+        return True
+    else:
+        last_ts = shop_last_ts.get(shop_id, 0)
+        if snapshot_ts - last_ts > ONE_WEEK:
+            shop_data = fetch_shop(client, shop_id)
+            if shop_data:
+                insert_shop_dynamic(conn, shop_data, snapshot_ts)
+                shop_last_ts[shop_id] = snapshot_ts
+            return True
+    return False
+
+
+# ─── Phase 1-3: Taxonomy Crawl ──────────────────────────────────────────────
+
+def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
+                existing_listings, existing_shops, listing_last_ts, shop_last_ts,
+                snapshot_ts, seen_in_crawl):
+
+    crawl_unit_index = progress.get("crawl_unit_index", 0)
+    exhausted = set(progress.get("exhausted", []))
+    offset = progress.get("offset", 0)
+
+    # Skip already exhausted units
+    while crawl_unit_index in exhausted and crawl_unit_index < len(CRAWL_UNITS):
+        crawl_unit_index += 1
+
+    if crawl_unit_index >= len(CRAWL_UNITS):
+        print(f"[{ts()}] All crawl units already exhausted.")
+        return
+
+    stats = {"new_2000plus": 0, "new_pre2000": 0, "existing_updated": 0,
+             "skipped": 0, "shops_fetched": 0}
+
+    while crawl_unit_index < len(CRAWL_UNITS):
+        unit = CRAWL_UNITS[crawl_unit_index]
+
+        if offset == 0:
+            print(f"\n{'='*60}")
+            print(f"CRAWL: {unit['name']} [{crawl_unit_index+1}/{len(CRAWL_UNITS)}]")
+            print(f"API: {_api_stats['used']}/{_api_stats['limit']}")
+            print(f"{'='*60}")
+
+        # Fetch batch
+        result, error = fetch_active_listings(
+            client, unit["taxonomy_id"], offset,
+            unit["min_price"], unit["max_price"]
+        )
+
+        if error == "rate_limited":
+            print("Rate limited. Saving and stopping.")
+            progress["crawl_unit_index"] = crawl_unit_index
+            progress["offset"] = offset
+            progress["exhausted"] = list(exhausted)
+            save_progress(progress)
+            save_metadata(metadata, metadata_lock)
+            conn.commit()
+            return
+
+        if error == "bad_request" or result is None:
+            exhausted.add(crawl_unit_index)
+            crawl_unit_index += 1
+            offset = 0
+            while crawl_unit_index in exhausted and crawl_unit_index < len(CRAWL_UNITS):
+                crawl_unit_index += 1
+            progress["crawl_unit_index"] = crawl_unit_index
+            progress["offset"] = 0
+            progress["exhausted"] = list(exhausted)
+            save_progress(progress)
+            continue
+
+        results = result
+        total_count = error  # second return value is count when successful
+
+        if not results or offset >= MAX_OFFSET or offset + 100 >= total_count:
+            if results:
+                # Process this last batch before marking exhausted
+                _process_crawl_batch(
+                    client, results, metadata, metadata_lock, conn, download_queue,
+                    existing_listings, existing_shops, listing_last_ts, shop_last_ts,
+                    snapshot_ts, seen_in_crawl, stats
+                )
+            exhausted.add(crawl_unit_index)
+            print(f"  Exhausted: {unit['name']}")
+            crawl_unit_index += 1
+            offset = 0
+            while crawl_unit_index in exhausted and crawl_unit_index < len(CRAWL_UNITS):
+                crawl_unit_index += 1
+            progress["crawl_unit_index"] = crawl_unit_index
+            progress["offset"] = 0
+            progress["exhausted"] = list(exhausted)
+            save_progress(progress)
+            conn.commit()
+            save_metadata(metadata, metadata_lock)
+            continue
+
+        # Process batch
+        _process_crawl_batch(
+            client, results, metadata, metadata_lock, conn, download_queue,
+            existing_listings, existing_shops, listing_last_ts, shop_last_ts,
+            snapshot_ts, seen_in_crawl, stats
+        )
+
+        offset += 100
+        progress["crawl_unit_index"] = crawl_unit_index
+        progress["offset"] = offset
+        progress["exhausted"] = list(exhausted)
+        save_progress(progress)
+        conn.commit()
+        save_metadata(metadata, metadata_lock)
+
+        dl_stats = download_queue.get_stats()
+        print(f"  offset={offset} | new={stats['new_2000plus']} pre2000={stats['new_pre2000']} "
+              f"updated={stats['existing_updated']} skipped={stats['skipped']} "
+              f"shops={stats['shops_fetched']} dl={dl_stats['downloaded']} "
+              f"API={_api_stats['used']}/{_api_stats['limit']}")
+
+    progress["phase"] = "mopup"
+    save_progress(progress)
+    print(f"\n[{ts()}] Crawl complete: {stats['new_2000plus']} new (2000+), "
+          f"{stats['new_pre2000']} new (pre-2000), {stats['existing_updated']} updated, "
+          f"{stats['skipped']} skipped, {stats['shops_fetched']} shops fetched")
+
+
+def _process_crawl_batch(client, results, metadata, metadata_lock, conn, download_queue,
+                         existing_listings, existing_shops, listing_last_ts, shop_last_ts,
+                         snapshot_ts, seen_in_crawl, stats):
+    """Process a batch of listings from the taxonomy crawl."""
+
+    new_need_images = []  # listings needing image fetch + DB insert
+
+    for listing in results:
+        lid = listing["listing_id"]
+        lid_str = str(lid)
+        when_made = listing.get("when_made", "")
+        shop_id = listing.get("shop_id")
+        is_2000_plus = when_made in ALLOWED_WHEN_MADE
+
+        seen_in_crawl.add(lid)
+
+        if lid_str in metadata:
+            # Already known listing
+            if is_2000_plus:
+                # Check if listing needs dynamic update
+                if lid in existing_listings:
+                    last_ts = listing_last_ts.get(lid, 0)
+                    if snapshot_ts - last_ts > ONE_WEEK:
+                        insert_listing_dynamic(conn, listing, snapshot_ts)
+                        listing_last_ts[lid] = snapshot_ts
+                        stats["existing_updated"] += 1
+                    else:
+                        stats["skipped"] += 1
+                else:
+                    # In metadata but not DB — insert
+                    insert_listing_static(conn, listing, snapshot_ts)
+                    insert_listing_dynamic(conn, listing, snapshot_ts)
+                    existing_listings.add(lid)
+                    listing_last_ts[lid] = snapshot_ts
+                    stats["existing_updated"] += 1
+
+                # Handle shop
+                if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
+                    stats["shops_fetched"] += 1
             else:
                 stats["skipped"] += 1
+            continue
 
-            if not shops_only:
-                # Fetch listings
-                listings = fetch_shop_listings(client, shop_id)
-                stats["api_calls"] += (len(listings) // 100) + 1
+        # New listing (not in metadata)
+        if not is_2000_plus:
+            # when_made < 2000: metadata only, no image, no DB
+            metadata[lid_str] = {"shop_id": shop_id, "when_made": when_made}
+            stats["new_pre2000"] += 1
+            continue
 
-                for listing in listings:
-                    listing_id = listing.get("listing_id")
-                    is_new_listing = conn.execute(
-                        "SELECT 1 FROM listings WHERE listing_id = ?", (listing_id,)
-                    ).fetchone() is None
+        # New, when_made >= 2000: collect for batch image fetch
+        new_need_images.append(listing)
 
-                    if is_new_listing:
-                        insert_listing_static(conn, listing, snapshot_timestamp)
-                        stats["listings_static"] += 1
+    # Batch fetch images for new listings
+    if new_need_images:
+        batch_ids = [l["listing_id"] for l in new_need_images]
+        image_info = get_batch_image_info(client, batch_ids)
 
-                    insert_listing_dynamic(conn, listing, snapshot_timestamp)
-                    stats["listings_dynamic"] += 1
+        for listing in new_need_images:
+            lid = listing["listing_id"]
+            lid_str = str(lid)
+            shop_id = listing["shop_id"]
+            wm = listing.get("when_made", "")
 
-                # Fetch reviews (incremental)
-                last_ts = last_review_timestamps.get(shop_id_str, 0)
-                reviews = fetch_shop_reviews(client, shop_id, last_ts)
-                stats["api_calls"] += 1
+            if lid in image_info:
+                image_id, image_url = image_info[lid]
+                download_queue.add(lid, image_url, image_id, shop_id, wm)
+            else:
+                # No images found — still add to metadata
+                metadata[lid_str] = {
+                    "image_id": None, "shop_id": shop_id,
+                    "hex": None, "suffix": None, "when_made": wm,
+                }
 
-                if reviews:
-                    newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
-                    last_review_timestamps[shop_id_str] = newest_ts
+            # Insert listing into DB
+            insert_listing_static(conn, listing, snapshot_ts)
+            insert_listing_dynamic(conn, listing, snapshot_ts)
+            existing_listings.add(lid)
+            listing_last_ts[lid] = snapshot_ts
 
-                    for review in reviews:
-                        insert_review(conn, review, snapshot_timestamp)
-                        stats["reviews"] += 1
+            # Handle shop
+            if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
+                stats["shops_fetched"] += 1
 
-                print(f"  Listings: {len(listings)}, New reviews: {len(reviews)}")
+            stats["new_2000plus"] += 1
 
-            # Mark shop as synced
-            last_shop_sync[shop_id_str] = snapshot_timestamp
 
-            # Commit periodically
-            if (i + 1) % 10 == 0:
-                conn.commit()
-                set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
-                set_sync_state(conn, "last_shop_sync", last_shop_sync)
+# ─── Phase 4: Mop-Up Pass ───────────────────────────────────────────────────
 
-    # Final commit
+def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
+                listing_last_ts, shop_last_ts, snapshot_ts, seen_in_crawl):
+
+    # Find listings in metadata with when_made >= 2000 not seen in crawl
+    mopup_ids = []
+    for lid_str, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+        wm = entry.get("when_made", "")
+        if wm not in ALLOWED_WHEN_MADE:
+            continue
+        try:
+            lid = int(lid_str)
+        except ValueError:
+            continue
+        if lid not in seen_in_crawl:
+            mopup_ids.append(lid)
+
+    if not mopup_ids:
+        print(f"[{ts()}] Mop-up: nothing to do (all listings seen in crawl)")
+        return
+
+    print(f"[{ts()}] Mop-up: {len(mopup_ids)} listings not seen in crawl")
+
+    processed = 0
+    for batch_start in range(0, len(mopup_ids), 100):
+        batch = mopup_ids[batch_start:batch_start + 100]
+        results = fetch_listings_batch(client, batch)
+
+        for listing in results:
+            lid = listing["listing_id"]
+            shop_id = listing["shop_id"]
+
+            if lid not in existing_listings:
+                insert_listing_static(conn, listing, snapshot_ts)
+                insert_listing_dynamic(conn, listing, snapshot_ts)
+                existing_listings.add(lid)
+                listing_last_ts[lid] = snapshot_ts
+            elif snapshot_ts - listing_last_ts.get(lid, 0) > ONE_WEEK:
+                insert_listing_dynamic(conn, listing, snapshot_ts)
+                listing_last_ts[lid] = snapshot_ts
+
+            handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts)
+
+        conn.commit()
+        processed += len(batch)
+        print(f"  Mop-up: {processed}/{len(mopup_ids)}")
+
+    print(f"[{ts()}] Mop-up complete: {processed} listings processed")
+
+
+# ─── Phase 5: Sync Check ────────────────────────────────────────────────────
+
+def phase_sync_check(metadata, conn, existing_listings, existing_shops):
+    issues = []
+
+    # Check 1: Every metadata entry with when_made >= 2000 has image + DB
+    for lid_str, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+        wm = entry.get("when_made", "")
+        if wm not in ALLOWED_WHEN_MADE:
+            continue
+
+        try:
+            lid = int(lid_str)
+        except ValueError:
+            continue
+
+        # Check image
+        img_path = IMAGES_DIR / f"{lid}.jpg"
+        if not img_path.exists() or img_path.stat().st_size == 0:
+            issues.append(f"Missing/empty image: {lid}")
+
+        # Check listing in DB
+        if lid not in existing_listings:
+            issues.append(f"Missing listing in DB: {lid}")
+
+        # Check shop in DB
+        shop_id = entry.get("shop_id")
+        if shop_id and shop_id not in existing_shops:
+            issues.append(f"Missing shop {shop_id} in DB (listing {lid})")
+
+    # Check 2: Every DB listing has metadata entry
+    for lid in existing_listings:
+        if str(lid) not in metadata:
+            issues.append(f"DB listing {lid} has no metadata entry")
+
+    # Check 3: No when_made < 2000 in DB
+    for lid in existing_listings:
+        entry = metadata.get(str(lid))
+        if isinstance(entry, dict) and entry.get("when_made") not in ALLOWED_WHEN_MADE:
+            issues.append(f"Listing {lid} in DB with pre-2000 when_made: {entry.get('when_made')}")
+
+    if issues:
+        print(f"\n[{ts()}] Sync check: {len(issues)} issues found")
+        for issue in issues[:20]:
+            print(f"  - {issue}")
+        if len(issues) > 20:
+            print(f"  ... and {len(issues) - 20} more")
+    else:
+        print(f"\n[{ts()}] Sync check: all data consistent")
+
+    return issues
+
+
+# ─── Phase 6: Reviews ───────────────────────────────────────────────────────
+
+def phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts):
+    shop_ids = sorted(existing_shops)
+    last_review_ts = get_sync_state(conn, "last_review_timestamps", {})
+    # Jan 1, 2000 as default
+    default_ts = 946684800
+
+    total_reviews = 0
+    skipped_reviews = 0
+    print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops")
+
+    for i, shop_id in enumerate(shop_ids):
+        sid_str = str(shop_id)
+        last_ts = last_review_ts.get(sid_str, default_ts)
+
+        reviews = fetch_shop_reviews(client, shop_id, last_ts)
+        if reviews:
+            newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
+            last_review_ts[sid_str] = newest_ts
+            for review in reviews:
+                if review.get("listing_id") not in existing_listings:
+                    skipped_reviews += 1
+                    continue
+                insert_review(conn, review, snapshot_ts)
+            total_reviews += sum(1 for r in reviews if r.get("listing_id") in existing_listings)
+
+        if (i + 1) % 100 == 0:
+            conn.commit()
+            set_sync_state(conn, "last_review_timestamps", last_review_ts)
+            print(f"  Reviews: {i+1}/{len(shop_ids)} shops, {total_reviews} new reviews "
+                  f"| API={_api_stats['used']}/{_api_stats['limit']}")
+
     conn.commit()
-    set_sync_state(conn, "last_review_timestamps", last_review_timestamps)
-    set_sync_state(conn, "last_shop_sync", last_shop_sync)
-    set_sync_state(conn, "last_sync", snapshot_timestamp)
-    conn.close()
+    set_sync_state(conn, "last_review_timestamps", last_review_ts)
+    print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops "
+          f"(skipped {skipped_reviews} non-matching)")
 
-    print("\n" + "=" * 50)
-    print("Sync complete!")
-    print(f"  Skipped (recently synced): {stats['skipped']}")
-    print(f"  New shops (static): {stats['shops_static']}")
-    print(f"  Shop snapshots (dynamic): {stats['shops_dynamic']}")
-    print(f"  New listings (static): {stats['listings_static']}")
-    print(f"  Listing snapshots (dynamic): {stats['listings_dynamic']}")
-    print(f"  Reviews: {stats['reviews']}")
-    print(f"  API calls: {stats['api_calls']}")
-    print(f"\nDatabase: {db_path}")
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    if not ETSY_API_KEY:
+        print("Error: ETSY_API_KEY not set in .env")
+        return
+
+    IMAGES_DIR.mkdir(exist_ok=True)
+
+    print(f"{'='*60}")
+    print(f"ETSY FURNITURE DATA SYNC")
+    print(f"{'='*60}")
+
+    # Load state
+    metadata = load_metadata()
+    progress = load_progress()
+    conn = init_db(DB_FILE)
+
+    print(f"Metadata: {len(metadata)} entries")
+    print(f"Crawl units: {len(CRAWL_UNITS)}")
+
+    # Pre-load DB state for O(1) lookups
+    print("Loading DB state...")
+    existing_listings = set(r[0] for r in conn.execute("SELECT listing_id FROM listings").fetchall())
+    existing_shops = set(r[0] for r in conn.execute("SELECT shop_id FROM shops").fetchall())
+
+    listing_last_ts = {}
+    for r in conn.execute("SELECT listing_id, MAX(snapshot_timestamp) FROM listings_dynamic GROUP BY listing_id").fetchall():
+        listing_last_ts[r[0]] = r[1]
+
+    shop_last_ts = {}
+    for r in conn.execute("SELECT shop_id, MAX(snapshot_timestamp) FROM shops_dynamic GROUP BY shop_id").fetchall():
+        shop_last_ts[r[0]] = r[1]
+
+    print(f"DB: {len(existing_listings)} listings, {len(existing_shops)} shops")
+
+    # Load image files
+    global _existing_images
+    _existing_images = load_existing_images()
+    complete = sum(1 for s in _existing_images.values() if s > 0)
+    pending = sum(1 for s in _existing_images.values() if s == 0)
+    print(f"Images: {complete} complete, {pending} pending")
+
+    # Start download queue
+    metadata_lock = threading.Lock()
+    download_queue = ImageDownloadQueue(metadata, metadata_lock)
+    download_queue.start()
+    global _download_queue
+    _download_queue = download_queue
+
+    snapshot_ts = int(time.time())
+    seen_in_crawl = set()
+
+    current_phase = progress.get("phase", "crawl")
+
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        # Phase 1-3: Taxonomy crawl
+        if current_phase == "crawl":
+            print(f"\n--- Phase 1-3: Taxonomy Crawl ---")
+            phase_crawl(
+                client, metadata, metadata_lock, conn, download_queue, progress,
+                existing_listings, existing_shops, listing_last_ts, shop_last_ts,
+                snapshot_ts, seen_in_crawl
+            )
+            current_phase = progress.get("phase", "crawl")
+
+        # Phase 4: Mop-up
+        if current_phase == "mopup":
+            print(f"\n--- Phase 4: Mop-Up ---")
+            phase_mopup(
+                client, metadata, conn, existing_listings, existing_shops,
+                listing_last_ts, shop_last_ts, snapshot_ts, seen_in_crawl
+            )
+            progress["phase"] = "sync_check"
+            save_progress(progress)
+            current_phase = "sync_check"
+
+        # Wait for all image downloads before sync check
+        pending_dl = download_queue.pending()
+        if pending_dl > 0:
+            print(f"\nWaiting for {pending_dl} pending image downloads...")
+            download_queue.wait_for_completion()
+
+        # Phase 5: Sync check
+        if current_phase == "sync_check":
+            print(f"\n--- Phase 5: Sync Check ---")
+            phase_sync_check(metadata, conn, existing_listings, existing_shops)
+            progress["phase"] = "reviews"
+            save_progress(progress)
+            current_phase = "reviews"
+
+        # Phase 6: Reviews
+        if current_phase == "reviews":
+            print(f"\n--- Phase 6: Reviews ---")
+            phase_reviews(client, conn, existing_shops, existing_listings, snapshot_ts)
+            progress["phase"] = "complete"
+            save_progress(progress)
+
+    # Wait for pending downloads
+    pending_dl = download_queue.pending()
+    if pending_dl > 0:
+        print(f"\nWaiting for {pending_dl} pending downloads...")
+        download_queue.wait_for_completion()
+
+    dl_stats = download_queue.get_stats()
+    download_queue.shutdown()
+
+    # Final save
+    conn.commit()
+    conn.close()
+    save_metadata(metadata, metadata_lock)
+
+    # Reset progress for next cycle
+    progress = {"phase": "crawl", "crawl_unit_index": 0, "offset": 0, "exhausted": []}
+    save_progress(progress)
+
+    print(f"\n{'='*60}")
+    print(f"SYNC COMPLETE")
+    print(f"{'='*60}")
+    print(f"Images downloaded: {dl_stats['downloaded']}")
+    print(f"Download errors: {dl_stats['errors']}")
+    print(f"DB: {len(existing_listings)} listings, {len(existing_shops)} shops")
+    print(f"Metadata: {len(metadata)} entries")
+    print(f"API: {_api_stats['used']}/{_api_stats['limit']}")
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Sync Etsy shop/listing/review data")
-    parser.add_argument("--top", type=int, default=0, help="Only sync top N shops by listing count")
-    parser.add_argument("--test", action="store_true", help="Use test database")
-    parser.add_argument("--fast", action="store_true", help="Fast mode: ~90 QPS (use all API quota)")
-    parser.add_argument("--slow", action="store_true", help="Slow mode: ~1 QPS (spread over ~10 days)")
-    parser.add_argument("--continuous", action="store_true", help="Run continuously, syncing stale shops")
-    parser.add_argument("--shops-only", action="store_true", help="Only sync shop data (skip listings and reviews)")
-    parser.add_argument("--listings-only", action="store_true", help="Only sync listings (skip shop data and reviews)")
-    args = parser.parse_args()
-
-    # Set API delay based on mode (default is fast)
-    if args.slow or args.continuous:
-        API_DELAY = API_DELAY_SLOW
-        print("*** SLOW MODE (~1 QPS) ***\n")
-    elif args.fast:
-        API_DELAY = API_DELAY_FAST
-        print("*** FAST MODE (5 QPS) ***\n")
-
-    db_path = DB_FILE_TEST if args.test else DB_FILE
-    if args.test:
-        print("*** TEST MODE ***\n")
-    if args.shops_only:
-        print("*** SHOPS ONLY (skipping listings and reviews) ***\n")
-    if args.listings_only:
-        print("*** LISTINGS ONLY (fetching individual listings from metadata) ***\n")
-
-    if args.listings_only:
-        sync_listings_only(db_path=db_path, limit=args.top)
-    else:
-        sync_data(top_n=args.top, db_path=db_path, continuous=args.continuous, shops_only=args.shops_only)
+    main()
