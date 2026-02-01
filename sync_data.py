@@ -30,7 +30,7 @@ load_dotenv()
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY = 0.6        # ~1.7 QPS
+API_DELAY = 0.2        # 5 QPS
 CDN_RATE_LIMIT = 5     # CDN downloads per second
 NUM_WORKERS = 1        # 1 download worker
 MAX_OFFSET = 10000     # Etsy API offset limit
@@ -694,18 +694,21 @@ class ImageDownloadQueue:
 
         # Build images metadata
         images_meta = []
-        for image_id, image_url in images_list:
+        for idx, (image_id, image_url) in enumerate(images_list):
             img_key = f"{listing_id}_{image_id}"
             filepath = IMAGES_DIR / f"{img_key}.jpg"
             filepath.touch()
             _existing_images[img_key] = 0
 
             hex_val, suffix = extract_hex_suffix(image_url)
-            images_meta.append({
+            img_entry = {
                 "image_id": image_id,
                 "hex": hex_val,
                 "suffix": suffix,
-            })
+            }
+            if idx == 0:
+                img_entry["is_primary"] = True
+            images_meta.append(img_entry)
             self.queue.put((listing_id, image_id, image_url))
 
         # Update metadata with all images
