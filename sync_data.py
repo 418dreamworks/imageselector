@@ -19,6 +19,7 @@ import threading
 import queue
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 import httpx
 
@@ -63,7 +64,7 @@ def ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def extract_hex_suffix(url: str) -> tuple[str | None, str | None]:
+def extract_hex_suffix(url: str) -> Tuple[Optional[str], Optional[str]]:
     match = re.search(r'/il/([a-f0-9]+)/(\d+)/il_[^.]+\.\d+_([a-z0-9]+)\.jpg', url)
     if match:
         return match.group(1), match.group(3)
@@ -530,10 +531,10 @@ def save_metadata(metadata, lock=None):
 
 # ─── Image Files ─────────────────────────────────────────────────────────────
 
-_existing_images: dict[str, int] = {}  # Key: "listing_id_image_id" or "listing_id"
+_existing_images: Dict[str, int] = {}  # Key: "listing_id_image_id" or "listing_id"
 
 
-def load_existing_images() -> dict[str, int]:
+def load_existing_images() -> Dict[str, int]:
     """Load existing images, handling both old and new naming formats.
 
     Old format: {listing_id}.jpg
