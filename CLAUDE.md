@@ -37,3 +37,13 @@ Two main scripts share the Etsy API quota:
 6. Loop through all the shops and pull in all the reviews at the shop level. Filter the reviews so that only reviews that were created after the last datasnapshot are given. If there are no reviews, ask for everything from year 2000. Loop as many offsets as needed.
 
 ## Keep things very clean for now. No flags. The one rule we need to stick to is 5QPS max, and 1 download worker. That's all we need. I suspect this will run very quickly. We test this locally. I want to completely go through 2 taxonomy categories here on this computer before going into production on the imac.
+
+## Stopping sync_data.py
+
+To stop sync_data.py gracefully:
+```bash
+touch /path/to/imageselector/KILL
+```
+The script checks for this file at each loop iteration and exits cleanly, saving all state first.
+
+Do NOT use `pkill` or `kill -9` - use the kill file instead.

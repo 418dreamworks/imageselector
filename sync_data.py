@@ -44,6 +44,7 @@ METADATA_FILE = BASE_DIR / "image_metadata.json"
 PROGRESS_FILE = BASE_DIR / "sync_progress.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
 TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
+KILL_FILE = BASE_DIR / "KILL"
 
 FURNITURE_TAXONOMY_IDS = {
     967, 968, 969, 12455, 12456, 970, 972, 971, 12470, 973, 974, 975, 976, 977,
@@ -62,6 +63,15 @@ ALLOWED_WHEN_MADE = {
 
 def ts():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def check_kill_file():
+    """Check for kill file and delete if found. Returns True if should exit."""
+    if KILL_FILE.exists():
+        KILL_FILE.unlink()
+        print(f"[{ts()}] Kill file detected. Shutting down gracefully...")
+        return True
+    return False
 
 
 def extract_hex_suffix(url: str) -> Tuple[Optional[str], Optional[str]]:
@@ -520,6 +530,7 @@ def load_metadata() -> dict:
 
 
 def save_metadata(metadata, lock=None):
+    """Save metadata to JSON file."""
     if lock:
         with lock:
             with open(METADATA_FILE, "w") as f:
@@ -802,6 +813,16 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
              "skipped": 0, "shops_fetched": 0}
 
     while crawl_unit_index < len(CRAWL_UNITS):
+        # Check for kill file
+        if check_kill_file():
+            progress["crawl_unit_index"] = crawl_unit_index
+            progress["offset"] = offset
+            progress["exhausted"] = list(exhausted)
+            save_progress(progress)
+            save_metadata(metadata, metadata_lock)
+            conn.commit()
+            return
+
         unit = CRAWL_UNITS[crawl_unit_index]
 
         if offset == 0:
@@ -1042,6 +1063,10 @@ def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
 
     processed = 0
     for batch_start in range(0, len(mopup_ids), 100):
+        if check_kill_file():
+            conn.commit()
+            return
+
         batch = mopup_ids[batch_start:batch_start + 100]
         results = fetch_listings_batch(client, batch)
 
@@ -1136,6 +1161,11 @@ def phase_reviews(client, conn, existing_shops, snapshot_ts):
     print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops")
 
     for i, shop_id in enumerate(shop_ids):
+        if check_kill_file():
+            conn.commit()
+            set_sync_state(conn, "last_review_timestamps", last_review_ts)
+            return
+
         sid_str = str(shop_id)
         last_ts = last_review_ts.get(sid_str, default_ts)
 
