@@ -1,13 +1,23 @@
 # Etsy Furniture Image Sync
 
-## Remote Server
+## Required Reading After Compaction
 
-This code runs on a remote computer accessible via:
+**IMPORTANT**: After any context compaction, read these files BEFORE doing anything else:
+- `IMAC_FILES.md` - iMac setup, venv location, file locations
+- `data_structure.md` - DB schema and field definitions
+- `imagesearch.md` - Image search implementation plan
+- `general_rules.md` - Points to parent directory rules
+
+## Remote Server (iMac)
+
 ```bash
 ssh imac
 # or: ssh tzuohannlaw@192.168.68.200
 ```
-No password or passphrase required from this machine.
+
+- **Path**: `/Users/tzuohannlaw/Documents/418Dreamworks/imageselector`
+- **Python**: `venv/bin/python` (not system python)
+- No password required from this machine
 
 ## Project State
 
@@ -42,7 +52,7 @@ Two main scripts share the Etsy API quota:
 
 To stop sync_data.py gracefully:
 ```bash
-touch /path/to/imageselector/KILL
+touch /Users/tzuohannlaw/Documents/418Dreamworks/imageselector/KILL
 ```
 The script checks for this file at each loop iteration and exits cleanly, saving all state first.
 

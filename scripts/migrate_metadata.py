@@ -10,7 +10,7 @@ New format:
 import json
 from pathlib import Path
 
-METADATA_FILE = Path(__file__).parent / "image_metadata.json"
+METADATA_FILE = Path(__file__).parent.parent / "image_metadata.json"
 
 
 def migrate():
