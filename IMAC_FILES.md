@@ -53,6 +53,27 @@ Files that must be present on the iMac at `~/Documents/418Dreamworks/imageselect
 - Only one script should use the API at a time to stay within the limit.
 - **Deploy via git only** — Always `git push` locally then `git pull` on iMac. Never use `scp` to copy files directly.
 
+## External Disks
+
+| Device | Name | Size | Purpose |
+|--------|------|------|---------|
+| disk6 | SSD_120 | 120 GB | Project data (fast access) |
+| disk4 | HDD_320 | 320 GB | Project data (bulk storage) |
+| disk5 | HDD_1000 | 1 TB | Backup (rsync mirror of SSD_120 + HDD_320) |
+
+**Backup strategy**: HDD_1000 is an rsync backup of the other two disks. Run periodically:
+```bash
+rsync -av /Volumes/SSD_120/ /Volumes/HDD_1000/SSD_120_backup/
+rsync -av /Volumes/HDD_320/ /Volumes/HDD_1000/HDD_320_backup/
+```
+
+**Disk health**: Run full read checks periodically to detect bad sectors:
+```bash
+sudo dd if=/dev/disk6 of=/dev/null bs=1m status=progress  # SSD_120
+sudo dd if=/dev/disk4 of=/dev/null bs=1m status=progress  # HDD_320
+sudo dd if=/dev/disk5 of=/dev/null bs=1m status=progress  # HDD_1000
+```
+
 ## Can Be Cleaned Up
 
 | File | Notes |
