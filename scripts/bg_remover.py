@@ -39,24 +39,40 @@ _metadata = None
 _metadata_dirty = False
 
 
-def load_metadata() -> dict:
-    """Load image metadata from JSON file."""
+def load_metadata(force_reload: bool = False, max_retries: int = 5) -> dict:
+    """Load image metadata from JSON file.
+
+    Retries on JSON decode errors (race condition with sync_data.py).
+    """
     global _metadata
-    if _metadata is None:
+    if _metadata is None or force_reload:
         if METADATA_FILE.exists():
-            with open(METADATA_FILE) as f:
-                _metadata = json.load(f)
+            for attempt in range(max_retries):
+                try:
+                    with open(METADATA_FILE) as f:
+                        _metadata = json.load(f)
+                    break
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries - 1:
+                        print(f"JSON decode error (attempt {attempt + 1}), retrying in 2s...")
+                        time.sleep(2)
+                    else:
+                        print(f"Failed to load metadata after {max_retries} attempts: {e}")
+                        _metadata = {}
         else:
             _metadata = {}
     return _metadata
 
 
 def save_metadata():
-    """Save metadata if dirty."""
+    """Save metadata if dirty (atomic write to avoid corruption)."""
     global _metadata, _metadata_dirty
     if _metadata_dirty and _metadata:
-        with open(METADATA_FILE, 'w') as f:
+        # Write to temp file, then rename (atomic on POSIX)
+        tmp_file = METADATA_FILE.with_suffix('.json.tmp')
+        with open(tmp_file, 'w') as f:
             json.dump(_metadata, f)
+        tmp_file.rename(METADATA_FILE)
         _metadata_dirty = False
 
 
@@ -175,8 +191,7 @@ def watch_mode(use_gpu: bool = False, interval: int = 30):
 
     while True:
         # Reload metadata to pick up new images from sync_data.py
-        global _metadata
-        _metadata = None
+        load_metadata(force_reload=True)
 
         items = get_unprocessed_images()
         if items:
