@@ -94,6 +94,11 @@ def extract_hex_suffix(url: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def construct_image_url(hex_val: str, image_id: int, suffix: str) -> str:
+    """Reconstruct Etsy CDN URL from metadata components."""
+    return f"https://i.etsystatic.com/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
+
+
 # ─── Taxonomy Config ─────────────────────────────────────────────────────────
 
 def load_taxonomy_config():
@@ -747,9 +752,63 @@ class ImageDownloadQueue:
 
     def shutdown(self):
         self.running = False
-        self.queue.put(None)
-        if self.worker:
-            self.worker.join(timeout=10.0)
+        for _ in self.workers:
+            self.queue.put(None)
+        for w in self.workers:
+            w.join(timeout=10.0)
+
+    def requeue_pending(self, existing_images):
+        """Re-queue images with size-0 placeholder files (incomplete downloads).
+
+        Looks up hex/suffix from self.metadata to reconstruct URLs.
+        Returns count of re-queued images.
+        """
+        requeued = 0
+        for img_key, size in existing_images.items():
+            if size > 0:
+                continue
+
+            # Parse img_key: "listing_id_image_id" (new) or "listing_id" (old)
+            if "_" in img_key:
+                parts = img_key.rsplit("_", 1)
+                listing_id = int(parts[0])
+                target_image_id = int(parts[1])
+            else:
+                listing_id = int(img_key)
+                target_image_id = None
+
+            lid_str = str(listing_id)
+            with self.metadata_lock:
+                entry = self.metadata.get(lid_str)
+
+            if not entry:
+                continue
+
+            # New format: images array
+            if "images" in entry and entry["images"]:
+                for img_meta in entry["images"]:
+                    img_id = img_meta.get("image_id")
+                    if target_image_id is not None and img_id != target_image_id:
+                        continue
+                    hex_val = img_meta.get("hex")
+                    suffix = img_meta.get("suffix")
+                    if hex_val and suffix and img_id:
+                        url = construct_image_url(hex_val, img_id, suffix)
+                        self.queue.put((listing_id, img_id, url))
+                        requeued += 1
+                    if target_image_id is not None:
+                        break
+            # Old format: single image_id, hex, suffix
+            elif "image_id" in entry and "hex" in entry and "suffix" in entry:
+                img_id = entry["image_id"]
+                hex_val = entry["hex"]
+                suffix = entry["suffix"]
+                if hex_val and suffix and img_id:
+                    url = construct_image_url(hex_val, img_id, suffix)
+                    self.queue.put((listing_id, img_id, url))
+                    requeued += 1
+
+        return requeued
 
 
 # ─── Progress ────────────────────────────────────────────────────────────────
@@ -1259,6 +1318,11 @@ def main():
     download_queue.start()
     global _download_queue
     _download_queue = download_queue
+
+    # Re-queue pending images (size-0 placeholders from interrupted downloads)
+    if pending > 0:
+        requeued = download_queue.requeue_pending(_existing_images)
+        print(f"Re-queued {requeued} pending images for download")
 
     snapshot_ts = int(time.time())
     seen_in_crawl = set()
