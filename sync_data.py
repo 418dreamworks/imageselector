@@ -661,11 +661,14 @@ class ImageDownloadQueue:
         self.stats_lock = threading.Lock()
         self.running = True
         self.rate_limiter = RateLimiter(CDN_RATE_LIMIT)
-        self.worker = None
+        self.workers = []
+        self.num_workers = 8
 
     def start(self):
-        self.worker = threading.Thread(target=self._run_worker, daemon=True)
-        self.worker.start()
+        for _ in range(self.num_workers):
+            worker = threading.Thread(target=self._run_worker, daemon=True)
+            worker.start()
+            self.workers.append(worker)
 
     def _run_worker(self):
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
@@ -913,7 +916,9 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
         progress["exhausted"] = list(exhausted)
         save_progress(progress)
         conn.commit()
-        save_metadata(metadata, metadata_lock)
+        # Save metadata every 5000 listings instead of every 100
+        if offset % 5000 == 0:
+            save_metadata(metadata, metadata_lock)
 
         dl_stats = download_queue.get_stats()
         print(f"  offset={offset} | new+img={stats['new_2000plus']} new-img={stats['new_no_img']} "
