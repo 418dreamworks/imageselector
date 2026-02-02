@@ -738,7 +738,55 @@ class ImageDownloadQueue:
                 "shop_id": shop_id,
                 "when_made": when_made,
                 "images": images_meta,
+                "images_queued": True,
             }
+
+    def add_missing(self, listing_id, images_list, shop_id, when_made):
+        """Add only MISSING images for an existing listing.
+
+        Checks which images already exist on disk and only queues missing ones.
+        Updates metadata to include all images from API.
+        Returns count of newly queued images.
+        """
+        lid_str = str(listing_id)
+        queued = 0
+
+        # Build complete images metadata from API, queue only missing
+        images_meta = []
+        for idx, (image_id, image_url) in enumerate(images_list):
+            img_key = f"{listing_id}_{image_id}"
+            filepath = IMAGES_DIR / f"{img_key}.jpg"
+
+            hex_val, suffix = extract_hex_suffix(image_url)
+            img_entry = {
+                "image_id": image_id,
+                "hex": hex_val,
+                "suffix": suffix,
+            }
+            if idx == 0:
+                img_entry["is_primary"] = True
+
+            # Check if image exists with content (not just placeholder)
+            existing_size = _existing_images.get(img_key, -1)
+            if existing_size <= 0:
+                # Missing or placeholder - queue for download
+                filepath.touch()
+                _existing_images[img_key] = 0
+                self.queue.put((listing_id, image_id, image_url))
+                queued += 1
+
+            images_meta.append(img_entry)
+
+        # Update metadata with complete image list
+        with self.metadata_lock:
+            self.metadata[lid_str] = {
+                "shop_id": shop_id,
+                "when_made": when_made,
+                "images": images_meta,
+                "images_queued": True,
+            }
+
+        return queued
 
     def pending(self):
         return self.queue.qsize()
@@ -998,13 +1046,13 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
     """Process a batch of listings from the taxonomy crawl."""
 
     new_listings = []  # listings not yet in metadata (need DB insert + possibly image)
+    existing_need_images = []  # existing listings that may need image updates
 
     for listing in results:
         lid = listing["listing_id"]
         lid_str = str(lid)
         when_made = listing.get("when_made", "")
         shop_id = listing.get("shop_id")
-        is_2000_plus = when_made in ALLOWED_WHEN_MADE
 
         # Get price for image download decision
         price_data = listing.get("price", {})
@@ -1035,6 +1083,11 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
             # Handle shop for all listings
             if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
                 stats["shops_fetched"] += 1
+
+            # Check if this existing listing needs images (not yet queued)
+            entry = metadata.get(lid_str, {})
+            if not entry.get("images_queued") and when_made in ALLOWED_WHEN_MADE and price >= MIN_PRICE:
+                existing_need_images.append(listing)
             continue
 
         # New listing (not in metadata) — collect for processing
@@ -1115,6 +1168,20 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
                 stats["shops_fetched"] += 1
 
             stats["new_no_img"] += 1
+
+    # Process existing listings that need images (images_complete not set)
+    if existing_need_images:
+        batch_ids = [l["listing_id"] for l in existing_need_images]
+        image_info = get_batch_image_info(client, batch_ids)
+
+        for listing in existing_need_images:
+            lid = listing["listing_id"]
+            shop_id = listing["shop_id"]
+            wm = listing.get("when_made", "")
+
+            if lid in image_info:
+                images_list = image_info[lid]
+                download_queue.add_missing(lid, images_list, shop_id, wm)
 
 
 # ─── Phase 4: Mop-Up Pass ───────────────────────────────────────────────────

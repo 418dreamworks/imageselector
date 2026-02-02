@@ -76,13 +76,20 @@ def save_metadata():
         _metadata_dirty = False
 
 
-def get_unprocessed_images() -> list[tuple[str, int, Path]]:
-    """Get list of (listing_id, image_id, path) for images not yet bg_removed."""
+def get_unprocessed_images(limit: int = 10000) -> list[tuple[str, int, Path]]:
+    """Get list of (listing_id, image_id, path) for images not yet bg_removed.
+
+    Args:
+        limit: Maximum number of images to return (default 10000)
+    """
     metadata = load_metadata()
     unprocessed = []
 
     for lid, entry in metadata.items():
         if not isinstance(entry, dict):
+            continue
+        # Skip listings already fully processed
+        if entry.get("background_removed"):
             continue
         images = entry.get("images", [])
         for img in images:
@@ -91,24 +98,35 @@ def get_unprocessed_images() -> list[tuple[str, int, Path]]:
             image_id = img.get("image_id")
             if image_id:
                 path = IMAGES_DIR / f"{lid}_{image_id}.jpg"
-                if path.exists():
+                if path.exists() and path.stat().st_size > 1000:  # Skip placeholders
                     unprocessed.append((lid, image_id, path))
+                    if len(unprocessed) >= limit:
+                        return unprocessed
 
     return unprocessed
 
 
 def mark_bg_removed(listing_id: str, image_id: int, success: bool):
-    """Mark an image as bg_removed in metadata."""
+    """Mark an image as bg_removed in metadata.
+
+    Also sets listing-level 'background_removed: True' when all images are done.
+    """
     global _metadata, _metadata_dirty
     metadata = load_metadata()
 
     if listing_id in metadata and isinstance(metadata[listing_id], dict):
-        images = metadata[listing_id].get("images", [])
+        entry = metadata[listing_id]
+        images = entry.get("images", [])
         for img in images:
             if img.get("image_id") == image_id:
                 img["bg_removed"] = success
                 _metadata_dirty = True
                 break
+
+        # Check if all images now have bg_removed
+        if images and all(img.get("bg_removed") for img in images):
+            entry["background_removed"] = True
+            _metadata_dirty = True
 
 
 def init_rembg(use_gpu: bool = False):
@@ -182,9 +200,9 @@ def process_batch(items: list[tuple[str, int, Path]], use_gpu: bool = False, sav
     print(f"Done: {success} success, {failed} failed")
 
 
-def watch_mode(use_gpu: bool = False, interval: int = 30):
+def watch_mode(use_gpu: bool = False, interval: int = 30, batch_size: int = 10000):
     """Continuously watch for new images and process them."""
-    print(f"Watch mode: checking every {interval} seconds...")
+    print(f"Watch mode: checking every {interval} seconds (batch size: {batch_size})...")
     print("Press Ctrl+C to stop")
 
     init_rembg(use_gpu=use_gpu)
@@ -193,13 +211,15 @@ def watch_mode(use_gpu: bool = False, interval: int = 30):
         # Reload metadata to pick up new images from sync_data.py
         load_metadata(force_reload=True)
 
-        items = get_unprocessed_images()
+        items = get_unprocessed_images(limit=batch_size)
         if items:
-            print(f"\nFound {len(items)} new images")
+            print(f"\nProcessing batch of {len(items)} images")
             for lid, image_id, img_path in tqdm(items, desc="Processing"):
                 ok = remove_background(img_path)
                 mark_bg_removed(lid, image_id, ok)
             save_metadata()
+        else:
+            print(".", end="", flush=True)
 
         time.sleep(interval)
 
