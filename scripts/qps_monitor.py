@@ -99,14 +99,16 @@ def adjust_qps(limits: dict, current_delay: float) -> float:
     day_remaining = per_day["remaining"]
 
     # Determine action based on daily remaining (main concern)
-    if day_remaining < THRESHOLD:
+    # Above 90k = plenty of quota = slow down to conserve
+    # Below 90k = running low = speed up to use it before reset
+    if day_remaining > THRESHOLD:
         new_delay = min(current_delay * 1.1, MAX_DELAY)
         action = "DECREASE"
-        trigger = "DAILY"
+        trigger = "CONSERVE"
     else:
         new_delay = max(current_delay * 0.9, MIN_DELAY)
         action = "INCREASE"
-        trigger = "OK"
+        trigger = "LOW"
 
     new_qps = 1.0 / new_delay
     old_qps = 1.0 / current_delay
