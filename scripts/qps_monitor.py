@@ -4,8 +4,8 @@
 Also monitors and restarts sync_data.py and bg_remover.py if stopped.
 
 Runs every 10 minutes:
-- If remaining < 90k: decrease QPS by 10%
-- If remaining > 90k: increase QPS by 10% (max 5 QPS)
+- If remaining > 10k: increase QPS by 10% (max 5 QPS)
+- If remaining < 10k: decrease QPS by 10% (conserve)
 - Restart sync_data.py if not running
 - Restart bg_remover.py if not running
 
@@ -34,7 +34,7 @@ BASE_URL = "https://openapi.etsy.com/v3"
 # Limits
 MIN_DELAY = 0.2    # 5 QPS max
 MAX_DELAY = 2.0    # 0.5 QPS min
-THRESHOLD = 90000  # Rate limit threshold
+THRESHOLD = 10000  # Rate limit threshold
 CHECK_INTERVAL = 600  # 10 minutes
 
 
@@ -99,15 +99,15 @@ def adjust_qps(limits: dict, current_delay: float) -> float:
     day_remaining = per_day["remaining"]
 
     # Determine action based on daily remaining (main concern)
-    # Above 90k = plenty of quota = slow down to conserve
-    # Below 90k = running low = speed up to use it before reset
+    # Above 10k = plenty left = speed up (QPS * 1.1)
+    # Below 10k = running low = slow down (QPS * 0.9)
     if day_remaining > THRESHOLD:
-        new_delay = min(current_delay * 1.1, MAX_DELAY)
-        action = "DECREASE"
-        trigger = "CONSERVE"
-    else:
-        new_delay = max(current_delay * 0.9, MIN_DELAY)
+        new_delay = max(current_delay / 1.1, MIN_DELAY)
         action = "INCREASE"
+        trigger = "PLENTY"
+    else:
+        new_delay = min(current_delay / 0.9, MAX_DELAY)
+        action = "DECREASE"
         trigger = "LOW"
 
     new_qps = 1.0 / new_delay
