@@ -73,8 +73,8 @@ def check_rate_limit() -> int | None:
                 f"{BASE_URL}/application/openapi-ping",
                 headers={"x-api-key": ETSY_API_KEY}
             )
-            # Rate limit info is in headers
-            remaining = response.headers.get("X-RateLimit-Remaining")
+            # Rate limit info is in headers (Etsy uses lowercase)
+            remaining = response.headers.get("x-remaining-today")
             if remaining:
                 return int(remaining)
             return None
