@@ -30,8 +30,8 @@ load_dotenv()
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY = 0.2        # 5 QPS
-CDN_RATE_LIMIT = 5     # CDN downloads per second
+API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
+CDN_RATE_LIMIT = 5       # CDN downloads per second
 NUM_WORKERS = 1        # 1 download worker
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
@@ -45,6 +45,19 @@ PROGRESS_FILE = BASE_DIR / "sync_progress.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
 TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
 KILL_FILE = BASE_DIR / "KILL"
+QPS_CONFIG_FILE = BASE_DIR / "qps_config.json"
+
+
+def get_api_delay() -> float:
+    """Get API delay from config file (set by qps_monitor.py)."""
+    if QPS_CONFIG_FILE.exists():
+        try:
+            with open(QPS_CONFIG_FILE) as f:
+                config = json.load(f)
+                return config.get("api_delay", API_DELAY_DEFAULT)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return API_DELAY_DEFAULT
 
 FURNITURE_TAXONOMY_IDS = {
     967, 968, 969, 12455, 12456, 970, 972, 971, 12470, 973, 974, 975, 976, 977,
@@ -384,7 +397,7 @@ def update_api_usage(response):
 
 def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price=None):
     """Fetch a batch of active listings for a taxonomy + price range."""
-    time.sleep(API_DELAY)
+    time.sleep(get_api_delay())
     params = {"taxonomy_id": taxonomy_id, "limit": 100, "offset": offset}
     if min_price is not None:
         params["min_price"] = min_price
@@ -411,7 +424,7 @@ def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price
 
 def fetch_shop(client, shop_id):
     """Fetch full shop data from API."""
-    time.sleep(API_DELAY)
+    time.sleep(get_api_delay())
     try:
         response = client.get(
             f"{BASE_URL}/application/shops/{shop_id}",
@@ -429,7 +442,7 @@ def fetch_shop(client, shop_id):
 
 def fetch_listings_batch(client, listing_ids):
     """Fetch up to 100 listings via batch endpoint."""
-    time.sleep(API_DELAY)
+    time.sleep(get_api_delay())
     try:
         response = client.get(
             f"{BASE_URL}/application/listings/batch",
@@ -452,7 +465,7 @@ def get_batch_image_info(client, listing_ids):
     if not listing_ids:
         return {}
 
-    time.sleep(API_DELAY)
+    time.sleep(get_api_delay())
     try:
         response = client.get(
             f"{BASE_URL}/application/listings/batch",
@@ -484,7 +497,7 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     offset = 0
 
     while True:
-        time.sleep(API_DELAY)
+        time.sleep(get_api_delay())
         try:
             response = client.get(
                 f"{BASE_URL}/application/shops/{shop_id}/reviews",
