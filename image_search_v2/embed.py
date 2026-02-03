@@ -191,6 +191,9 @@ def generate_embeddings(
     Also marks each image as embedded in metadata.
     """
     loader = get_loader()
+    # Preload model before starting (avoids segfault when loading inside tqdm)
+    loader.get_model(model_key)
+
     image_embeddings = []
     text_embeddings = []
     processed = 0
