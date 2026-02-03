@@ -1448,17 +1448,8 @@ def main():
             save_progress(progress)
             current_phase = "sync_check"
 
-        # Wait for all image downloads before sync check
-        pending_dl = download_queue.pending()
-        killed = False
-        if pending_dl > 0:
-            print(f"\nWaiting for {pending_dl} pending image downloads...")
-            if not download_queue.wait_for_completion():
-                # Killed during wait - skip remaining phases
-                killed = True
-
-        # Phase 5: Sync check
-        if not killed and current_phase == "sync_check":
+        # Phase 5: Sync check (downloads continue in background)
+        if current_phase == "sync_check":
             print(f"\n--- Phase 5: Sync Check ---")
             phase_sync_check(metadata, conn, existing_listings, existing_shops)
             progress["phase"] = "reviews"
@@ -1466,7 +1457,7 @@ def main():
             current_phase = "reviews"
 
         # Phase 6: Reviews
-        if not killed and current_phase == "reviews":
+        if current_phase == "reviews":
             print(f"\n--- Phase 6: Reviews ---")
             phase_reviews(client, conn, existing_shops, snapshot_ts)
             progress["phase"] = "complete"
