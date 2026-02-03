@@ -11,7 +11,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-import faiss
+# NOTE: faiss is imported lazily in functions that need it
+# Importing faiss before loading open_clip models on MPS causes segfaults
 import numpy as np
 import torch
 from PIL import Image
@@ -258,23 +259,26 @@ def get_embedding_file(model_key: str, emb_type: str = "image") -> Path:
     return EMBEDDINGS_DIR / f"{model_key}.faiss"
 
 
-def create_faiss_index(dim: int) -> faiss.Index:
+def create_faiss_index(dim: int):
     """Create a FAISS index for cosine similarity.
 
     Uses IndexFlatIP (inner product) since vectors are normalized.
     """
+    import faiss
     return faiss.IndexFlatIP(dim)
 
 
-def load_faiss_index(path: Path) -> faiss.Index | None:
+def load_faiss_index(path: Path):
     """Load a FAISS index from file."""
+    import faiss
     if path.exists():
         return faiss.read_index(str(path))
     return None
 
 
-def save_faiss_index(index: faiss.Index, path: Path):
+def save_faiss_index(index, path: Path):
     """Save a FAISS index to file."""
+    import faiss
     faiss.write_index(index, str(path))
 
 
