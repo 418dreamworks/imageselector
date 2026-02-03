@@ -174,38 +174,43 @@ def get_image_files() -> tuple[list[Path], list[tuple[int, int]]]:
     return valid_files, image_ids
 
 
-def generate_embeddings(
+def generate_embeddings_incremental(
     model_key: str,
     image_files: list[Path],
     image_ids: list[tuple[int, int]],
+    img_index,
+    text_index,
+    emb_file: Path,
+    text_emb_file: Path | None,
     batch_size: int = 32,
     save_interval: int = 1000,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Generate embeddings for all images using specified model.
+    index_save_interval: int = 50000,
+) -> tuple[int, list[tuple[int, int]]]:
+    """Generate embeddings incrementally and add to FAISS indexes.
 
-    For CLIP models, also generates text embeddings from listing titles+materials.
-    Returns (image_embeddings, text_embeddings) - text is None for non-CLIP models.
-    Also marks each image as embedded in metadata.
+    Adds embeddings directly to FAISS indexes instead of accumulating in memory.
+    Saves FAISS indexes periodically to avoid data loss.
+
+    Returns (num_embedded, list of actually embedded image_ids).
     """
     loader = get_loader()
     # Preload model before starting (avoids segfault when loading inside tqdm)
     loader.get_model(model_key)
 
-    image_embeddings = []
-    text_embeddings = []
     processed = 0
     is_clip = MODELS[model_key]["library"] == "open_clip"
+    actually_embedded = []
 
     for i in tqdm(range(0, len(image_files), batch_size), desc=f"Embedding ({model_key})"):
         # Check for kill file
         if check_kill_file():
             save_metadata()
-            # Return what we have so far
-            if image_embeddings:
-                img_arr = np.vstack(image_embeddings).astype("float32")
-                text_arr = np.vstack(text_embeddings).astype("float32") if text_embeddings else None
-                return img_arr, text_arr
-            return np.array([]).reshape(0, MODELS[model_key]["dim"]).astype("float32"), None
+            # Save FAISS indexes before exiting
+            print(f"\nSaving FAISS index ({img_index.ntotal} vectors)...")
+            save_faiss_index(img_index, emb_file)
+            if is_clip and text_index is not None:
+                save_faiss_index(text_index, text_emb_file)
+            return processed, actually_embedded
 
         batch_files = image_files[i : i + batch_size]
         batch_ids = image_ids[i : i + batch_size]
@@ -220,20 +225,23 @@ def generate_embeddings(
                 # Create placeholder
                 images.append(Image.new("RGB", (224, 224), (128, 128, 128)))
 
-        # Always get image embeddings
+        # Get image embeddings and add to index immediately
         img_emb = loader.embed_batch(model_key, images)
-        image_embeddings.append(img_emb.cpu().numpy())
+        img_emb_np = img_emb.cpu().numpy().astype("float32")
+        img_index.add(img_emb_np)
 
         # For CLIP, also get text embeddings
-        if is_clip:
+        if is_clip and text_index is not None:
             listing_ids = [lid for lid, _ in batch_ids]
             texts = get_texts_for_batch(listing_ids)
             text_emb = loader.embed_text_batch(model_key, texts)
-            text_embeddings.append(text_emb.cpu().numpy())
+            text_emb_np = text_emb.cpu().numpy().astype("float32")
+            text_index.add(text_emb_np)
 
         # Mark each image as embedded in metadata
         for lid, iid in batch_ids:
             mark_embedded(str(lid), iid, model_key)
+            actually_embedded.append((lid, iid))
 
         processed += len(batch_files)
 
@@ -241,12 +249,17 @@ def generate_embeddings(
         if processed % save_interval == 0:
             save_metadata()
 
+        # Periodically save FAISS indexes (every 50K images)
+        if processed % index_save_interval == 0:
+            print(f"\nCheckpoint: saving FAISS index ({img_index.ntotal} vectors)...")
+            save_faiss_index(img_index, emb_file)
+            if is_clip and text_index is not None:
+                save_faiss_index(text_index, text_emb_file)
+            save_metadata()
+
     # Final save
     save_metadata()
-
-    img_arr = np.vstack(image_embeddings).astype("float32")
-    text_arr = np.vstack(text_embeddings).astype("float32") if text_embeddings else None
-    return img_arr, text_arr
+    return processed, actually_embedded
 
 
 def get_embedding_file(model_key: str, emb_type: str = "image") -> Path:
@@ -325,8 +338,8 @@ def main():
     parser.add_argument(
         "--batch-limit",
         type=int,
-        default=20000,
-        help="Max new images to embed per run (default: 20000)",
+        default=0,
+        help="Max new images to embed per run (0 = unlimited)",
     )
     args = parser.parse_args()
 
@@ -368,88 +381,55 @@ def main():
         is_clip = MODELS[model_key]["library"] == "open_clip"
         text_emb_file = get_embedding_file(model_key, "text") if is_clip else None
 
-        # Check for existing FAISS index (incremental mode)
-        if not args.full and emb_file.exists() and existing_index:
+        # Load or create FAISS indexes
+        if not args.full and emb_file.exists():
             img_index = load_faiss_index(emb_file)
             text_index = load_faiss_index(text_emb_file) if is_clip and text_emb_file else None
-
-            # Find images not yet embedded for this model
-            new_files = []
-            new_image_ids = []
-            for f, (lid, iid) in zip(all_files, all_image_ids):
-                if (lid, iid) not in existing_index:
-                    new_files.append(f)
-                    new_image_ids.append((lid, iid))
-
-            print(f"Existing embeddings: {img_index.ntotal}")
-            print(f"New images to embed: {len(new_files)}")
-
-            if not new_files:
-                print(f"No new images for {model_key}. Skipping.")
-                continue
-
-            # Apply batch limit
-            if args.batch_limit > 0 and len(new_files) > args.batch_limit:
-                print(f"Limiting to {args.batch_limit} images (batch limit)")
-                new_files = new_files[:args.batch_limit]
-                new_image_ids = new_image_ids[:args.batch_limit]
-
-            # Generate new embeddings
-            new_img_emb, new_text_emb = generate_embeddings(
-                model_key, new_files, new_image_ids, args.batch_size
-            )
-
-            # Calculate how many were actually embedded (may be fewer if killed early)
-            num_embedded = new_img_emb.shape[0]
-            if num_embedded < len(new_image_ids):
-                print(f"Partial embedding: {num_embedded}/{len(new_image_ids)} images")
-                # Only add actually-embedded IDs to final index
-                actually_embedded = new_image_ids[:num_embedded]
-            else:
-                actually_embedded = new_image_ids
-
-            # Add newly embedded IDs to final index (only on first model, shared index)
-            if model_key == models_to_run[0]:
-                for img_id in actually_embedded:
-                    if img_id not in existing_index:
-                        final_index.append(img_id)
-                        existing_index.add(img_id)
-
-            # Add to existing FAISS indexes
-            img_index.add(new_img_emb)
-            if is_clip and text_index is not None and new_text_emb is not None:
-                text_index.add(new_text_emb)
-            elif is_clip and new_text_emb is not None:
+            if text_index is None and is_clip:
                 text_index = create_faiss_index(dim)
-                text_index.add(new_text_emb)
+            print(f"Loaded existing index: {img_index.ntotal} vectors")
         else:
-            # Full regeneration
-            new_img_emb, new_text_emb = generate_embeddings(
-                model_key, all_files, all_image_ids, args.batch_size
-            )
-
-            # Calculate how many were actually embedded (may be fewer if killed early)
-            num_embedded = new_img_emb.shape[0]
-            if num_embedded < len(all_image_ids):
-                print(f"Partial embedding: {num_embedded}/{len(all_image_ids)} images")
-                actually_embedded = all_image_ids[:num_embedded]
-            else:
-                actually_embedded = all_image_ids
-
-            # For full mode, replace final_index with only what was embedded
-            if model_key == models_to_run[0]:
-                final_index = list(actually_embedded)
-                existing_index = set(actually_embedded)
-
-            # Create new FAISS indexes
             img_index = create_faiss_index(dim)
-            img_index.add(new_img_emb)
+            text_index = create_faiss_index(dim) if is_clip else None
+            print(f"Created new index")
 
-            if is_clip and new_text_emb is not None:
-                text_index = create_faiss_index(dim)
-                text_index.add(new_text_emb)
-            else:
-                text_index = None
+        # Find images not yet embedded for this model
+        new_files = []
+        new_image_ids = []
+        for f, (lid, iid) in zip(all_files, all_image_ids):
+            if (lid, iid) not in existing_index:
+                new_files.append(f)
+                new_image_ids.append((lid, iid))
+
+        print(f"New images to embed: {len(new_files)}")
+
+        if not new_files:
+            print(f"No new images for {model_key}. Skipping.")
+            continue
+
+        # Apply batch limit if set
+        if args.batch_limit > 0 and len(new_files) > args.batch_limit:
+            print(f"Limiting to {args.batch_limit} images (batch limit)")
+            new_files = new_files[:args.batch_limit]
+            new_image_ids = new_image_ids[:args.batch_limit]
+
+        # Generate embeddings incrementally (adds directly to FAISS, saves periodically)
+        num_embedded, actually_embedded = generate_embeddings_incremental(
+            model_key, new_files, new_image_ids,
+            img_index, text_index,
+            emb_file, text_emb_file,
+            args.batch_size
+        )
+
+        if num_embedded < len(new_image_ids):
+            print(f"Partial embedding: {num_embedded}/{len(new_image_ids)} images")
+
+        # Add newly embedded IDs to final index (only on first model, shared index)
+        if model_key == models_to_run[0]:
+            for img_id in actually_embedded:
+                if img_id not in existing_index:
+                    final_index.append(img_id)
+                    existing_index.add(img_id)
 
         # Save FAISS indexes
         print(f"\nImage index: {img_index.ntotal} vectors, dim={dim}")
