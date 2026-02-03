@@ -348,8 +348,12 @@ def main():
         return
 
     # Load existing image index (shared across all models)
-    existing_index = set(load_existing_index())
+    existing_index_list = load_existing_index()
+    existing_index = set(existing_index_list)
     print(f"Existing index has {len(existing_index)} images")
+
+    # Track the final index (starts with existing, we add newly embedded)
+    final_index = list(existing_index_list)
 
     # Determine which models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
@@ -395,6 +399,22 @@ def main():
                 model_key, new_files, new_image_ids, args.batch_size
             )
 
+            # Calculate how many were actually embedded (may be fewer if killed early)
+            num_embedded = new_img_emb.shape[0]
+            if num_embedded < len(new_image_ids):
+                print(f"Partial embedding: {num_embedded}/{len(new_image_ids)} images")
+                # Only add actually-embedded IDs to final index
+                actually_embedded = new_image_ids[:num_embedded]
+            else:
+                actually_embedded = new_image_ids
+
+            # Add newly embedded IDs to final index (only on first model, shared index)
+            if model_key == models_to_run[0]:
+                for img_id in actually_embedded:
+                    if img_id not in existing_index:
+                        final_index.append(img_id)
+                        existing_index.add(img_id)
+
             # Add to existing FAISS indexes
             img_index.add(new_img_emb)
             if is_clip and text_index is not None and new_text_emb is not None:
@@ -407,6 +427,19 @@ def main():
             new_img_emb, new_text_emb = generate_embeddings(
                 model_key, all_files, all_image_ids, args.batch_size
             )
+
+            # Calculate how many were actually embedded (may be fewer if killed early)
+            num_embedded = new_img_emb.shape[0]
+            if num_embedded < len(all_image_ids):
+                print(f"Partial embedding: {num_embedded}/{len(all_image_ids)} images")
+                actually_embedded = all_image_ids[:num_embedded]
+            else:
+                actually_embedded = all_image_ids
+
+            # For full mode, replace final_index with only what was embedded
+            if model_key == models_to_run[0]:
+                final_index = list(actually_embedded)
+                existing_index = set(actually_embedded)
 
             # Create new FAISS indexes
             img_index = create_faiss_index(dim)
@@ -428,8 +461,8 @@ def main():
             print(f"Saving to {text_emb_file}...")
             save_faiss_index(text_index, text_emb_file)
 
-    # Save image index (shared across all models)
-    save_image_index(all_image_ids)
+    # Save image index (shared across all models) - only actually embedded images
+    save_image_index(final_index)
 
     # Final metadata save
     save_metadata()
