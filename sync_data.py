@@ -795,8 +795,38 @@ class ImageDownloadQueue:
         with self.stats_lock:
             return dict(self.stats)
 
-    def wait_for_completion(self):
-        self.queue.join()
+    def wait_for_completion(self, check_interval: float = 5.0) -> bool:
+        """Wait for all downloads to complete.
+
+        Checks kill file every check_interval seconds.
+        Returns True if completed normally, False if killed.
+        """
+        empty_count = 0
+        last_pending = -1
+
+        while True:
+            # Check kill file
+            if check_kill_file():
+                return False
+
+            pending = self.queue.qsize()
+
+            # Show progress when it changes significantly
+            if pending != last_pending and (pending == 0 or pending % 1000 == 0 or last_pending == -1):
+                print(f"[{ts()}] Downloads pending: {pending}")
+                last_pending = pending
+
+            # If queue is empty, count consecutive empty checks
+            if pending == 0:
+                empty_count += 1
+                # After 3 consecutive empty checks (15 seconds), consider complete
+                if empty_count >= 3:
+                    return True
+            else:
+                empty_count = 0
+
+            # Wait before next check
+            time.sleep(check_interval)
 
     def shutdown(self):
         self.running = False
@@ -1420,12 +1450,15 @@ def main():
 
         # Wait for all image downloads before sync check
         pending_dl = download_queue.pending()
+        killed = False
         if pending_dl > 0:
             print(f"\nWaiting for {pending_dl} pending image downloads...")
-            download_queue.wait_for_completion()
+            if not download_queue.wait_for_completion():
+                # Killed during wait - skip remaining phases
+                killed = True
 
         # Phase 5: Sync check
-        if current_phase == "sync_check":
+        if not killed and current_phase == "sync_check":
             print(f"\n--- Phase 5: Sync Check ---")
             phase_sync_check(metadata, conn, existing_listings, existing_shops)
             progress["phase"] = "reviews"
@@ -1433,7 +1466,7 @@ def main():
             current_phase = "reviews"
 
         # Phase 6: Reviews
-        if current_phase == "reviews":
+        if not killed and current_phase == "reviews":
             print(f"\n--- Phase 6: Reviews ---")
             phase_reviews(client, conn, existing_shops, snapshot_ts)
             progress["phase"] = "complete"
@@ -1443,7 +1476,7 @@ def main():
     pending_dl = download_queue.pending()
     if pending_dl > 0:
         print(f"\nWaiting for {pending_dl} pending downloads...")
-        download_queue.wait_for_completion()
+        download_queue.wait_for_completion()  # Kill file checked inside
 
     dl_stats = download_queue.get_stats()
     download_queue.shutdown()
