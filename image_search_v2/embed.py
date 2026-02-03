@@ -42,11 +42,21 @@ KILL_FILE = BASE_DIR / "KILL_EMBED"
 _metadata = None
 _metadata_dirty = False
 
+# Global kill flag - set when kill file is detected
+_kill_requested = False
+
 
 def check_kill_file() -> bool:
-    """Check if kill file exists. If so, remove it and return True."""
+    """Check if kill file exists or kill was previously requested.
+
+    Once kill is detected, the flag stays set so all models stop.
+    """
+    global _kill_requested
+    if _kill_requested:
+        return True
     if KILL_FILE.exists():
         KILL_FILE.unlink()
+        _kill_requested = True
         print("\nKill file detected. Stopping gracefully...")
         return True
     return False
@@ -363,6 +373,11 @@ def main():
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
 
     for model_key in models_to_run:
+        # Check for kill before starting each model
+        if check_kill_file():
+            print("Stopping before next model due to kill request.")
+            break
+
         print(f"\n{'='*60}")
         print(f"Processing model: {model_key}")
         print(f"{'='*60}")
