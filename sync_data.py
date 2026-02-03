@@ -1115,8 +1115,8 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
                 stats["shops_fetched"] += 1
 
             # Check if this existing listing needs images (not yet queued)
-            entry = metadata.get(lid_str, {})
-            if not entry.get("images_queued") and when_made in ALLOWED_WHEN_MADE and price >= MIN_PRICE:
+            entry = metadata.get(lid_str)
+            if isinstance(entry, dict) and not entry.get("images_queued") and when_made in ALLOWED_WHEN_MADE and price >= MIN_PRICE:
                 existing_need_images.append(listing)
             continue
 
