@@ -24,6 +24,7 @@ from tqdm import tqdm
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 METADATA_FILE = BASE_DIR / "image_metadata.json"
+KILL_FILE = BASE_DIR / "KILL_BG"
 
 # If images dir doesn't exist, try dev/images (local dev)
 if not IMAGES_DIR.exists():
@@ -37,6 +38,15 @@ _remove_func = None
 # Metadata cache
 _metadata = None
 _metadata_dirty = False
+
+
+def check_kill_file() -> bool:
+    """Check if kill file exists. If so, remove it and return True."""
+    if KILL_FILE.exists():
+        KILL_FILE.unlink()
+        print("\nKill file detected. Stopping gracefully...")
+        return True
+    return False
 
 
 def load_metadata(force_reload: bool = False, max_retries: int = 5) -> dict:
@@ -183,6 +193,12 @@ def process_batch(items: list[tuple[str, int, Path]], use_gpu: bool = False, sav
     failed = 0
 
     for i, (lid, image_id, img_path) in enumerate(tqdm(items, desc="Removing backgrounds")):
+        # Check for kill file
+        if check_kill_file():
+            save_metadata()
+            print(f"Stopped: {success} success, {failed} failed")
+            return
+
         ok = remove_background(img_path)
         mark_bg_removed(lid, image_id, ok)
 
@@ -203,11 +219,16 @@ def process_batch(items: list[tuple[str, int, Path]], use_gpu: bool = False, sav
 def watch_mode(use_gpu: bool = False, interval: int = 30, batch_size: int = 10000):
     """Continuously watch for new images and process them."""
     print(f"Watch mode: checking every {interval} seconds (batch size: {batch_size})...")
-    print("Press Ctrl+C to stop")
+    print("Stop with: touch KILL_BG")
 
     init_rembg(use_gpu=use_gpu)
 
     while True:
+        # Check for kill file
+        if check_kill_file():
+            save_metadata()
+            return
+
         # Reload metadata to pick up new images from sync_data.py
         load_metadata(force_reload=True)
 
@@ -215,6 +236,9 @@ def watch_mode(use_gpu: bool = False, interval: int = 30, batch_size: int = 1000
         if items:
             print(f"\nProcessing batch of {len(items)} images")
             for lid, image_id, img_path in tqdm(items, desc="Processing"):
+                if check_kill_file():
+                    save_metadata()
+                    return
                 ok = remove_background(img_path)
                 mark_bg_removed(lid, image_id, ok)
             save_metadata()

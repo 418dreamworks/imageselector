@@ -1,5 +1,19 @@
 # Etsy Furniture Image Sync
 
+## CRITICAL RULES - READ FIRST
+
+**NEVER DO THESE:**
+- ❌ `pkill` or `kill -9` on any script → Use KILL files instead (see below)
+- ❌ Use system python on iMac → Use `venv/bin/python`
+- ❌ Wrong iMac path → Correct: `/Users/tzuohannlaw/Documents/418Dreamworks/imageselector`
+- ❌ Direct scp/rsync to remote → Use git push/pull instead
+
+**ALWAYS DO THESE:**
+- ✅ Read this file after every context compaction
+- ✅ Use KILL files to stop scripts gracefully (see Kill Files section)
+- ✅ Confirm YES:RS before running remote scripts
+- ✅ Confirm YES:GIT before git push/pull
+
 ## Required Reading After Compaction
 
 **IMPORTANT**: After any context compaction, read these files BEFORE doing anything else:
@@ -48,12 +62,23 @@ Two main scripts share the Etsy API quota:
 
 ## Keep things very clean for now. No flags. The one rule we need to stick to is 5QPS max, and 1 download worker. That's all we need. I suspect this will run very quickly. We test this locally. I want to completely go through 2 taxonomy categories here on this computer before going into production on the imac.
 
-## Stopping sync_data.py
+## Kill Files - Graceful Script Shutdown
 
-To stop sync_data.py gracefully:
+Each script has its own kill file. Create the file to stop the script gracefully:
+
+| Script | Kill File | Command (iMac) |
+|--------|-----------|----------------|
+| sync_data.py | `KILL` | `touch KILL` |
+| bg_remover.py | `KILL_BG` | `touch KILL_BG` |
+| embed.py | `KILL_EMBED` | `touch KILL_EMBED` |
+
+Full paths on iMac:
 ```bash
-touch /Users/tzuohannlaw/Documents/418Dreamworks/imageselector/KILL
+touch /Users/tzuohannlaw/Documents/418Dreamworks/imageselector/KILL        # sync_data
+touch /Users/tzuohannlaw/Documents/418Dreamworks/imageselector/KILL_BG     # bg_remover
+touch /Users/tzuohannlaw/Documents/418Dreamworks/imageselector/KILL_EMBED  # embed
 ```
-The script checks for this file at each loop iteration and exits cleanly, saving all state first.
 
-Do NOT use `pkill` or `kill -9` - use the kill file instead.
+Each script checks for its kill file at each loop iteration and exits cleanly, saving all state first.
+
+**NEVER use `pkill` or `kill -9`** - always use kill files instead.

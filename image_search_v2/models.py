@@ -1,6 +1,6 @@
 """Model registry for multi-model image embeddings.
 
-Supports CLIP (via open_clip) and DINOv2 (via transformers).
+Supports CLIP (via open_clip), DINOv2 and DINOv3 (via transformers).
 """
 import torch
 from PIL import Image
@@ -21,14 +21,19 @@ MODELS = {
         "dim": 768,
     },
     "dinov2_base": {
-        "name": "dinov2_vitb14",
+        "name": "dinov2-base",
         "library": "transformers",
         "dim": 768,
     },
     "dinov2_large": {
-        "name": "dinov2_vitl14",
+        "name": "dinov2-large",
         "library": "transformers",
         "dim": 1024,
+    },
+    "dinov3_base": {
+        "name": "dinov3-vitb16-pretrain-lvd1689m",
+        "library": "transformers_dinov3",
+        "dim": 768,
     },
 }
 
@@ -48,6 +53,7 @@ class ModelLoader:
     def __init__(self):
         self._models = {}
         self._preprocessors = {}
+        self._tokenizers = {}  # For CLIP text encoding
         self._device = get_device()
 
     def get_model(self, model_key: str):
@@ -67,8 +73,8 @@ class ModelLoader:
 
         if config["library"] == "open_clip":
             self._load_clip_model(model_key, config)
-        elif config["library"] == "transformers":
-            self._load_dinov2_model(model_key, config)
+        elif config["library"] in ("transformers", "transformers_dinov3"):
+            self._load_dino_model(model_key, config)
         else:
             raise ValueError(f"Unknown library: {config['library']}")
 
@@ -82,12 +88,14 @@ class ModelLoader:
             device=self._device,
         )
         model.eval()
+        tokenizer = open_clip.get_tokenizer(config["name"])
 
         self._models[model_key] = model
         self._preprocessors[model_key] = preprocess
+        self._tokenizers[model_key] = tokenizer
 
-    def _load_dinov2_model(self, model_key: str, config: dict):
-        """Load a DINOv2 model via transformers."""
+    def _load_dino_model(self, model_key: str, config: dict):
+        """Load a DINOv2 or DINOv3 model via transformers."""
         from transformers import AutoImageProcessor, AutoModel
 
         model_name = f"facebook/{config['name']}"
@@ -107,11 +115,14 @@ class ModelLoader:
             if config["library"] == "open_clip":
                 img_tensor = preprocess(image).unsqueeze(0).to(self._device)
                 emb = model.encode_image(img_tensor)
-            else:  # transformers (DINOv2)
+            else:  # transformers (DINOv2/DINOv3)
                 inputs = preprocess(image, return_tensors="pt").to(self._device)
                 outputs = model(**inputs)
-                # Use CLS token embedding
-                emb = outputs.last_hidden_state[:, 0, :]
+                # DINOv3 uses pooler_output, DINOv2 uses CLS token from last_hidden_state
+                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                    emb = outputs.pooler_output
+                else:
+                    emb = outputs.last_hidden_state[:, 0, :]
 
             # Normalize
             emb = emb / emb.norm(dim=-1, keepdim=True)
@@ -127,15 +138,66 @@ class ModelLoader:
             if config["library"] == "open_clip":
                 tensors = torch.stack([preprocess(img) for img in images]).to(self._device)
                 emb = model.encode_image(tensors)
-            else:  # transformers (DINOv2)
+            else:  # transformers (DINOv2/DINOv3)
                 inputs = preprocess(images, return_tensors="pt").to(self._device)
                 outputs = model(**inputs)
-                emb = outputs.last_hidden_state[:, 0, :]
+                # DINOv3 uses pooler_output, DINOv2 uses CLS token from last_hidden_state
+                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                    emb = outputs.pooler_output
+                else:
+                    emb = outputs.last_hidden_state[:, 0, :]
 
             # Normalize
             emb = emb / emb.norm(dim=-1, keepdim=True)
 
         return emb
+
+    def embed_text_batch(self, model_key: str, texts: list[str]) -> torch.Tensor:
+        """Generate text embeddings for CLIP models."""
+        config = MODELS[model_key]
+        if config["library"] != "open_clip":
+            raise ValueError(f"Text embedding only supported for CLIP models, not {model_key}")
+
+        model, _ = self.get_model(model_key)
+        tokenizer = self._tokenizers[model_key]
+
+        with torch.no_grad():
+            tokens = tokenizer(texts).to(self._device)
+            emb = model.encode_text(tokens)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+
+        return emb
+
+    def embed_batch_with_text(
+        self,
+        model_key: str,
+        images: list[Image.Image],
+        texts: list[str],
+        text_weight: float = 0.3,
+    ) -> torch.Tensor:
+        """Generate combined image+text embeddings for CLIP models.
+
+        Combines image and text embeddings with weighted average.
+        text_weight: 0.0 = image only, 1.0 = text only, 0.3 = 70% image + 30% text
+        """
+        config = MODELS[model_key]
+        if config["library"] != "open_clip":
+            # Non-CLIP models: just return image embeddings
+            return self.embed_batch(model_key, images)
+
+        # Get image embeddings
+        img_emb = self.embed_batch(model_key, images)
+
+        # Get text embeddings
+        text_emb = self.embed_text_batch(model_key, texts)
+
+        # Weighted combination
+        combined = (1 - text_weight) * img_emb + text_weight * text_emb
+
+        # Re-normalize
+        combined = combined / combined.norm(dim=-1, keepdim=True)
+
+        return combined
 
     @property
     def device(self) -> str:
