@@ -20,10 +20,18 @@ from tqdm import tqdm
 from models import MODELS, get_loader
 
 BASE_DIR = Path(__file__).parent.parent
-DEV_DIR = BASE_DIR / "dev"
-IMAGES_DIR_NOBG = DEV_DIR / "images_nobg"  # Primary: nobg images
-IMAGES_DIR = DEV_DIR / "images"  # Fallback: original images
-EMBEDDINGS_DIR = DEV_DIR / "embeddings"
+
+# Paths - adjust for iMac vs local dev
+IMAGES_DIR_NOBG = BASE_DIR / "images_nobg"
+IMAGES_DIR = BASE_DIR / "images"
+EMBEDDINGS_DIR = BASE_DIR / "embeddings"
+
+# If images dir doesn't exist, try dev/images (local dev)
+if not IMAGES_DIR.exists():
+    IMAGES_DIR_NOBG = BASE_DIR / "dev" / "images_nobg"
+    IMAGES_DIR = BASE_DIR / "dev" / "images"
+    EMBEDDINGS_DIR = BASE_DIR / "dev" / "embeddings"
+
 IMAGE_INDEX_FILE = EMBEDDINGS_DIR / "image_index.json"
 METADATA_FILE = BASE_DIR / "image_metadata.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
