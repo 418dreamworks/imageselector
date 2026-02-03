@@ -137,15 +137,19 @@ def get_texts_for_batch(listing_ids: list[int]) -> list[str]:
     return [texts.get(lid, "") for lid in listing_ids]
 
 
-def get_image_files() -> tuple[list[Path], list[tuple[int, int]]]:
-    """Get images with bg_removed=true from metadata.
+def get_image_files_for_model(model_key: str) -> tuple[list[Path], list[tuple[int, int]]]:
+    """Get images that need embedding for a specific model.
 
-    Only returns images that have had background removal completed.
-    Looks for files in images/ directory (bg_remover overwrites in-place).
+    Only returns images that:
+    1. Have bg_removed=true
+    2. Do NOT have embedded_{model_key}=true
+
+    This allows each model to track its own progress independently.
     """
     metadata = load_metadata()
     image_ids = []  # List of (listing_id, image_id) tuples
     valid_files = []
+    embed_flag = f"embedded_{model_key}"
 
     for lid, entry in metadata.items():
         if not isinstance(entry, dict):
@@ -153,6 +157,9 @@ def get_image_files() -> tuple[list[Path], list[tuple[int, int]]]:
         for img in entry.get("images", []):
             # Only process images with background removed
             if not img.get("bg_removed"):
+                continue
+            # Skip if already embedded for this model
+            if img.get(embed_flag):
                 continue
             image_id = img.get("image_id")
             if not image_id:
@@ -170,7 +177,7 @@ def get_image_files() -> tuple[list[Path], list[tuple[int, int]]]:
         valid_files = list(valid_files)
         image_ids = list(image_ids)
 
-    print(f"Found {len(valid_files)} images with bg_removed=true")
+    print(f"Found {len(valid_files)} images needing {model_key} embedding")
     return valid_files, image_ids
 
 
@@ -346,27 +353,11 @@ def main():
     # Create output directory
     EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
-    # Get all image files
-    print(f"\nScanning for images...")
-    all_files, all_image_ids = get_image_files()
-    print(f"Found {len(all_files)} total images")
-
-    if args.limit > 0:
-        all_files = all_files[: args.limit]
-        all_image_ids = all_image_ids[: args.limit]
-        print(f"Limited to {len(all_files)} images")
-
-    if not all_files:
-        print("No images found!")
-        return
-
-    # Load existing image index (shared across all models)
+    # Load existing image index (shared across all models for search)
     existing_index_list = load_existing_index()
     existing_index = set(existing_index_list)
-    print(f"Existing index has {len(existing_index)} images")
-
-    # Track the final index (starts with existing, we add newly embedded)
     final_index = list(existing_index_list)
+    print(f"Existing image index has {len(existing_index)} images")
 
     # Determine which models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
@@ -387,21 +378,19 @@ def main():
             text_index = load_faiss_index(text_emb_file) if is_clip and text_emb_file else None
             if text_index is None and is_clip:
                 text_index = create_faiss_index(dim)
-            print(f"Loaded existing index: {img_index.ntotal} vectors")
+            print(f"Loaded existing FAISS index: {img_index.ntotal} vectors")
         else:
             img_index = create_faiss_index(dim)
             text_index = create_faiss_index(dim) if is_clip else None
-            print(f"Created new index")
+            print(f"Created new FAISS index")
 
-        # Find images not yet embedded for this model
-        new_files = []
-        new_image_ids = []
-        for f, (lid, iid) in zip(all_files, all_image_ids):
-            if (lid, iid) not in existing_index:
-                new_files.append(f)
-                new_image_ids.append((lid, iid))
+        # Get images that need embedding for THIS model (checks embedded_{model} flag)
+        new_files, new_image_ids = get_image_files_for_model(model_key)
 
-        print(f"New images to embed: {len(new_files)}")
+        if args.limit > 0:
+            new_files = new_files[: args.limit]
+            new_image_ids = new_image_ids[: args.limit]
+            print(f"Limited to {len(new_files)} images")
 
         if not new_files:
             print(f"No new images for {model_key}. Skipping.")
@@ -424,12 +413,11 @@ def main():
         if num_embedded < len(new_image_ids):
             print(f"Partial embedding: {num_embedded}/{len(new_image_ids)} images")
 
-        # Add newly embedded IDs to final index (only on first model, shared index)
-        if model_key == models_to_run[0]:
-            for img_id in actually_embedded:
-                if img_id not in existing_index:
-                    final_index.append(img_id)
-                    existing_index.add(img_id)
+        # Add newly embedded IDs to shared image index (for search)
+        for img_id in actually_embedded:
+            if img_id not in existing_index:
+                final_index.append(img_id)
+                existing_index.add(img_id)
 
         # Save FAISS indexes
         print(f"\nImage index: {img_index.ntotal} vectors, dim={dim}")
