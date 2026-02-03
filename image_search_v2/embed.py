@@ -137,43 +137,39 @@ def get_texts_for_batch(listing_ids: list[int]) -> list[str]:
 
 
 def get_image_files() -> tuple[list[Path], list[tuple[int, int]]]:
-    """Get all images and extract (listing_id, image_id) tuples.
+    """Get images with bg_removed=true from metadata.
 
-    Priority: images_nobg (png) > images (jpg)
-    Filename format: {listing_id}_{image_id}.png or .jpg
+    Only returns images that have had background removal completed.
+    Looks for files in images/ directory (bg_remover overwrites in-place).
     """
-    files = []
-
-    # Prefer nobg images (png format)
-    if IMAGES_DIR_NOBG.exists():
-        files = sorted(IMAGES_DIR_NOBG.glob("*.png"))
-        if files:
-            print(f"Using nobg images from {IMAGES_DIR_NOBG}")
-
-    # Fallback to original images (jpg format)
-    if not files and IMAGES_DIR.exists():
-        files = sorted(IMAGES_DIR.glob("*.jpg"))
-        if files:
-            print(f"Using original images from {IMAGES_DIR}")
-
+    metadata = load_metadata()
     image_ids = []  # List of (listing_id, image_id) tuples
     valid_files = []
 
-    for f in files:
-        # Filename format: {listing_id}_{image_id}.png/jpg
-        stem = f.stem
-        parts = stem.split("_")
-        if len(parts) >= 2:
-            try:
-                lid = int(parts[0])
-                iid = int(parts[1])
-                image_ids.append((lid, iid))
-                valid_files.append(f)
-            except ValueError:
-                print(f"Skipping {f.name} - can't parse IDs")
-        else:
-            print(f"Skipping {f.name} - expected format: listingid_imageid")
+    for lid, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+        for img in entry.get("images", []):
+            # Only process images with background removed
+            if not img.get("bg_removed"):
+                continue
+            image_id = img.get("image_id")
+            if not image_id:
+                continue
+            # Build file path - bg_remover saves back to images/ as jpg
+            img_path = IMAGES_DIR / f"{lid}_{image_id}.jpg"
+            if img_path.exists():
+                image_ids.append((int(lid), image_id))
+                valid_files.append(img_path)
 
+    # Sort by listing_id, image_id for consistent ordering
+    combined = sorted(zip(valid_files, image_ids), key=lambda x: x[1])
+    if combined:
+        valid_files, image_ids = zip(*combined)
+        valid_files = list(valid_files)
+        image_ids = list(image_ids)
+
+    print(f"Found {len(valid_files)} images with bg_removed=true")
     return valid_files, image_ids
 
 
