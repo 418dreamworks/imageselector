@@ -24,7 +24,7 @@ import httpx
 load_dotenv()
 
 # Import from shared image_db module
-from image_db import get_connection as get_image_db_connection, insert_image
+from image_db import get_connection as get_image_db_connection, insert_image, _retry_on_lock
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -257,6 +257,7 @@ def set_sync_state(conn, key, value):
 
 # ─── DB Insert Functions ─────────────────────────────────────────────────────
 
+@_retry_on_lock
 def insert_shop_static(conn, shop_data, snapshot_ts):
     conn.execute("""
         INSERT OR IGNORE INTO shops (
@@ -274,6 +275,7 @@ def insert_shop_static(conn, shop_data, snapshot_ts):
     ))
 
 
+@_retry_on_lock
 def insert_shop_dynamic(conn, shop_data, snapshot_ts):
     conn.execute("""
         INSERT INTO shops_dynamic (
@@ -294,6 +296,7 @@ def insert_shop_dynamic(conn, shop_data, snapshot_ts):
     ))
 
 
+@_retry_on_lock
 def insert_listing_static(conn, listing, snapshot_ts):
     price = listing.get("price", {})
     conn.execute("""
@@ -340,6 +343,7 @@ def insert_listing_static(conn, listing, snapshot_ts):
     ))
 
 
+@_retry_on_lock
 def insert_listing_dynamic(conn, listing, snapshot_ts):
     price = listing.get("price", {})
     conn.execute("""
@@ -361,6 +365,7 @@ def insert_listing_dynamic(conn, listing, snapshot_ts):
     ))
 
 
+@_retry_on_lock
 def insert_review(conn, review, snapshot_ts):
     try:
         conn.execute("""
