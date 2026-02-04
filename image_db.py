@@ -4,11 +4,33 @@ All scripts use this module to update flags in image_status table.
 Each UPDATE is atomic - no race conditions between scripts.
 """
 import sqlite3
+import time
+import random
 from pathlib import Path
 from typing import Iterator
 
 BASE_DIR = Path(__file__).parent
 DB_FILE = BASE_DIR / "etsy_data.db"
+
+# Retry settings for database lock handling
+MAX_RETRIES = 10
+BASE_DELAY = 0.1  # 100ms initial delay
+MAX_DELAY = 5.0   # Max 5 seconds between retries
+
+
+def _retry_on_lock(func):
+    """Decorator to retry on database lock with exponential backoff."""
+    def wrapper(*args, **kwargs):
+        for attempt in range(MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < MAX_RETRIES - 1:
+                    delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.1), MAX_DELAY)
+                    time.sleep(delay)
+                else:
+                    raise
+    return wrapper
 
 # CDN URL template for Etsy images (570xN size)
 CDN_URL_TEMPLATE = "https://i.etsystatic.com/il/{hex}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
@@ -31,6 +53,7 @@ def build_cdn_url(hex_val: str, image_id: int, suffix: str) -> str:
 # INSERT (only sync_data.py uses this)
 # ============================================================
 
+@_retry_on_lock
 def insert_image(
     conn: sqlite3.Connection,
     listing_id: int,
@@ -55,6 +78,7 @@ def insert_image(
 # ATOMIC FLAG UPDATES (each script uses its own)
 # ============================================================
 
+@_retry_on_lock
 def mark_download_done(conn: sqlite3.Connection, listing_id: int, image_id: int) -> bool:
     """Mark image as downloaded. Returns True if flag was actually flipped."""
     cursor = conn.execute("""
@@ -64,6 +88,7 @@ def mark_download_done(conn: sqlite3.Connection, listing_id: int, image_id: int)
     return cursor.rowcount > 0
 
 
+@_retry_on_lock
 def mark_bg_removed(conn: sqlite3.Connection, listing_id: int, image_id: int) -> bool:
     """Mark image as background removed. Returns True if flag was actually flipped."""
     cursor = conn.execute("""
@@ -73,6 +98,7 @@ def mark_bg_removed(conn: sqlite3.Connection, listing_id: int, image_id: int) ->
     return cursor.rowcount > 0
 
 
+@_retry_on_lock
 def mark_embedded(conn: sqlite3.Connection, listing_id: int, image_id: int, model_key: str) -> bool:
     """Mark image as embedded for a specific model. Returns True if flag was actually flipped."""
     # Validate model_key to prevent SQL injection
