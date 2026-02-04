@@ -1,0 +1,10 @@
+# Minimal requirements for embed_worker.py
+# No faiss needed - workers only produce numpy files
+
+torch
+torchvision
+open-clip-torch
+transformers
+numpy
+Pillow
+tqdm
