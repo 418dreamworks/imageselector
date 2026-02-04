@@ -2,19 +2,22 @@
 """Cleanup non-primary images after embedding is complete.
 
 For each listing where all images have all 5 embedded_* flags:
-- Keep the primary image (is_primary = 1)
-- Delete all non-primary images from disk
-- Optionally delete from database
+- Keep the primary image (is_primary = 1) in images/
+- Move all non-primary images to backup location (HDD)
 
 Uses SQLite image_status table for tracking.
 """
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_CLEANUP"
+
+# Backup location for embedded images on HDD
+BACKUP_DIR = Path("/Volumes/HDD_1000/embedded_backup/images")
 
 # Add parent to path for imports
 sys.path.insert(0, str(BASE_DIR))
@@ -42,18 +45,18 @@ def check_kill_file() -> bool:
 def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
     """Find non-primary images where listing has all embeddings complete.
 
-    Returns images that can be deleted (non-primary, fully embedded).
+    Returns images that can be moved (non-primary, fully embedded).
     """
-    # Build condition for all models embedded
-    embed_conditions = " AND ".join([f"embed_{m} = 1" for m in EMBED_MODELS])
-
     # Find non-primary images from listings where ALL images are fully embedded
-    # A listing is fully embedded if it has no images with any embed_* = 0
-    query = f"""
+    query = """
         SELECT i.listing_id, i.image_id
         FROM image_status i
         WHERE i.is_primary = 0
-          AND i.{embed_conditions.replace(' AND ', ' AND i.')}
+          AND i.embed_clip_vitb32 = 1
+          AND i.embed_clip_vitl14 = 1
+          AND i.embed_dinov2_base = 1
+          AND i.embed_dinov2_large = 1
+          AND i.embed_dinov3_base = 1
           AND NOT EXISTS (
               SELECT 1 FROM image_status i2
               WHERE i2.listing_id = i.listing_id
@@ -70,32 +73,41 @@ def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
     return [dict(row) for row in cursor.fetchall()]
 
 
-def delete_image_file(listing_id: int, image_id: int, dry_run: bool = True) -> bool:
-    """Delete image file from disk."""
-    img_path = IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
+def move_image_file(listing_id: int, image_id: int, backup_dir: Path, dry_run: bool = True) -> bool:
+    """Move image file from images/ to backup location."""
+    src_path = IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
+    dst_path = backup_dir / f"{listing_id}_{image_id}.jpg"
 
-    if img_path.exists():
-        if dry_run:
-            print(f"  Would delete: {img_path.name}")
-        else:
-            img_path.unlink()
-            print(f"  Deleted: {img_path.name}")
-        return True
-    return False
+    if not src_path.exists():
+        return False
+
+    if dry_run:
+        print(f"  Would move: {src_path.name} -> {dst_path}")
+    else:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_path), str(dst_path))
+        print(f"  Moved: {src_path.name}")
+    return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cleanup non-primary images after embedding")
+    parser = argparse.ArgumentParser(description="Move non-primary images to backup after embedding")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be deleted without actually deleting",
+        help="Show what would be moved without actually moving",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=10000,
         help="Limit number of images to process per run (default: 10000)",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        type=str,
+        default=str(BACKUP_DIR),
+        help=f"Backup directory (default: {BACKUP_DIR})",
     )
     parser.add_argument(
         "--watch",
@@ -110,11 +122,23 @@ def main():
     )
     args = parser.parse_args()
 
-    print("Cleanup: Delete non-primary images after embedding")
-    print(f"Images dir: {IMAGES_DIR}")
+    backup_dir = Path(args.backup_dir)
+
+    print("Cleanup: Move non-primary images to backup after embedding")
+    print(f"Source: {IMAGES_DIR}")
+    print(f"Backup: {backup_dir}")
     if args.dry_run:
-        print("DRY RUN - no files will be deleted")
+        print("DRY RUN - no files will be moved")
     print()
+
+    # Check backup dir exists (or can be created)
+    if not args.dry_run and not backup_dir.exists():
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Created backup directory: {backup_dir}")
+        except Exception as e:
+            print(f"ERROR: Cannot create backup directory: {e}")
+            return
 
     conn = get_connection()
 
@@ -124,19 +148,19 @@ def main():
 
         print("Finding cleanable images...")
         cleanable = get_cleanable_images(conn, args.limit)
-        print(f"Found {len(cleanable)} non-primary images ready for cleanup")
+        print(f"Found {len(cleanable)} non-primary images ready for backup")
 
         if not cleanable:
             if args.watch:
                 import time
-                print(f"Nothing to clean. Waiting {args.interval}s...")
+                print(f"Nothing to move. Waiting {args.interval}s...")
                 time.sleep(args.interval)
                 continue
             else:
                 print("Nothing to clean up.")
                 break
 
-        deleted = 0
+        moved = 0
         for img in cleanable:
             if check_kill_file():
                 break
@@ -144,15 +168,15 @@ def main():
             lid = img["listing_id"]
             iid = img["image_id"]
 
-            if delete_image_file(lid, iid, dry_run=args.dry_run):
-                deleted += 1
+            if move_image_file(lid, iid, backup_dir, dry_run=args.dry_run):
+                moved += 1
 
-        print(f"\n{'Would delete' if args.dry_run else 'Deleted'}: {deleted} files")
+        print(f"\n{'Would move' if args.dry_run else 'Moved'}: {moved} files")
 
         if not args.watch:
             break
 
-        if deleted == 0:
+        if moved == 0:
             import time
             print(f"Waiting {args.interval}s before next check...")
             time.sleep(args.interval)
