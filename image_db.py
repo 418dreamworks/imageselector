@@ -13,9 +13,9 @@ BASE_DIR = Path(__file__).parent
 DB_FILE = BASE_DIR / "etsy_data.db"
 
 # Retry settings for database lock handling
-MAX_RETRIES = 10
-BASE_DELAY = 0.1  # 100ms initial delay
-MAX_DELAY = 5.0   # Max 5 seconds between retries
+MAX_RETRIES = 30
+BASE_DELAY = 0.5  # 500ms initial delay
+MAX_DELAY = 10.0  # Max 10 seconds between retries
 
 
 def _retry_on_lock(func):

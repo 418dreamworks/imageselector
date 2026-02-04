@@ -235,9 +235,8 @@ def generate_embeddings_incremental(
 
         processed += len(batch_files)
 
-        # Periodically commit SQL changes
-        if processed % save_interval == 0:
-            commit_db()
+        # Commit after EVERY batch to release DB lock quickly
+        commit_db()
 
         # Periodically save FAISS indexes (every 50K images)
         if processed % index_save_interval == 0:
