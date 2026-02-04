@@ -271,17 +271,47 @@ def create_faiss_index(dim: int):
 
 
 def load_faiss_index(path: Path):
-    """Load a FAISS index from file."""
+    """Load a FAISS index from file.
+
+    Returns None if file doesn't exist.
+    Raises exception if file exists but is corrupted (don't silently lose data).
+    """
     import faiss
     if path.exists():
-        return faiss.read_index(str(path))
+        try:
+            return faiss.read_index(str(path))
+        except Exception as e:
+            # File exists but corrupted - this is a serious error, don't silently continue
+            raise RuntimeError(
+                f"FAISS index {path} exists but failed to load: {e}. "
+                f"This may indicate corruption. Refusing to create new index to prevent data loss. "
+                f"Manually delete the file if you want to start fresh."
+            )
     return None
 
 
 def save_faiss_index(index, path: Path):
-    """Save a FAISS index to file."""
+    """Save a FAISS index to file atomically.
+
+    Writes to temp file first, then renames to prevent corruption
+    if process crashes mid-write.
+    """
     import faiss
-    faiss.write_index(index, str(path))
+    import tempfile
+
+    # Write to temp file in same directory (for same filesystem rename)
+    temp_fd, temp_path = tempfile.mkstemp(dir=path.parent, suffix='.faiss.tmp')
+    os.close(temp_fd)
+
+    try:
+        faiss.write_index(index, temp_path)
+        # Atomic rename
+        os.replace(temp_path, str(path))
+    except Exception:
+        # Clean up temp file on failure
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
 
 
 def load_existing_index() -> list[tuple[int, int]]:
@@ -293,9 +323,20 @@ def load_existing_index() -> list[tuple[int, int]]:
 
 
 def save_image_index(image_ids: list[tuple[int, int]]):
-    """Save image index mapping row → (listing_id, image_id)."""
-    with open(IMAGE_INDEX_FILE, 'w') as f:
-        json.dump(image_ids, f)
+    """Save image index mapping row → (listing_id, image_id) atomically."""
+    import tempfile
+
+    # Write to temp file first
+    temp_fd, temp_path = tempfile.mkstemp(dir=IMAGE_INDEX_FILE.parent, suffix='.json.tmp')
+    try:
+        with os.fdopen(temp_fd, 'w') as f:
+            json.dump(image_ids, f)
+        # Atomic rename
+        os.replace(temp_path, str(IMAGE_INDEX_FILE))
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
     print(f"Saved image index to {IMAGE_INDEX_FILE}")
 
 
