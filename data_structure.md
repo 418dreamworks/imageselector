@@ -1,225 +1,183 @@
-## Runtime Data (NOT in git)
+# Database Schema
 
-These files exist on iMac but are gitignored:
-- `image_metadata.json` - Listing metadata
-- `etsy_data.db` - SQLite database
-- `images/` - Downloaded listing images
+SQLite database: `etsy_data.db` (WAL mode for concurrent access)
 
 ---
 
-**Output:** SQLite database `etsy_data.db` with tables:
-- `shops` - Static shop data (written once)
-- `shops_dynamic` - Dynamic shop data (appended each sync)
-- `listings` - Static listing data (written once)
-- `listings_dynamic` - Dynamic listing data (appended each sync)
-- `reviews` - Reviews (append-only, incremental fetch)
-- `sync_state` - Tracks last sync times per shop
+## Core Tables
 
+### `image_status` - Image Pipeline Tracking
 
-## Data Collection
+Tracks every image through the download → bg_removal → embedding pipeline.
 
-### Data Structure
+| Column | Type | Description |
+|--------|------|-------------|
+| `listing_id` | INTEGER | Listing ID (PK with image_id) |
+| `image_id` | INTEGER | Image ID (PK with listing_id) |
+| `shop_id` | INTEGER | Shop ID |
+| `hex` | TEXT | CDN hex path component |
+| `suffix` | TEXT | CDN suffix component |
+| `is_primary` | INTEGER | 1 if primary image for listing |
+| `when_made` | TEXT | "2020_2024", "before_2000", etc. |
+| `price` | REAL | Listing price |
+| `to_download` | INTEGER | 1 if queued for download (default 1) |
+| `download_done` | INTEGER | 1 if downloaded (default 0) |
+| `bg_removed` | INTEGER | 1 if background removed (default 0) |
+| `embed_clip_vitb32` | INTEGER | 1 if embedded with CLIP ViT-B/32 |
+| `embed_clip_vitl14` | INTEGER | 1 if embedded with CLIP ViT-L/14 |
+| `embed_dinov2_base` | INTEGER | 1 if embedded with DINOv2 base |
+| `embed_dinov2_large` | INTEGER | 1 if embedded with DINOv2 large |
+| `embed_dinov3_base` | INTEGER | 1 if embedded with DINOv3 base |
 
-Three datasets, all append-only with `snapshot_timestamp`:
+**CDN URL reconstruction:**
+```
+https://i.etsystatic.com/il/{hex}/{image_id}/il_570xN.{image_id}_{suffix}.jpg
+```
 
-1. **Shops** - All selected fields + `snapshot_timestamp`. Append new row each sync (every 2 weeks for dynamic fields like `num_favorers`, `transaction_sold_count`; full refresh every 6 months for static fields).
+---
 
-2. **Listings** - All selected fields + `snapshot_timestamp`. Append new row each sync (every 2 weeks for `num_favorers`, `views`; full refresh every 6 months for static fields).
+### `shops` - Static Shop Data
 
-3. **Reviews** - All selected fields, append-only. Only fetch new reviews since last sync (by `create_timestamp`). Derive `last_review_timestamp` per shop via `max(create_timestamp) group by shop_id`.
+Written once when shop is first discovered.
 
-Forward-fill when joining data for analysis.
+| Column | Type | Description |
+|--------|------|-------------|
+| `shop_id` | INTEGER | Primary key |
+| `snapshot_timestamp` | TEXT | When first synced |
+| `create_date` | INTEGER | Unix timestamp of shop creation |
+| `url` | TEXT | Shop URL |
+| `is_shop_us_based` | INTEGER | 1 if US-based |
+| `shipping_from_country_iso` | TEXT | Country code |
+| `shop_location_country_iso` | TEXT | Country code |
 
-### Selected Shop Fields
+### `shops_dynamic` - Shop Metrics Over Time
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `shop_id` | int | Unique shop identifier |
-| `create_date` | int | Unix timestamp of shop creation |
-| `update_date` | int | Unix timestamp of last update |
-| `listing_active_count` | int | Number of active listings |
-| `accepts_custom_requests` | bool | Whether shop accepts custom orders |
-| `url` | string | Full URL to shop page |
-| `num_favorers` | int | Number of users who favorited shop |
-| `is_shop_us_based` | bool | Shop is US-based |
-| `transaction_sold_count` | int | Total number of sales |
-| `shipping_from_country_iso` | string | Country code where items ship from |
-| `shop_location_country_iso` | string | Country code where shop is located |
-| `review_average` | float | Average review rating (1-5) |
-| `review_count` | int | Total number of reviews |
+Appended each sync (every 2 weeks).
 
-### Available Shop Fields
+| Column | Type | Description |
+|--------|------|-------------|
+| `shop_id` | INTEGER | Foreign key to shops |
+| `snapshot_timestamp` | TEXT | When synced |
+| `update_date` | INTEGER | Last update timestamp |
+| `listing_active_count` | INTEGER | Active listings |
+| `accepts_custom_requests` | INTEGER | 1 if accepts custom |
+| `num_favorers` | INTEGER | Favorites count |
+| `transaction_sold_count` | INTEGER | Total sales |
+| `review_average` | REAL | Average rating (1-5) |
+| `review_count` | INTEGER | Total reviews |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `shop_id` | int | Unique shop identifier |
-| `shop_name` | string | Shop's URL-friendly name |
-| `user_id` | int | Owner's user ID |
-| `create_date` | int | Unix timestamp of shop creation |
-| `created_timestamp` | int | Same as create_date |
-| `title` | string | Shop title displayed at top of pages |
-| `announcement` | string | Message displayed on shop homepage |
-| `currency_code` | string | Shop's default currency (e.g., "USD", "MAD") |
-| `is_vacation` | bool | Whether shop is on vacation mode |
-| `vacation_message` | string | Message shown when on vacation |
-| `sale_message` | string | Message sent to buyers after purchase |
-| `digital_sale_message` | string | Message for digital item purchases |
-| `update_date` | int | Unix timestamp of last update |
-| `updated_timestamp` | int | Same as update_date |
-| `listing_active_count` | int | Number of active listings |
-| `digital_listing_count` | int | Number of digital listings |
-| `login_name` | string | Internal login identifier |
-| `accepts_custom_requests` | bool | Whether shop accepts custom orders |
-| `vacation_autoreply` | string | Auto-reply message during vacation |
-| `url` | string | Full URL to shop page |
-| `image_url_760x100` | string | Shop banner image URL |
-| `num_favorers` | int | Number of users who favorited shop |
-| `languages` | array | Languages shop supports |
-| `icon_url_fullxfull` | string | Shop icon/logo URL |
-| `is_using_structured_policies` | bool | Using Etsy's structured policies |
-| `has_onboarded_structured_policies` | bool | Onboarded to structured policies |
-| `include_dispute_form_link` | bool | Shows dispute form link |
-| `is_direct_checkout_onboarded` | bool | Direct checkout enabled |
-| `is_etsy_payments_onboarded` | bool | Etsy Payments enabled |
-| `is_opted_in_to_buyer_promise` | bool | Opted into buyer promise program |
-| `is_calculated_eligible` | bool | Eligible for calculated shipping |
-| `is_shop_us_based` | bool | Shop is US-based |
-| `transaction_sold_count` | int | Total number of sales |
-| `shipping_from_country_iso` | string | Country code where items ship from |
-| `shop_location_country_iso` | string | Country code where shop is located |
-| `policy_welcome` | string | Welcome policy text |
-| `policy_payment` | string | Payment policy text |
-| `policy_shipping` | string | Shipping policy text |
-| `policy_refunds` | string | Refund policy text |
-| `policy_additional` | string | Additional policy text |
-| `policy_seller_info` | string | Seller info policy |
-| `policy_update_date` | int | When policies were last updated |
-| `policy_has_private_receipt_info` | bool | Has private receipt info |
-| `has_unstructured_policies` | bool | Has old-style policies |
-| `policy_privacy` | string | Privacy policy text |
-| `review_average` | float | Average review rating (1-5) |
-| `review_count` | int | Total number of reviews |
+---
 
-### Selected Listing Fields
+### `listings` - Static Listing Data
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `listing_id` | int | Unique listing identifier |
-| `shop_id` | int | Shop identifier |
-| `title` | string | Listing title |
-| `description` | string | Full listing description |
-| `state` | string | Listing state (active, inactive, etc.) |
-| `creation_timestamp` | int | Unix timestamp when created |
-| `ending_timestamp` | int | When listing expires |
-| `quantity` | int | Available quantity |
-| `url` | string | Full URL to listing |
-| `num_favorers` | int | Number of users who favorited |
-| `is_customizable` | bool | Whether item can be customized |
-| `is_personalizable` | bool | Whether item can be personalized |
-| `listing_type` | string | Type: physical, digital, etc. |
-| `tags` | array | Search tags (up to 13) |
-| `materials` | array | Materials used |
-| `processing_min` | int | Min processing days |
-| `processing_max` | int | Max processing days |
-| `who_made` | string | Who made it (i_did, collective, someone_else) |
-| `when_made` | string | When made (made_to_order, 2020s, etc.) |
-| `item_weight` | float | Item weight |
-| `item_weight_unit` | string | Weight unit (oz, lb, g, kg) |
-| `item_length` | float | Item length |
-| `item_width` | float | Item width |
-| `item_height` | float | Item height |
-| `item_dimensions_unit` | string | Dimension unit (in, ft, mm, cm, m) |
-| `should_auto_renew` | bool | Auto-renew when expires |
-| `language` | string | Listing language |
-| `price` | object | Price with `amount`, `divisor`, `currency_code` |
-| `taxonomy_id` | int | Category taxonomy ID |
-| `production_partners` | array | Production partner IDs |
-| `views` | int | Number of views |
+Written once when listing is first discovered.
 
-### Available Listing Fields
+| Column | Type | Description |
+|--------|------|-------------|
+| `listing_id` | INTEGER | Primary key |
+| `snapshot_timestamp` | TEXT | When first synced |
+| `shop_id` | INTEGER | Foreign key to shops |
+| `title` | TEXT | Listing title |
+| `description` | TEXT | Full description |
+| `creation_timestamp` | INTEGER | When created |
+| `url` | TEXT | Listing URL |
+| `is_customizable` | INTEGER | 1 if customizable |
+| `is_personalizable` | INTEGER | 1 if personalizable |
+| `listing_type` | TEXT | physical, digital, etc. |
+| `tags` | TEXT | JSON array of tags |
+| `materials` | TEXT | JSON array of materials |
+| `processing_min` | INTEGER | Min processing days |
+| `processing_max` | INTEGER | Max processing days |
+| `who_made` | TEXT | i_did, collective, someone_else |
+| `when_made` | TEXT | made_to_order, 2020_2024, etc. |
+| `item_weight` | REAL | Weight |
+| `item_weight_unit` | TEXT | oz, lb, g, kg |
+| `item_length` | REAL | Length |
+| `item_width` | REAL | Width |
+| `item_height` | REAL | Height |
+| `item_dimensions_unit` | TEXT | in, ft, mm, cm, m |
+| `should_auto_renew` | INTEGER | Auto-renew |
+| `language` | TEXT | Listing language |
+| `price_amount` | INTEGER | Price amount |
+| `price_divisor` | INTEGER | Price divisor |
+| `price_currency` | TEXT | Currency code |
+| `taxonomy_id` | INTEGER | Category ID |
+| `production_partners` | TEXT | JSON array |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `listing_id` | int | Unique listing identifier |
-| `user_id` | int | Owner's user ID |
-| `shop_id` | int | Shop identifier |
-| `title` | string | Listing title |
-| `description` | string | Full listing description |
-| `state` | string | Listing state (active, inactive, etc.) |
-| `creation_timestamp` | int | Unix timestamp when created |
-| `created_timestamp` | int | Same as creation_timestamp |
-| `ending_timestamp` | int | When listing expires |
-| `original_creation_timestamp` | int | Original creation time |
-| `last_modified_timestamp` | int | Last modification time |
-| `updated_timestamp` | int | Same as last_modified_timestamp |
-| `state_timestamp` | int | When state last changed |
-| `quantity` | int | Available quantity |
-| `shop_section_id` | int | Shop section this belongs to |
-| `featured_rank` | int | Featured position in shop |
-| `url` | string | Full URL to listing |
-| `num_favorers` | int | Number of users who favorited |
-| `non_taxable` | bool | Whether item is non-taxable |
-| `is_taxable` | bool | Whether item is taxable |
-| `is_customizable` | bool | Whether item can be customized |
-| `is_personalizable` | bool | Whether item can be personalized |
-| `personalization_is_required` | bool | Personalization required |
-| `personalization_char_count_max` | int | Max chars for personalization |
-| `personalization_instructions` | string | Instructions for personalization |
-| `listing_type` | string | Type: physical, digital, etc. |
-| `tags` | array | Search tags (up to 13) |
-| `materials` | array | Materials used |
-| `shipping_profile_id` | int | Shipping profile ID |
-| `return_policy_id` | int | Return policy ID |
-| `processing_min` | int | Min processing days |
-| `processing_max` | int | Max processing days |
-| `who_made` | string | Who made it (i_did, collective, someone_else) |
-| `when_made` | string | When made (made_to_order, 2020s, etc.) |
-| `is_supply` | bool | Whether it's a craft supply |
-| `item_weight` | float | Item weight |
-| `item_weight_unit` | string | Weight unit (oz, lb, g, kg) |
-| `item_length` | float | Item length |
-| `item_width` | float | Item width |
-| `item_height` | float | Item height |
-| `item_dimensions_unit` | string | Dimension unit (in, ft, mm, cm, m) |
-| `is_private` | bool | Whether listing is private |
-| `style` | array | Style tags |
-| `file_data` | string | Digital file data |
-| `has_variations` | bool | Whether has variations |
-| `should_auto_renew` | bool | Auto-renew when expires |
-| `language` | string | Listing language |
-| `price` | object | Price with `amount`, `divisor`, `currency_code` (actual price = amount/divisor) |
-| `taxonomy_id` | int | Category taxonomy ID |
-| `production_partners` | array | Production partner IDs |
-| `skus` | array | SKU codes |
-| `views` | int | Number of views |
+### `listings_dynamic` - Listing Metrics Over Time
 
-### Selected Review Fields
+Appended each sync.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `shop_id` | int | Shop that received the review |
-| `listing_id` | int | Listing being reviewed |
-| `buyer_user_id` | int | User ID of reviewer |
-| `rating` | int | Rating 1-5 stars |
-| `review` | string | Review text |
-| `language` | string | Language code (en, fr, etc.) |
-| `create_timestamp` | int | When review was created |
+| Column | Type | Description |
+|--------|------|-------------|
+| `listing_id` | INTEGER | Foreign key to listings |
+| `snapshot_timestamp` | TEXT | When synced |
+| `state` | TEXT | active, inactive, etc. |
+| `ending_timestamp` | INTEGER | Expiration |
+| `quantity` | INTEGER | Available quantity |
+| `num_favorers` | INTEGER | Favorites count |
+| `views` | INTEGER | View count |
+| `price_amount` | INTEGER | Current price |
+| `price_divisor` | INTEGER | Price divisor |
+| `price_currency` | TEXT | Currency |
 
-**Strategy:** API returns reviews sorted by `create_timestamp` DESC (newest first). Fetch page 1, stop when hitting a `create_timestamp` older than last sync. Ignore review edits - only store initial review.
+---
 
-### Available Review Fields (via getReviewsByShop)
+### `reviews` - Shop Reviews
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `shop_id` | int | Shop that received the review |
-| `listing_id` | int | Listing being reviewed |
-| `transaction_id` | int | Transaction/order ID |
-| `buyer_user_id` | int | User ID of reviewer |
-| `rating` | int | Rating 1-5 stars |
-| `review` | string | Review text |
-| `language` | string | Language code (en, fr, etc.) |
-| `image_url_fullxfull` | string | Review image URL (if attached) |
-| `create_timestamp` | int | When review was created |
-| `created_timestamp` | int | Same as create_timestamp |
-| `update_timestamp` | int | When review was last updated |
-| `updated_timestamp` | int | Same as update_timestamp |
+Append-only. Fetches only new reviews since last sync.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `snapshot_timestamp` | TEXT | When synced |
+| `shop_id` | INTEGER | Shop ID |
+| `listing_id` | INTEGER | Listing reviewed |
+| `buyer_user_id` | INTEGER | Reviewer's user ID |
+| `rating` | INTEGER | 1-5 stars |
+| `review` | TEXT | Review text |
+| `language` | TEXT | Language code |
+| `create_timestamp` | INTEGER | When review was created |
+
+---
+
+### `sync_state` - Crawler State
+
+Key-value store for sync progress.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | TEXT | State key |
+| `value` | TEXT | JSON value |
+
+---
+
+## Embedding Files
+
+Located in `embeddings/`:
+
+| File | Shape | Description |
+|------|-------|-------------|
+| `clip_vitb32.faiss` | (N, 512) | CLIP ViT-B/32 image embeddings |
+| `clip_vitb32_text.faiss` | (N, 512) | CLIP ViT-B/32 text embeddings |
+| `clip_vitl14.faiss` | (N, 768) | CLIP ViT-L/14 image embeddings |
+| `clip_vitl14_text.faiss` | (N, 768) | CLIP ViT-L/14 text embeddings |
+| `dinov2_base.faiss` | (N, 768) | DINOv2 base embeddings |
+| `dinov2_large.faiss` | (N, 1024) | DINOv2 large embeddings |
+| `dinov3_base.faiss` | (N, 768) | DINOv3 base embeddings |
+| `image_index.json` | - | Maps row index → (listing_id, image_id) |
+
+**Row alignment:** Row 42 in ALL FAISS files corresponds to the same (listing_id, image_id) pair in image_index.json.
+
+---
+
+## Runtime Files (gitignored)
+
+| Path | Description |
+|------|-------------|
+| `etsy_data.db` | Main SQLite database |
+| `etsy_data.db-wal` | WAL file (don't delete while running) |
+| `etsy_data.db-shm` | Shared memory file |
+| `images/` | Downloaded images (~1M files) |
+| `embeddings/` | FAISS index files |
+| `qps_config.json` | API rate limit config |
+| `*.log` | Script logs |
