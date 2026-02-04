@@ -44,6 +44,25 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def commit_with_retry(conn: sqlite3.Connection):
+    """Commit with retry on database lock.
+
+    The @_retry_on_lock decorator only wraps individual execute() calls,
+    but commit() can also fail with 'database is locked'. This function
+    provides the same retry logic for commits.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < MAX_RETRIES - 1:
+                delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.1), MAX_DELAY)
+                time.sleep(delay)
+            else:
+                raise
+
+
 def build_cdn_url(hex_val: str, image_id: int, suffix: str) -> str:
     """Build CDN URL for an image."""
     return f"https://i.etsystatic.com/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
@@ -143,7 +162,11 @@ def get_images_for_bg_removal(conn: sqlite3.Connection, limit: int = 1000) -> li
 
 
 def get_images_for_embedding(conn: sqlite3.Connection, model_key: str, limit: int = 1000) -> list[dict]:
-    """Get images that need embedding for a specific model."""
+    """Get images that need embedding for a specific model.
+
+    Results are ordered by (listing_id, image_id) for consistent ordering
+    across models - this ensures FAISS row alignment.
+    """
     valid_models = [
         "clip_vitb32", "clip_vitl14", "dinov2_base", "dinov2_large", "dinov3_base"
     ]
@@ -155,9 +178,74 @@ def get_images_for_embedding(conn: sqlite3.Connection, model_key: str, limit: in
         SELECT listing_id, image_id
         FROM image_status
         WHERE bg_removed = 1 AND {col} = 0
+        ORDER BY listing_id, image_id
         LIMIT ?
     """, (limit,))
     return [dict(row) for row in cursor.fetchall()]
+
+
+def get_images_for_embedding_batch(conn: sqlite3.Connection, limit: int = 50000) -> list[dict]:
+    """Get a batch of images that need embedding for ANY model.
+
+    Returns images ordered by (listing_id, image_id) that have bg_removed=1
+    but are missing at least one embedding. This ensures the same batch
+    is processed through all models before moving to the next batch.
+    """
+    cursor = conn.execute("""
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE bg_removed = 1 AND (
+            embed_clip_vitb32 = 0 OR
+            embed_clip_vitl14 = 0 OR
+            embed_dinov2_base = 0 OR
+            embed_dinov2_large = 0 OR
+            embed_dinov3_base = 0
+        )
+        ORDER BY listing_id, image_id
+        LIMIT ?
+    """, (limit,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_embedding_status_for_images(
+    conn: sqlite3.Connection,
+    image_ids: list[tuple[int, int]]
+) -> dict[tuple[int, int], dict[str, bool]]:
+    """Get embedding status for a list of specific images.
+
+    Returns dict mapping (listing_id, image_id) -> {model_key: bool, ...}
+    Queries in batches to avoid SQLite variable limit.
+    """
+    if not image_ids:
+        return {}
+
+    result = {}
+    batch_size = 400  # Safe limit for (?, ?) pairs = 800 variables
+
+    for i in range(0, len(image_ids), batch_size):
+        batch = image_ids[i:i + batch_size]
+        placeholders = ",".join(["(?, ?)"] * len(batch))
+        flat_ids = [x for pair in batch for x in pair]
+
+        cursor = conn.execute(f"""
+            SELECT listing_id, image_id,
+                   embed_clip_vitb32, embed_clip_vitl14,
+                   embed_dinov2_base, embed_dinov2_large, embed_dinov3_base
+            FROM image_status
+            WHERE (listing_id, image_id) IN ({placeholders})
+        """, flat_ids)
+
+        for row in cursor.fetchall():
+            key = (row[0], row[1])
+            result[key] = {
+                "clip_vitb32": bool(row[2]),
+                "clip_vitl14": bool(row[3]),
+                "dinov2_base": bool(row[4]),
+                "dinov2_large": bool(row[5]),
+                "dinov3_base": bool(row[6]),
+            }
+
+    return result
 
 
 # ============================================================

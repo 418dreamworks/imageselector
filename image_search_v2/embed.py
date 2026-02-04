@@ -2,6 +2,12 @@
 
 Outputs separate embedding files per model in embeddings/.
 Tracks embedded_{model} flags per image in SQLite image_status table.
+
+BATCH-FIRST APPROACH:
+- Select a fixed batch of images (e.g., 50K) that need ANY embedding
+- Process that SAME batch through ALL 5 models before considering next batch
+- Each model only processes images missing its specific flag
+- Consistent ORDER BY ensures FAISS row alignment across models
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -41,8 +47,8 @@ KILL_FILE = BASE_DIR / "KILL_EMBED"
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR))
 from image_db import (
-    get_connection, get_images_for_embedding,
-    mark_embedded as db_mark_embedded
+    get_connection, get_images_for_embedding, get_images_for_embedding_batch,
+    get_embedding_status_for_images, mark_embedded as db_mark_embedded
 )
 
 # Global kill flag - set when kill file is detected
@@ -340,6 +346,116 @@ def save_image_index(image_ids: list[tuple[int, int]]):
     print(f"Saved image index to {IMAGE_INDEX_FILE}")
 
 
+def process_batch_all_models(
+    batch_image_ids: list[tuple[int, int]],
+    models_to_run: list[str],
+    batch_size: int = 32,
+) -> list[tuple[int, int]]:
+    """Process a batch of images through ALL models.
+
+    This ensures the same images are processed in the same order for all models,
+    maintaining FAISS row alignment.
+
+    Returns list of image_ids that were successfully processed through all models.
+    """
+    if not batch_image_ids:
+        return []
+
+    # Build file paths and filter to existing files
+    valid_files = []
+    valid_ids = []
+    for lid, iid in batch_image_ids:
+        img_path = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if img_path.exists():
+            valid_files.append(img_path)
+            valid_ids.append((lid, iid))
+
+    if not valid_files:
+        print("No valid image files found in batch")
+        return []
+
+    print(f"\nProcessing batch of {len(valid_ids)} images through {len(models_to_run)} models")
+
+    # Get current embedding status for all images in batch
+    conn = get_db_conn()
+    status = get_embedding_status_for_images(conn, valid_ids)
+
+    successfully_processed = set(valid_ids)  # Start assuming all succeed
+
+    for model_key in models_to_run:
+        if check_kill_file():
+            print(f"Kill requested, stopping before {model_key}")
+            return []
+
+        # Filter to images that need this model's embedding
+        need_embedding = []
+        need_embedding_files = []
+        for (lid, iid), fpath in zip(valid_ids, valid_files):
+            img_status = status.get((lid, iid), {})
+            if not img_status.get(model_key, False):
+                need_embedding.append((lid, iid))
+                need_embedding_files.append(fpath)
+
+        if not need_embedding:
+            print(f"  {model_key}: all {len(valid_ids)} images already done, skipping")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"Processing model: {model_key} ({len(need_embedding)}/{len(valid_ids)} images need embedding)")
+        print(f"{'='*60}")
+
+        dim = MODELS[model_key]["dim"]
+        emb_file = get_embedding_file(model_key)
+        is_clip = MODELS[model_key]["library"] == "open_clip"
+        text_emb_file = get_embedding_file(model_key, "text") if is_clip else None
+
+        # Load or create FAISS indexes
+        if emb_file.exists():
+            img_index = load_faiss_index(emb_file)
+            text_index = load_faiss_index(text_emb_file) if is_clip and text_emb_file else None
+            if text_index is None and is_clip:
+                text_index = create_faiss_index(dim)
+            print(f"Loaded existing FAISS index: {img_index.ntotal} vectors")
+        else:
+            img_index = create_faiss_index(dim)
+            text_index = create_faiss_index(dim) if is_clip else None
+            print(f"Created new FAISS index")
+
+        # Generate embeddings
+        num_embedded, actually_embedded = generate_embeddings_incremental(
+            model_key, need_embedding_files, need_embedding,
+            img_index, text_index,
+            emb_file, text_emb_file,
+            batch_size
+        )
+
+        # Track which images failed
+        if num_embedded < len(need_embedding):
+            print(f"Partial embedding: {num_embedded}/{len(need_embedding)} images")
+            # Remove images that weren't fully processed from success set
+            embedded_set = set(actually_embedded)
+            for img_id in need_embedding:
+                if img_id not in embedded_set:
+                    successfully_processed.discard(img_id)
+
+        # Save FAISS indexes
+        print(f"Image index: {img_index.ntotal} vectors, dim={dim}")
+        print(f"Saving to {emb_file}...")
+        save_faiss_index(img_index, emb_file)
+
+        if is_clip and text_index is not None:
+            print(f"Text index: {text_index.ntotal} vectors, dim={dim}")
+            print(f"Saving to {text_emb_file}...")
+            save_faiss_index(text_index, text_emb_file)
+
+        # Update status cache for next model iteration
+        for lid, iid in actually_embedded:
+            if (lid, iid) in status:
+                status[(lid, iid)][model_key] = True
+
+    return [img_id for img_id in valid_ids if img_id in successfully_processed]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate multi-model embeddings")
     parser.add_argument(
@@ -357,112 +473,111 @@ def main():
         "--batch-size",
         type=int,
         default=32,
-        help="Batch size for embedding",
+        help="Batch size for GPU embedding",
     )
     parser.add_argument(
-        "--limit",
+        "--job-size",
         type=int,
-        default=0,
-        help="Limit number of images (for testing)",
-    )
-    parser.add_argument(
-        "--batch-limit",
-        type=int,
-        default=0,
-        help="Max new images to embed per run (0 = unlimited)",
+        default=50000,
+        help="Number of images per job (processed through all models before next job)",
     )
     args = parser.parse_args()
 
     # Create output directory
     EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
-    # Load existing image index (shared across all models for search)
+    # Load existing image index
     existing_index_list = load_existing_index()
-    existing_index = set(existing_index_list)
+    existing_index_set = set(existing_index_list)
     final_index = list(existing_index_list)
-    print(f"Existing image index has {len(existing_index)} images")
+    print(f"Existing image index has {len(existing_index_set)} images")
 
     # Determine which models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
+    print(f"Models to run: {models_to_run}")
 
-    for model_key in models_to_run:
-        # Check for kill before starting each model
-        if check_kill_file():
-            print("Stopping before next model due to kill request.")
-            break
-
+    # PHASE 1: Complete existing partial embeddings
+    # Images in image_index that don't have all models done
+    if existing_index_list and not args.full:
         print(f"\n{'='*60}")
-        print(f"Processing model: {model_key}")
+        print("PHASE 1: Completing existing partial embeddings")
         print(f"{'='*60}")
 
-        dim = MODELS[model_key]["dim"]
-        emb_file = get_embedding_file(model_key)
-        is_clip = MODELS[model_key]["library"] == "open_clip"
-        text_emb_file = get_embedding_file(model_key, "text") if is_clip else None
+        conn = get_db_conn()
+        status = get_embedding_status_for_images(conn, existing_index_list)
 
-        # Load or create FAISS indexes
-        if not args.full and emb_file.exists():
-            img_index = load_faiss_index(emb_file)
-            text_index = load_faiss_index(text_emb_file) if is_clip and text_emb_file else None
-            if text_index is None and is_clip:
-                text_index = create_faiss_index(dim)
-            print(f"Loaded existing FAISS index: {img_index.ntotal} vectors")
+        # Find images missing any model
+        incomplete = []
+        for img_id in existing_index_list:
+            img_status = status.get(img_id, {})
+            for model_key in models_to_run:
+                if not img_status.get(model_key, False):
+                    incomplete.append(img_id)
+                    break
+
+        if incomplete:
+            print(f"Found {len(incomplete)} images needing completion")
+            # Process in batches of job_size
+            for i in range(0, len(incomplete), args.job_size):
+                if check_kill_file():
+                    break
+                batch = incomplete[i:i + args.job_size]
+                print(f"\nProcessing completion batch {i//args.job_size + 1}: {len(batch)} images")
+                process_batch_all_models(batch, models_to_run, args.batch_size)
         else:
-            img_index = create_faiss_index(dim)
-            text_index = create_faiss_index(dim) if is_clip else None
-            print(f"Created new FAISS index")
+            print("All existing images have complete embeddings")
 
-        # Get images that need embedding for THIS model (checks embedded_{model} flag)
-        new_files, new_image_ids = get_image_files_for_model(model_key)
+    # PHASE 2: Process new batches
+    print(f"\n{'='*60}")
+    print("PHASE 2: Processing new image batches")
+    print(f"{'='*60}")
 
-        if args.limit > 0:
-            new_files = new_files[: args.limit]
-            new_image_ids = new_image_ids[: args.limit]
-            print(f"Limited to {len(new_files)} images")
+    while True:
+        if check_kill_file():
+            print("Kill requested, stopping")
+            break
 
-        if not new_files:
-            print(f"No new images for {model_key}. Skipping.")
+        # Get next batch of images needing ANY embedding
+        conn = get_db_conn()
+        batch_images = get_images_for_embedding_batch(conn, limit=args.job_size)
+
+        if not batch_images:
+            print("No more images to process")
+            break
+
+        # Convert to list of tuples
+        batch_ids = [(img["listing_id"], img["image_id"]) for img in batch_images]
+
+        # Filter out images already in index (they were handled in Phase 1)
+        new_batch_ids = [img_id for img_id in batch_ids if img_id not in existing_index_set]
+
+        if not new_batch_ids:
+            print("All queried images already in index, checking for more...")
+            # This shouldn't happen normally, but if it does, the next query should get different images
             continue
 
-        # Apply batch limit if set
-        if args.batch_limit > 0 and len(new_files) > args.batch_limit:
-            print(f"Limiting to {args.batch_limit} images (batch limit)")
-            new_files = new_files[:args.batch_limit]
-            new_image_ids = new_image_ids[:args.batch_limit]
+        print(f"\nNew batch: {len(new_batch_ids)} images")
 
-        # Generate embeddings incrementally (adds directly to FAISS, saves periodically)
-        num_embedded, actually_embedded = generate_embeddings_incremental(
-            model_key, new_files, new_image_ids,
-            img_index, text_index,
-            emb_file, text_emb_file,
-            args.batch_size
-        )
+        # Process through all models
+        successfully_processed = process_batch_all_models(new_batch_ids, models_to_run, args.batch_size)
 
-        if num_embedded < len(new_image_ids):
-            print(f"Partial embedding: {num_embedded}/{len(new_image_ids)} images")
-
-        # Add newly embedded IDs to shared image index (for search)
-        for img_id in actually_embedded:
-            if img_id not in existing_index:
+        # Add successfully processed images to index
+        for img_id in successfully_processed:
+            if img_id not in existing_index_set:
                 final_index.append(img_id)
-                existing_index.add(img_id)
+                existing_index_set.add(img_id)
 
-        # Save FAISS indexes
-        print(f"\nImage index: {img_index.ntotal} vectors, dim={dim}")
-        print(f"Saving to {emb_file}...")
-        save_faiss_index(img_index, emb_file)
+        # Save image index after each batch
+        save_image_index(final_index)
+        print(f"Image index now has {len(final_index)} images")
 
-        if is_clip and text_index is not None:
-            print(f"Text index: {text_index.ntotal} vectors, dim={dim}")
-            print(f"Saving to {text_emb_file}...")
-            save_faiss_index(text_index, text_emb_file)
+        # Only process one batch per run (pipeline_monitor will restart)
+        print(f"\nCompleted batch of {len(successfully_processed)} images through all models")
+        break
 
-    # Save image index (shared across all models) - only actually embedded images
+    # Final save
     save_image_index(final_index)
-
-    # Final DB commit
     commit_db()
-
     print("\nDone!")
 
 

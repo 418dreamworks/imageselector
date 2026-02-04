@@ -31,7 +31,8 @@ if not IMAGES_DIR.exists():
 sys.path.insert(0, str(BASE_DIR))
 from image_db import (
     get_connection, get_images_for_bg_removal,
-    mark_bg_removed as db_mark_bg_removed, get_stats
+    mark_bg_removed as db_mark_bg_removed, get_stats,
+    commit_with_retry
 )
 
 # Globals for rembg session
@@ -71,7 +72,7 @@ def mark_bg_removed(listing_id: int, image_id: int, success: bool):
     if success:
         conn = get_connection()
         db_mark_bg_removed(conn, listing_id, image_id)
-        conn.commit()
+        commit_with_retry(conn)
         conn.close()
 
 

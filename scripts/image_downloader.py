@@ -33,7 +33,7 @@ KILL_FILE = BASE_DIR / "KILL_DL"
 sys.path.insert(0, str(BASE_DIR))
 from image_db import (
     get_connection, get_images_to_download, mark_download_done,
-    build_cdn_url
+    build_cdn_url, commit_with_retry
 )
 
 
@@ -100,7 +100,7 @@ def manager_scan(batch_size: int = 1000) -> dict:
         else:
             stats["already_done"] += 1
 
-    conn.commit()
+    commit_with_retry(conn)
     conn.close()
 
     return stats
