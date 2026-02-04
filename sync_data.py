@@ -1,11 +1,11 @@
 """
-sync_data.py — Merged Etsy furniture data sync.
+sync_data.py — Etsy furniture data sync (API only).
 
-Crawls taxonomy categories, downloads images, and populates SQLite database.
-Replaces both sync_images.py and the old sync_data.py.
+Crawls taxonomy categories and populates SQLite database.
+Does NOT download images - that's handled by image_downloader.py.
 
 Usage:
-    python sync_data_new.py
+    python sync_data.py
 """
 
 import os
@@ -15,8 +15,6 @@ import time
 import signal
 import re
 import sqlite3
-import threading
-import queue
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
@@ -25,22 +23,22 @@ import httpx
 
 load_dotenv()
 
+# Import from shared image_db module
+from image_db import get_connection as get_image_db_connection, insert_image
+
 # ─── Config ─────────────────────────────────────────────────────────────────
 
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
 API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
-CDN_RATE_LIMIT = 5       # CDN downloads per second
-NUM_WORKERS = 1        # 1 download worker
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
 FAILED_IMAGE_ID = 9999999999
-MIN_PRICE = 50             # Only for image downloads (not DB inserts)
+MIN_PRICE = 50             # Only for image_status inserts (all listings go to DB)
 
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
-METADATA_FILE = BASE_DIR / "image_metadata.json"
 PROGRESS_FILE = BASE_DIR / "sync_progress.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
 TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
@@ -538,355 +536,40 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     return reviews
 
 
-# ─── Metadata ────────────────────────────────────────────────────────────────
+# ─── Image SQL Insert ────────────────────────────────────────────────────────
 
-def load_metadata() -> dict:
-    if METADATA_FILE.exists():
-        with open(METADATA_FILE) as f:
-            return json.load(f)
-    return {}
+def add_images_to_sql(listing_id: int, images_list: list, shop_id: int, when_made: str,
+                      conn=None):
+    """Insert images to SQL image_status table.
 
+    Args:
+        listing_id: The listing ID
+        images_list: List of (image_id, url) tuples from API
+        shop_id: Shop ID
+        when_made: When made category
+        conn: Optional existing database connection (to avoid lock conflicts)
 
-def save_metadata(metadata, lock=None):
-    """Save metadata to JSON file."""
-    if lock:
-        with lock:
-            with open(METADATA_FILE, "w") as f:
-                json.dump(metadata, f)
-    else:
-        with open(METADATA_FILE, "w") as f:
-            json.dump(metadata, f)
-
-
-# ─── Image Files ─────────────────────────────────────────────────────────────
-
-_existing_images: Dict[str, int] = {}  # Key: "listing_id_image_id" or "listing_id"
-
-
-def load_existing_images() -> Dict[str, int]:
-    """Load existing images, handling both old and new naming formats.
-
-    Old format: {listing_id}.jpg
-    New format: {listing_id}_{image_id}.jpg
-
-    Returns dict with keys as "{listing_id}_{image_id}" for new format.
+    Downloads are handled separately by image_downloader.py.
     """
-    existing = {}
-    for f in IMAGES_DIR.glob("*.jpg"):
-        stem = f.stem
-        # New format: listing_id_image_id
-        if "_" in stem:
-            existing[stem] = f.stat().st_size
-        else:
-            # Old format: just listing_id - still track it
-            try:
-                int(stem)  # Validate it's a number
-                existing[stem] = f.stat().st_size
-            except ValueError:
-                pass
-    return existing
+    if not images_list:
+        return
 
+    own_conn = conn is None
+    if own_conn:
+        conn = get_image_db_connection()
 
-def download_image(client, url, listing_id, image_id) -> bool:
-    """Download image with new naming: {listing_id}_{image_id}.jpg"""
-    try:
-        response = client.get(url)
-        response.raise_for_status()
-        filepath = IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
-        with open(filepath, "wb") as f:
-            f.write(response.content)
-        return True
-    except Exception as e:
-        print(f"  Error downloading image {listing_id}_{image_id}: {e}")
-        return False
+    for idx, (image_id, image_url) in enumerate(images_list):
+        hex_val, suffix = extract_hex_suffix(image_url)
+        is_primary = (idx == 0)
 
+        insert_image(
+            conn, listing_id, image_id, shop_id,
+            hex_val, suffix, is_primary, when_made, to_download=True
+        )
 
-def create_white_placeholder(filepath: Path) -> int:
-    white_jpeg = bytes([
-        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
-        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-        0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
-        0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
-        0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
-        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
-        0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
-        0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
-        0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03,
-        0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
-        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
-        0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
-        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72,
-        0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
-        0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-        0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
-        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3,
-        0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
-        0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
-        0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
-        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4,
-        0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01,
-        0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xDB, 0x20, 0xA8, 0xF1, 0x4F, 0xFF,
-        0xD9
-    ])
-    with open(filepath, "wb") as f:
-        f.write(white_jpeg)
-    return len(white_jpeg)
-
-
-# ─── Download Queue ──────────────────────────────────────────────────────────
-
-class RateLimiter:
-    def __init__(self, rate):
-        self.min_interval = 1.0 / rate
-        self.lock = threading.Lock()
-        self.last_time = 0.0
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_time
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-            self.last_time = time.time()
-
-
-class ImageDownloadQueue:
-    """Queue for downloading images with new naming: {listing_id}_{image_id}.jpg"""
-
-    def __init__(self, metadata, metadata_lock):
-        self.queue = queue.Queue()
-        self.metadata = metadata
-        self.metadata_lock = metadata_lock
-        self.stats = {"downloaded": 0, "errors": 0}
-        self.stats_lock = threading.Lock()
-        self.running = True
-        self.rate_limiter = RateLimiter(CDN_RATE_LIMIT)
-        self.workers = []
-        self.num_workers = 8
-
-    def start(self):
-        for _ in range(self.num_workers):
-            worker = threading.Thread(target=self._run_worker, daemon=True)
-            worker.start()
-            self.workers.append(worker)
-
-    def _run_worker(self):
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            while self.running:
-                try:
-                    job = self.queue.get(timeout=5.0)
-                    if job is None:
-                        break
-
-                    listing_id, image_id, image_url = job
-                    img_key = f"{listing_id}_{image_id}"
-                    self.rate_limiter.acquire()
-                    success = download_image(client, image_url, listing_id, image_id)
-
-                    with self.stats_lock:
-                        if success:
-                            self.stats["downloaded"] += 1
-                            filepath = IMAGES_DIR / f"{img_key}.jpg"
-                            _existing_images[img_key] = filepath.stat().st_size
-                        else:
-                            self.stats["errors"] += 1
-                            filepath = IMAGES_DIR / f"{img_key}.jpg"
-                            _existing_images[img_key] = create_white_placeholder(filepath)
-
-                    self.queue.task_done()
-                except queue.Empty:
-                    continue
-
-    def add(self, listing_id, images_list, shop_id, when_made):
-        """Add all images for a listing to download queue.
-
-        Args:
-            listing_id: The listing ID
-            images_list: List of (image_id, url) tuples
-            shop_id: Shop ID
-            when_made: When made category
-        """
-        lid_str = str(listing_id)
-
-        # Build images metadata
-        images_meta = []
-        for idx, (image_id, image_url) in enumerate(images_list):
-            img_key = f"{listing_id}_{image_id}"
-            filepath = IMAGES_DIR / f"{img_key}.jpg"
-            filepath.touch()
-            _existing_images[img_key] = 0
-
-            hex_val, suffix = extract_hex_suffix(image_url)
-            img_entry = {
-                "image_id": image_id,
-                "hex": hex_val,
-                "suffix": suffix,
-            }
-            if idx == 0:
-                img_entry["is_primary"] = True
-            images_meta.append(img_entry)
-            self.queue.put((listing_id, image_id, image_url))
-
-        # Update metadata with all images
-        with self.metadata_lock:
-            self.metadata[lid_str] = {
-                "shop_id": shop_id,
-                "when_made": when_made,
-                "images": images_meta,
-                "images_queued": True,
-            }
-
-    def add_missing(self, listing_id, images_list, shop_id, when_made):
-        """Add only MISSING images for an existing listing.
-
-        Checks which images already exist on disk and only queues missing ones.
-        Updates metadata to include all images from API.
-        Returns count of newly queued images.
-        """
-        lid_str = str(listing_id)
-        queued = 0
-
-        # Build complete images metadata from API, queue only missing
-        images_meta = []
-        for idx, (image_id, image_url) in enumerate(images_list):
-            img_key = f"{listing_id}_{image_id}"
-            filepath = IMAGES_DIR / f"{img_key}.jpg"
-
-            hex_val, suffix = extract_hex_suffix(image_url)
-            img_entry = {
-                "image_id": image_id,
-                "hex": hex_val,
-                "suffix": suffix,
-            }
-            if idx == 0:
-                img_entry["is_primary"] = True
-
-            # Check if image exists with content (not just placeholder)
-            existing_size = _existing_images.get(img_key, -1)
-            if existing_size <= 0:
-                # Missing or placeholder - queue for download
-                filepath.touch()
-                _existing_images[img_key] = 0
-                self.queue.put((listing_id, image_id, image_url))
-                queued += 1
-
-            images_meta.append(img_entry)
-
-        # Update metadata with complete image list
-        with self.metadata_lock:
-            self.metadata[lid_str] = {
-                "shop_id": shop_id,
-                "when_made": when_made,
-                "images": images_meta,
-                "images_queued": True,
-            }
-
-        return queued
-
-    def pending(self):
-        return self.queue.qsize()
-
-    def get_stats(self):
-        with self.stats_lock:
-            return dict(self.stats)
-
-    def wait_for_completion(self, check_interval: float = 5.0) -> bool:
-        """Wait for all downloads to complete.
-
-        Checks kill file every check_interval seconds.
-        Returns True if completed normally, False if killed.
-        """
-        empty_count = 0
-        last_pending = -1
-
-        while True:
-            # Check kill file
-            if check_kill_file():
-                return False
-
-            pending = self.queue.qsize()
-
-            # Show progress when it changes significantly
-            if pending != last_pending and (pending == 0 or pending % 1000 == 0 or last_pending == -1):
-                print(f"[{ts()}] Downloads pending: {pending}")
-                last_pending = pending
-
-            # If queue is empty, count consecutive empty checks
-            if pending == 0:
-                empty_count += 1
-                # After 3 consecutive empty checks (15 seconds), consider complete
-                if empty_count >= 3:
-                    return True
-            else:
-                empty_count = 0
-
-            # Wait before next check
-            time.sleep(check_interval)
-
-    def shutdown(self):
-        self.running = False
-        for _ in self.workers:
-            self.queue.put(None)
-        for w in self.workers:
-            w.join(timeout=10.0)
-
-    def requeue_pending(self, existing_images):
-        """Re-queue images with size-0 placeholder files (incomplete downloads).
-
-        Looks up hex/suffix from self.metadata to reconstruct URLs.
-        Returns count of re-queued images.
-        """
-        requeued = 0
-        for img_key, size in existing_images.items():
-            if size > 0:
-                continue
-
-            # Parse img_key: "listing_id_image_id" (new) or "listing_id" (old)
-            if "_" in img_key:
-                parts = img_key.rsplit("_", 1)
-                listing_id = int(parts[0])
-                target_image_id = int(parts[1])
-            else:
-                listing_id = int(img_key)
-                target_image_id = None
-
-            lid_str = str(listing_id)
-            with self.metadata_lock:
-                entry = self.metadata.get(lid_str)
-
-            if not entry:
-                continue
-
-            # New format: images array
-            if "images" in entry and entry["images"]:
-                for img_meta in entry["images"]:
-                    img_id = img_meta.get("image_id")
-                    if target_image_id is not None and img_id != target_image_id:
-                        continue
-                    hex_val = img_meta.get("hex")
-                    suffix = img_meta.get("suffix")
-                    if hex_val and suffix and img_id:
-                        url = construct_image_url(hex_val, img_id, suffix)
-                        self.queue.put((listing_id, img_id, url))
-                        requeued += 1
-                    if target_image_id is not None:
-                        break
-            # Old format: single image_id, hex, suffix
-            elif "image_id" in entry and "hex" in entry and "suffix" in entry:
-                img_id = entry["image_id"]
-                hex_val = entry["hex"]
-                suffix = entry["suffix"]
-                if hex_val and suffix and img_id:
-                    url = construct_image_url(hex_val, img_id, suffix)
-                    self.queue.put((listing_id, img_id, url))
-                    requeued += 1
-
-        return requeued
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
 # ─── Progress ────────────────────────────────────────────────────────────────
@@ -910,13 +593,8 @@ def save_progress(progress):
 
 # ─── Signal Handling ─────────────────────────────────────────────────────────
 
-_download_queue = None
-
-
 def _signal_handler(signum, frame):
     print("\n\nInterrupted! Shutting down...")
-    if _download_queue is not None:
-        _download_queue.shutdown()
     sys.exit(0)
 
 
@@ -949,7 +627,7 @@ def handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts
 
 # ─── Phase 1-3: Taxonomy Crawl ──────────────────────────────────────────────
 
-def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
+def phase_crawl(client, conn, progress,
                 existing_listings, existing_shops, listing_last_ts, shop_last_ts,
                 snapshot_ts, seen_in_crawl):
 
@@ -975,7 +653,6 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
             progress["offset"] = offset
             progress["exhausted"] = list(exhausted)
             save_progress(progress)
-            save_metadata(metadata, metadata_lock)
             conn.commit()
             return
 
@@ -999,7 +676,6 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
             progress["offset"] = offset
             progress["exhausted"] = list(exhausted)
             save_progress(progress)
-            save_metadata(metadata, metadata_lock)
             conn.commit()
             return
 
@@ -1022,7 +698,7 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
             if results:
                 # Process this last batch before marking exhausted
                 _process_crawl_batch(
-                    client, results, metadata, metadata_lock, conn, download_queue,
+                    client, results, conn,
                     existing_listings, existing_shops, listing_last_ts, shop_last_ts,
                     snapshot_ts, seen_in_crawl, stats
                 )
@@ -1037,12 +713,11 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
             progress["exhausted"] = list(exhausted)
             save_progress(progress)
             conn.commit()
-            save_metadata(metadata, metadata_lock)
             continue
 
         # Process batch
         _process_crawl_batch(
-            client, results, metadata, metadata_lock, conn, download_queue,
+            client, results, conn,
             existing_listings, existing_shops, listing_last_ts, shop_last_ts,
             snapshot_ts, seen_in_crawl, stats
         )
@@ -1053,14 +728,10 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
         progress["exhausted"] = list(exhausted)
         save_progress(progress)
         conn.commit()
-        # Save metadata every 5000 listings instead of every 100
-        if offset % 5000 == 0:
-            save_metadata(metadata, metadata_lock)
 
-        dl_stats = download_queue.get_stats()
         print(f"  offset={offset} | new+img={stats['new_2000plus']} new-img={stats['new_no_img']} "
               f"dyn_upd={stats['existing_updated']} dyn_fresh={stats['skipped']} "
-              f"shops={stats['shops_fetched']} img_dl={dl_stats['downloaded']} "
+              f"shops={stats['shops_fetched']} "
               f"API={_api_stats['used']}/{_api_stats['limit']}")
 
     progress["phase"] = "mopup"
@@ -1070,57 +741,35 @@ def phase_crawl(client, metadata, metadata_lock, conn, download_queue, progress,
           f"{stats['skipped']} dyn_fresh, {stats['shops_fetched']} shops")
 
 
-def _process_crawl_batch(client, results, metadata, metadata_lock, conn, download_queue,
+def _process_crawl_batch(client, results, conn,
                          existing_listings, existing_shops, listing_last_ts, shop_last_ts,
                          snapshot_ts, seen_in_crawl, stats):
     """Process a batch of listings from the taxonomy crawl."""
 
-    new_listings = []  # listings not yet in metadata (need DB insert + possibly image)
-    existing_need_images = []  # existing listings that may need image updates
+    new_listings = []  # listings not yet in DB
 
     for listing in results:
         lid = listing["listing_id"]
-        lid_str = str(lid)
-        when_made = listing.get("when_made", "")
         shop_id = listing.get("shop_id")
-
-        # Get price for image download decision
-        price_data = listing.get("price", {})
-        price_amount = price_data.get("amount", 0)
-        price_divisor = price_data.get("divisor", 100)
-        price = price_amount / price_divisor if price_divisor else 0
 
         seen_in_crawl.add(lid)
 
-        if lid_str in metadata:
+        if lid in existing_listings:
             # Already known listing — update DB dynamic if needed
-            if lid in existing_listings:
-                last_ts = listing_last_ts.get(lid, 0)
-                if snapshot_ts - last_ts > ONE_WEEK:
-                    insert_listing_dynamic(conn, listing, snapshot_ts)
-                    listing_last_ts[lid] = snapshot_ts
-                    stats["existing_updated"] += 1
-                else:
-                    stats["skipped"] += 1
-            else:
-                # In metadata but not DB — insert (was pre-2000 before filter removal)
-                insert_listing_static(conn, listing, snapshot_ts)
+            last_ts = listing_last_ts.get(lid, 0)
+            if snapshot_ts - last_ts > ONE_WEEK:
                 insert_listing_dynamic(conn, listing, snapshot_ts)
-                existing_listings.add(lid)
                 listing_last_ts[lid] = snapshot_ts
                 stats["existing_updated"] += 1
+            else:
+                stats["skipped"] += 1
 
             # Handle shop for all listings
             if handle_shop(client, shop_id, conn, existing_shops, shop_last_ts, snapshot_ts):
                 stats["shops_fetched"] += 1
-
-            # Check if this existing listing needs images (not yet queued)
-            entry = metadata.get(lid_str)
-            if isinstance(entry, dict) and not entry.get("images_queued") and when_made in ALLOWED_WHEN_MADE and price >= MIN_PRICE:
-                existing_need_images.append(listing)
             continue
 
-        # New listing (not in metadata) — collect for processing
+        # New listing — collect for processing
         new_listings.append(listing)
 
     # Process new listings: all go to DB, only some get images
@@ -1156,14 +805,7 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
             if lid in image_info:
                 # image_info[lid] is now a list of (image_id, url) tuples
                 images_list = image_info[lid]
-                download_queue.add(lid, images_list, shop_id, wm)
-            else:
-                # No images found — still add to metadata
-                metadata[lid_str] = {
-                    "shop_id": shop_id,
-                    "when_made": wm,
-                    "images": [],
-                }
+                add_images_to_sql(lid, images_list, shop_id, wm, conn)
 
             # Insert listing into DB
             insert_listing_static(conn, listing, snapshot_ts)
@@ -1180,14 +822,9 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
         # Process listings that don't need images (pre-2000 or under $50)
         for listing in no_images:
             lid = listing["listing_id"]
-            lid_str = str(lid)
             shop_id = listing["shop_id"]
-            wm = listing.get("when_made", "")
 
-            # Add to metadata (no images - pre-2000 or under $50)
-            metadata[lid_str] = {"shop_id": shop_id, "when_made": wm, "images": []}
-
-            # Insert listing into DB (ALL listings go to DB now)
+            # Insert listing into DB (ALL listings go to DB)
             insert_listing_static(conn, listing, snapshot_ts)
             insert_listing_dynamic(conn, listing, snapshot_ts)
             existing_listings.add(lid)
@@ -1199,38 +836,14 @@ def _process_crawl_batch(client, results, metadata, metadata_lock, conn, downloa
 
             stats["new_no_img"] += 1
 
-    # Process existing listings that need images (images_complete not set)
-    if existing_need_images:
-        batch_ids = [l["listing_id"] for l in existing_need_images]
-        image_info = get_batch_image_info(client, batch_ids)
-
-        for listing in existing_need_images:
-            lid = listing["listing_id"]
-            shop_id = listing["shop_id"]
-            wm = listing.get("when_made", "")
-
-            if lid in image_info:
-                images_list = image_info[lid]
-                download_queue.add_missing(lid, images_list, shop_id, wm)
-
 
 # ─── Phase 4: Mop-Up Pass ───────────────────────────────────────────────────
 
-def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
+def phase_mopup(client, conn, existing_listings, existing_shops,
                 listing_last_ts, shop_last_ts, snapshot_ts, seen_in_crawl):
 
-    # Find ALL listings in metadata that were not seen in this crawl cycle
-    # (may have changed taxonomy/price since last crawl)
-    mopup_ids = []
-    for lid_str, entry in metadata.items():
-        if not isinstance(entry, dict):
-            continue
-        try:
-            lid = int(lid_str)
-        except ValueError:
-            continue
-        if lid not in seen_in_crawl:
-            mopup_ids.append(lid)
+    # Find listings in DB that were not seen in this crawl cycle
+    mopup_ids = [lid for lid in existing_listings if lid not in seen_in_crawl]
 
     if not mopup_ids:
         print(f"[{ts()}] Mop-up: nothing to do (all listings seen in crawl)")
@@ -1271,48 +884,20 @@ def phase_mopup(client, metadata, conn, existing_listings, existing_shops,
 
 # ─── Phase 5: Sync Check ────────────────────────────────────────────────────
 
-def phase_sync_check(metadata, conn, existing_listings, existing_shops):
+def phase_sync_check(conn, existing_listings):
+    """Check that downloaded images exist on disk."""
     issues = []
 
-    # Check 1: Every metadata entry with images should have those images on disk
-    for lid_str, entry in metadata.items():
-        if not isinstance(entry, dict):
-            continue
-
-        try:
-            lid = int(lid_str)
-        except ValueError:
-            continue
-
-        # Handle both old format (image_id) and new format (images array)
-        images = entry.get("images", [])
-        if not images and "image_id" in entry and entry["image_id"]:
-            # Old format: single image_id
-            img_path = IMAGES_DIR / f"{lid}.jpg"
-            if not img_path.exists() or img_path.stat().st_size == 0:
-                issues.append(f"Missing/empty image: {lid}")
-        else:
-            # New format: images array with {listing_id}_{image_id}.jpg
-            for img_meta in images:
-                image_id = img_meta.get("image_id")
-                if image_id:
-                    img_path = IMAGES_DIR / f"{lid}_{image_id}.jpg"
-                    if not img_path.exists() or img_path.stat().st_size == 0:
-                        issues.append(f"Missing/empty image: {lid}_{image_id}")
-
-    # Check 2: Every DB listing has metadata entry
-    for lid in existing_listings:
-        if str(lid) not in metadata:
-            issues.append(f"DB listing {lid} has no metadata entry")
-
-    # Check 3: Every metadata entry has a listing in DB
-    for lid_str in metadata:
-        try:
-            lid = int(lid_str)
-        except ValueError:
-            continue
-        if lid not in existing_listings:
-            issues.append(f"Metadata listing {lid} not in DB")
+    # Check: images marked download_done=1 should exist on disk
+    cursor = conn.execute("""
+        SELECT listing_id, image_id FROM image_status
+        WHERE download_done = 1
+    """)
+    for row in cursor.fetchall():
+        lid, iid = row[0], row[1]
+        img_path = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if not img_path.exists() or img_path.stat().st_size == 0:
+            issues.append(f"Missing/empty image: {lid}_{iid}")
 
     if issues:
         print(f"\n[{ts()}] Sync check: {len(issues)} issues found")
@@ -1380,11 +965,9 @@ def main():
     print(f"{'='*60}")
 
     # Load state
-    metadata = load_metadata()
     progress = load_progress()
     conn = init_db(DB_FILE)
 
-    print(f"Metadata: {len(metadata)} entries")
     print(f"Crawl units: {len(CRAWL_UNITS)}")
 
     # Pre-load DB state for O(1) lookups
@@ -1402,25 +985,6 @@ def main():
 
     print(f"DB: {len(existing_listings)} listings, {len(existing_shops)} shops")
 
-    # Load image files
-    global _existing_images
-    _existing_images = load_existing_images()
-    complete = sum(1 for s in _existing_images.values() if s > 0)
-    pending = sum(1 for s in _existing_images.values() if s == 0)
-    print(f"Images: {complete} complete, {pending} pending")
-
-    # Start download queue
-    metadata_lock = threading.Lock()
-    download_queue = ImageDownloadQueue(metadata, metadata_lock)
-    download_queue.start()
-    global _download_queue
-    _download_queue = download_queue
-
-    # Re-queue pending images (size-0 placeholders from interrupted downloads)
-    if pending > 0:
-        requeued = download_queue.requeue_pending(_existing_images)
-        print(f"Re-queued {requeued} pending images for download")
-
     snapshot_ts = int(time.time())
     seen_in_crawl = set()
 
@@ -1431,7 +995,7 @@ def main():
         if current_phase == "crawl":
             print(f"\n--- Phase 1-3: Taxonomy Crawl ---")
             phase_crawl(
-                client, metadata, metadata_lock, conn, download_queue, progress,
+                client, conn, progress,
                 existing_listings, existing_shops, listing_last_ts, shop_last_ts,
                 snapshot_ts, seen_in_crawl
             )
@@ -1441,17 +1005,17 @@ def main():
         if current_phase == "mopup":
             print(f"\n--- Phase 4: Mop-Up ---")
             phase_mopup(
-                client, metadata, conn, existing_listings, existing_shops,
+                client, conn, existing_listings, existing_shops,
                 listing_last_ts, shop_last_ts, snapshot_ts, seen_in_crawl
             )
             progress["phase"] = "sync_check"
             save_progress(progress)
             current_phase = "sync_check"
 
-        # Phase 5: Sync check (downloads continue in background)
+        # Phase 5: Sync check
         if current_phase == "sync_check":
             print(f"\n--- Phase 5: Sync Check ---")
-            phase_sync_check(metadata, conn, existing_listings, existing_shops)
+            phase_sync_check(conn, existing_listings)
             progress["phase"] = "reviews"
             save_progress(progress)
             current_phase = "reviews"
@@ -1463,19 +1027,9 @@ def main():
             progress["phase"] = "complete"
             save_progress(progress)
 
-    # Don't wait for downloads - incomplete ones will be retried on next run
-    pending_dl = download_queue.pending()
-    dl_stats = download_queue.get_stats()
-
-    if pending_dl > 0:
-        print(f"\n{pending_dl} downloads still pending - will be completed on next run")
-
-    download_queue.shutdown()
-
     # Final save
     conn.commit()
     conn.close()
-    save_metadata(metadata, metadata_lock)
 
     # Reset progress for next cycle
     progress = {"phase": "crawl", "crawl_unit_index": 0, "offset": 0, "exhausted": []}
@@ -1484,11 +1038,9 @@ def main():
     print(f"\n{'='*60}")
     print(f"SYNC COMPLETE")
     print(f"{'='*60}")
-    print(f"Images downloaded: {dl_stats['downloaded']}")
-    print(f"Download errors: {dl_stats['errors']}")
     print(f"DB: {len(existing_listings)} listings, {len(existing_shops)} shops")
-    print(f"Metadata: {len(metadata)} entries")
     print(f"API: {_api_stats['used']}/{_api_stats['limit']}")
+    print(f"Run image_downloader.py to download queued images")
 
 
 if __name__ == "__main__":

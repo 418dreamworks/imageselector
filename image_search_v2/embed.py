@@ -1,7 +1,7 @@
 """Generate embeddings for images using multiple models.
 
-Outputs separate embedding files per model in dev/embeddings/.
-Tracks embedded_{model} flags per image in metadata.
+Outputs separate embedding files per model in embeddings/.
+Tracks embedded_{model} flags per image in SQLite image_status table.
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -9,6 +9,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 # NOTE: faiss is imported lazily in functions that need it
@@ -34,16 +35,21 @@ if not IMAGES_DIR.exists():
     EMBEDDINGS_DIR = BASE_DIR / "dev" / "embeddings"
 
 IMAGE_INDEX_FILE = EMBEDDINGS_DIR / "image_index.json"
-METADATA_FILE = BASE_DIR / "image_metadata.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
 KILL_FILE = BASE_DIR / "KILL_EMBED"
 
-# Metadata cache
-_metadata = None
-_metadata_dirty = False
+# Import from shared image_db module
+sys.path.insert(0, str(BASE_DIR))
+from image_db import (
+    get_connection, get_images_for_embedding,
+    mark_embedded as db_mark_embedded
+)
 
 # Global kill flag - set when kill file is detected
 _kill_requested = False
+
+# DB connection for batch operations
+_db_conn = None
 
 
 def check_kill_file() -> bool:
@@ -62,43 +68,25 @@ def check_kill_file() -> bool:
     return False
 
 
-def load_metadata() -> dict:
-    """Load metadata from file."""
-    global _metadata
-    if _metadata is None:
-        if METADATA_FILE.exists():
-            with open(METADATA_FILE) as f:
-                _metadata = json.load(f)
-        else:
-            _metadata = {}
-    return _metadata
+def get_db_conn():
+    """Get or create DB connection."""
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = get_connection()
+    return _db_conn
 
 
-def save_metadata():
-    """Save metadata to file if dirty."""
-    global _metadata, _metadata_dirty
-    if _metadata_dirty and _metadata is not None:
-        tmp_file = METADATA_FILE.with_suffix('.json.tmp')
-        with open(tmp_file, 'w') as f:
-            json.dump(_metadata, f)
-        tmp_file.rename(METADATA_FILE)
-        _metadata_dirty = False
-        print(f"Saved metadata to {METADATA_FILE}")
+def commit_db():
+    """Commit any pending DB changes."""
+    global _db_conn
+    if _db_conn is not None:
+        _db_conn.commit()
 
 
-def mark_embedded(listing_id: str, image_id: int, model_key: str):
-    """Mark an image as embedded for a specific model."""
-    global _metadata, _metadata_dirty
-    metadata = load_metadata()
-
-    if listing_id in metadata and isinstance(metadata[listing_id], dict):
-        entry = metadata[listing_id]
-        images = entry.get("images", [])
-        for img in images:
-            if img.get("image_id") == image_id:
-                img[f"embedded_{model_key}"] = True
-                _metadata_dirty = True
-                break
+def mark_embedded(listing_id: int, image_id: int, model_key: str):
+    """Mark an image as embedded for a specific model in SQLite."""
+    conn = get_db_conn()
+    db_mark_embedded(conn, listing_id, image_id, model_key)
 
 
 # Listing text cache (title + materials)
@@ -147,45 +135,30 @@ def get_texts_for_batch(listing_ids: list[int]) -> list[str]:
     return [texts.get(lid, "") for lid in listing_ids]
 
 
-def get_image_files_for_model(model_key: str) -> tuple[list[Path], list[tuple[int, int]]]:
+def get_image_files_for_model(model_key: str, limit: int = 0) -> tuple[list[Path], list[tuple[int, int]]]:
     """Get images that need embedding for a specific model.
 
-    Only returns images that:
-    1. Have bg_removed=true
-    2. Do NOT have embedded_{model_key}=true
+    Uses SQLite image_status table:
+    - bg_removed=1 AND embed_{model_key}=0
 
     This allows each model to track its own progress independently.
     """
-    metadata = load_metadata()
+    conn = get_db_conn()
+    # Get large batch from SQL (limit 0 = no limit in query, default to 100k)
+    query_limit = limit if limit > 0 else 100000
+    images = get_images_for_embedding(conn, model_key, limit=query_limit)
+
     image_ids = []  # List of (listing_id, image_id) tuples
     valid_files = []
-    embed_flag = f"embedded_{model_key}"
 
-    for lid, entry in metadata.items():
-        if not isinstance(entry, dict):
-            continue
-        for img in entry.get("images", []):
-            # Only process images with background removed
-            if not img.get("bg_removed"):
-                continue
-            # Skip if already embedded for this model
-            if img.get(embed_flag):
-                continue
-            image_id = img.get("image_id")
-            if not image_id:
-                continue
-            # Build file path - bg_remover saves back to images/ as jpg
-            img_path = IMAGES_DIR / f"{lid}_{image_id}.jpg"
-            if img_path.exists():
-                image_ids.append((int(lid), image_id))
-                valid_files.append(img_path)
-
-    # Sort by listing_id, image_id for consistent ordering
-    combined = sorted(zip(valid_files, image_ids), key=lambda x: x[1])
-    if combined:
-        valid_files, image_ids = zip(*combined)
-        valid_files = list(valid_files)
-        image_ids = list(image_ids)
+    for img in images:
+        lid = img["listing_id"]
+        iid = img["image_id"]
+        # Build file path - bg_remover saves back to images/ as jpg
+        img_path = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if img_path.exists():
+            image_ids.append((lid, iid))
+            valid_files.append(img_path)
 
     print(f"Found {len(valid_files)} images needing {model_key} embedding")
     return valid_files, image_ids
@@ -221,7 +194,7 @@ def generate_embeddings_incremental(
     for i in tqdm(range(0, len(image_files), batch_size), desc=f"Embedding ({model_key})"):
         # Check for kill file
         if check_kill_file():
-            save_metadata()
+            commit_db()
             # Save FAISS indexes before exiting
             print(f"\nSaving FAISS index ({img_index.ntotal} vectors)...")
             save_faiss_index(img_index, emb_file)
@@ -255,16 +228,16 @@ def generate_embeddings_incremental(
             text_emb_np = text_emb.cpu().numpy().astype("float32")
             text_index.add(text_emb_np)
 
-        # Mark each image as embedded in metadata
+        # Mark each image as embedded in SQL (atomic update)
         for lid, iid in batch_ids:
-            mark_embedded(str(lid), iid, model_key)
+            mark_embedded(lid, iid, model_key)
             actually_embedded.append((lid, iid))
 
         processed += len(batch_files)
 
-        # Periodically save metadata
+        # Periodically commit SQL changes
         if processed % save_interval == 0:
-            save_metadata()
+            commit_db()
 
         # Periodically save FAISS indexes (every 50K images)
         if processed % index_save_interval == 0:
@@ -272,10 +245,10 @@ def generate_embeddings_incremental(
             save_faiss_index(img_index, emb_file)
             if is_clip and text_index is not None:
                 save_faiss_index(text_index, text_emb_file)
-            save_metadata()
+            commit_db()
 
-    # Final save
-    save_metadata()
+    # Final commit
+    commit_db()
     return processed, actually_embedded
 
 
@@ -447,8 +420,8 @@ def main():
     # Save image index (shared across all models) - only actually embedded images
     save_image_index(final_index)
 
-    # Final metadata save
-    save_metadata()
+    # Final DB commit
+    commit_db()
 
     print("\nDone!")
 
