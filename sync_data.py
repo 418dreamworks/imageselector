@@ -539,7 +539,7 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
 # ─── Image SQL Insert ────────────────────────────────────────────────────────
 
 def add_images_to_sql(listing_id: int, images_list: list, shop_id: int, when_made: str,
-                      conn=None):
+                      price: float = None, conn=None):
     """Insert images to SQL image_status table.
 
     Args:
@@ -547,6 +547,7 @@ def add_images_to_sql(listing_id: int, images_list: list, shop_id: int, when_mad
         images_list: List of (image_id, url) tuples from API
         shop_id: Shop ID
         when_made: When made category
+        price: Listing price
         conn: Optional existing database connection (to avoid lock conflicts)
 
     Downloads are handled separately by image_downloader.py.
@@ -564,7 +565,7 @@ def add_images_to_sql(listing_id: int, images_list: list, shop_id: int, when_mad
 
         insert_image(
             conn, listing_id, image_id, shop_id,
-            hex_val, suffix, is_primary, when_made, to_download=True
+            hex_val, suffix, is_primary, when_made, price=price, to_download=True
         )
 
     if own_conn:
@@ -801,11 +802,13 @@ def _process_crawl_batch(client, results, conn,
             lid_str = str(lid)
             shop_id = listing["shop_id"]
             wm = listing.get("when_made", "")
+            price_data = listing.get("price", {})
+            price = price_data.get("amount", 0) / price_data.get("divisor", 100) if price_data.get("divisor") else 0
 
             if lid in image_info:
                 # image_info[lid] is now a list of (image_id, url) tuples
                 images_list = image_info[lid]
-                add_images_to_sql(lid, images_list, shop_id, wm, conn)
+                add_images_to_sql(lid, images_list, shop_id, wm, price=price, conn=conn)
 
             # Insert listing into DB
             insert_listing_static(conn, listing, snapshot_ts)

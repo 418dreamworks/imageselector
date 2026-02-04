@@ -40,14 +40,15 @@ def insert_image(
     suffix: str,
     is_primary: bool,
     when_made: str,
+    price: float = None,
     to_download: bool = True,
 ):
     """Insert a new image. Used by sync_data.py when discovering new images."""
     conn.execute("""
         INSERT OR IGNORE INTO image_status (
-            listing_id, image_id, shop_id, hex, suffix, is_primary, when_made, to_download
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (listing_id, image_id, shop_id, hex_val, suffix, int(is_primary), when_made, int(to_download)))
+            listing_id, image_id, shop_id, hex, suffix, is_primary, when_made, price, to_download
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (listing_id, image_id, shop_id, hex_val, suffix, int(is_primary), when_made, price, int(to_download)))
 
 
 # ============================================================
