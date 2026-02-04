@@ -16,10 +16,8 @@ IMAGES_DIR = BASE_DIR / "images"
 IMAGES_NOBG_DIR = BASE_DIR / "images_nobg"
 METADATA_FILE = BASE_DIR / "image_metadata.json"
 
-# Backup location for embedded images (change to HDD once verified)
-# SSD: /Volumes/SSD_120/embedded_backup
-# HDD: /Volumes/HDD_1000/embedded_backup (after disk check passes)
-BACKUP_DIR = Path("/Volumes/SSD_120/embedded_backup")
+# Backup location for embedded images on HDD
+BACKUP_DIR = Path("/Volumes/HDD_1000/embedded_backup")
 
 # All embedding models that must be complete before cleanup
 EMBED_MODELS = [

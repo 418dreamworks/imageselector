@@ -1463,13 +1463,13 @@ def main():
             progress["phase"] = "complete"
             save_progress(progress)
 
-    # Wait for pending downloads
+    # Don't wait for downloads - incomplete ones will be retried on next run
     pending_dl = download_queue.pending()
-    if pending_dl > 0:
-        print(f"\nWaiting for {pending_dl} pending downloads...")
-        download_queue.wait_for_completion()  # Kill file checked inside
-
     dl_stats = download_queue.get_stats()
+
+    if pending_dl > 0:
+        print(f"\n{pending_dl} downloads still pending - will be completed on next run")
+
     download_queue.shutdown()
 
     # Final save
