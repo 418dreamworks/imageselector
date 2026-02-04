@@ -2,22 +2,23 @@
 """Cleanup non-primary images after embedding is complete.
 
 For each listing where all images have all 5 embedded_* flags:
-- Keep the primary image (is_primary: true)
-- Move all non-primary images to backup location (SSD or HDD)
-- Update metadata to remove moved images
+- Keep the primary image (is_primary = 1)
+- Delete all non-primary images from disk
+- Optionally delete from database
+
+Uses SQLite image_status table for tracking.
 """
 import argparse
-import json
-import shutil
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
-IMAGES_NOBG_DIR = BASE_DIR / "images_nobg"
-METADATA_FILE = BASE_DIR / "image_metadata.json"
+KILL_FILE = BASE_DIR / "KILL_CLEANUP"
 
-# Backup location for embedded images on HDD
-BACKUP_DIR = Path("/Volumes/HDD_1000/embedded_backup")
+# Add parent to path for imports
+sys.path.insert(0, str(BASE_DIR))
+from image_db import get_connection
 
 # All embedding models that must be complete before cleanup
 EMBED_MODELS = [
@@ -29,116 +30,62 @@ EMBED_MODELS = [
 ]
 
 
-def load_metadata() -> dict:
-    """Load metadata from file."""
-    if METADATA_FILE.exists():
-        with open(METADATA_FILE) as f:
-            return json.load(f)
-    return {}
+def check_kill_file() -> bool:
+    """Check if kill file exists."""
+    if KILL_FILE.exists():
+        KILL_FILE.unlink()
+        print("\nKill file detected. Stopping...")
+        return True
+    return False
 
 
-def save_metadata(metadata: dict):
-    """Save metadata to file."""
-    tmp_file = METADATA_FILE.with_suffix('.json.tmp')
-    with open(tmp_file, 'w') as f:
-        json.dump(metadata, f)
-    tmp_file.rename(METADATA_FILE)
+def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
+    """Find non-primary images where listing has all embeddings complete.
 
-
-def is_fully_embedded(img: dict) -> bool:
-    """Check if an image has all embedding flags set."""
-    return all(img.get(f"embedded_{model}") for model in EMBED_MODELS)
-
-
-def find_cleanable_listings(metadata: dict) -> list[str]:
-    """Find listings where all images are fully embedded."""
-    cleanable = []
-
-    for lid, entry in metadata.items():
-        if not isinstance(entry, dict):
-            continue
-
-        images = entry.get("images", [])
-        if not images:
-            continue
-
-        # All images must be fully embedded
-        if all(is_fully_embedded(img) for img in images):
-            # Must have at least one non-primary image to clean
-            non_primary = [img for img in images if not img.get("is_primary")]
-            if non_primary:
-                cleanable.append(lid)
-
-    return cleanable
-
-
-def cleanup_listing(lid: str, entry: dict, dry_run: bool = True) -> int:
-    """Move non-primary images to backup location.
-
-    Returns count of moved files.
+    Returns images that can be deleted (non-primary, fully embedded).
     """
-    images = entry.get("images", [])
-    moved = 0
+    # Build condition for all models embedded
+    embed_conditions = " AND ".join([f"embed_{m} = 1" for m in EMBED_MODELS])
 
-    # Find primary and non-primary images
-    primary_img = None
-    to_move = []
+    # Find non-primary images from listings where ALL images are fully embedded
+    # A listing is fully embedded if it has no images with any embed_* = 0
+    query = f"""
+        SELECT i.listing_id, i.image_id
+        FROM image_status i
+        WHERE i.is_primary = 0
+          AND i.{embed_conditions.replace(' AND ', ' AND i.')}
+          AND NOT EXISTS (
+              SELECT 1 FROM image_status i2
+              WHERE i2.listing_id = i.listing_id
+                AND (i2.embed_clip_vitb32 = 0
+                     OR i2.embed_clip_vitl14 = 0
+                     OR i2.embed_dinov2_base = 0
+                     OR i2.embed_dinov2_large = 0
+                     OR i2.embed_dinov3_base = 0)
+          )
+        LIMIT ?
+    """
 
-    for img in images:
-        if img.get("is_primary"):
-            primary_img = img
+    cursor = conn.execute(query, (limit,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_image_file(listing_id: int, image_id: int, dry_run: bool = True) -> bool:
+    """Delete image file from disk."""
+    img_path = IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
+
+    if img_path.exists():
+        if dry_run:
+            print(f"  Would delete: {img_path.name}")
         else:
-            to_move.append(img)
-
-    if not primary_img:
-        print(f"  Warning: No primary image for {lid}")
-        return 0
-
-    # Create backup subdirs
-    backup_images = BACKUP_DIR / "images"
-    backup_nobg = BACKUP_DIR / "images_nobg"
-
-    if not dry_run:
-        backup_images.mkdir(parents=True, exist_ok=True)
-        backup_nobg.mkdir(parents=True, exist_ok=True)
-
-    # Move non-primary image files
-    for img in to_move:
-        iid = img.get("image_id")
-        if not iid:
-            continue
-
-        # Original image
-        orig_path = IMAGES_DIR / f"{lid}_{iid}.jpg"
-        if orig_path.exists():
-            dest_path = backup_images / f"{lid}_{iid}.jpg"
-            if dry_run:
-                print(f"  Would move: {orig_path.name} -> {dest_path}")
-            else:
-                shutil.move(str(orig_path), str(dest_path))
-                print(f"  Moved: {orig_path.name}")
-            moved += 1
-
-        # Nobg image
-        nobg_path = IMAGES_NOBG_DIR / f"{lid}_{iid}.png"
-        if nobg_path.exists():
-            dest_path = backup_nobg / f"{lid}_{iid}.png"
-            if dry_run:
-                print(f"  Would move: {nobg_path.name} -> {dest_path}")
-            else:
-                shutil.move(str(nobg_path), str(dest_path))
-                print(f"  Moved: {nobg_path.name}")
-            moved += 1
-
-    # Update metadata to keep only primary
-    if not dry_run:
-        entry["images"] = [primary_img]
-
-    return moved
+            img_path.unlink()
+            print(f"  Deleted: {img_path.name}")
+        return True
+    return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cleanup non-primary images")
+    parser = argparse.ArgumentParser(description="Cleanup non-primary images after embedding")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -147,40 +94,70 @@ def main():
     parser.add_argument(
         "--limit",
         type=int,
-        default=0,
-        help="Limit number of listings to process (for testing)",
+        default=10000,
+        help="Limit number of images to process per run (default: 10000)",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuous watch mode - keep checking for cleanable images",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="Seconds between checks in watch mode (default: 300)",
     )
     args = parser.parse_args()
 
-    print("Loading metadata...")
-    metadata = load_metadata()
-    print(f"Total listings: {len(metadata)}")
+    print("Cleanup: Delete non-primary images after embedding")
+    print(f"Images dir: {IMAGES_DIR}")
+    if args.dry_run:
+        print("DRY RUN - no files will be deleted")
+    print()
 
-    print("\nFinding cleanable listings...")
-    cleanable = find_cleanable_listings(metadata)
-    print(f"Listings ready for cleanup: {len(cleanable)}")
+    conn = get_connection()
 
-    if not cleanable:
-        print("Nothing to clean up.")
-        return
+    while True:
+        if check_kill_file():
+            break
 
-    if args.limit > 0:
-        cleanable = cleanable[:args.limit]
-        print(f"Limited to {len(cleanable)} listings")
+        print("Finding cleanable images...")
+        cleanable = get_cleanable_images(conn, args.limit)
+        print(f"Found {len(cleanable)} non-primary images ready for cleanup")
 
-    total_deleted = 0
-    for lid in cleanable:
-        print(f"\nProcessing listing {lid}:")
-        entry = metadata[lid]
-        deleted = cleanup_listing(lid, entry, dry_run=args.dry_run)
-        total_deleted += deleted
+        if not cleanable:
+            if args.watch:
+                import time
+                print(f"Nothing to clean. Waiting {args.interval}s...")
+                time.sleep(args.interval)
+                continue
+            else:
+                print("Nothing to clean up.")
+                break
 
-    if not args.dry_run and total_deleted > 0:
-        print("\nSaving updated metadata...")
-        save_metadata(metadata)
+        deleted = 0
+        for img in cleanable:
+            if check_kill_file():
+                break
 
-    print(f"\n{'Would move' if args.dry_run else 'Moved'}: {total_deleted} files")
-    print(f"Backup location: {BACKUP_DIR}")
+            lid = img["listing_id"]
+            iid = img["image_id"]
+
+            if delete_image_file(lid, iid, dry_run=args.dry_run):
+                deleted += 1
+
+        print(f"\n{'Would delete' if args.dry_run else 'Deleted'}: {deleted} files")
+
+        if not args.watch:
+            break
+
+        if deleted == 0:
+            import time
+            print(f"Waiting {args.interval}s before next check...")
+            time.sleep(args.interval)
+
+    conn.close()
     print("Done!")
 
 
