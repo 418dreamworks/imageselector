@@ -71,11 +71,10 @@ def ts():
 
 
 def check_kill_file():
-    """Check for kill file and delete if found. Returns True if should exit."""
+    """Check for kill file. Returns True if should exit. User must manually delete KILL file."""
     try:
         if KILL_FILE.exists():
-            KILL_FILE.unlink()
-            print(f"[{ts()}] Kill file detected at {KILL_FILE}. Shutting down gracefully...")
+            print(f"[{ts()}] Kill file detected at {KILL_FILE}. Shutting down...")
             return True
     except Exception as e:
         print(f"[{ts()}] Error checking kill file: {e}")
@@ -416,47 +415,68 @@ def update_api_usage(response):
 
 def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price=None):
     """Fetch a batch of active listings for a taxonomy + price range, including images."""
-    time.sleep(get_api_delay())
     params = {"taxonomy_id": taxonomy_id, "limit": 100, "offset": offset, "includes": "Images"}
     if min_price is not None:
         params["min_price"] = min_price
     if max_price is not None:
         params["max_price"] = max_price
 
-    response = client.get(
-        f"{BASE_URL}/application/listings/active",
-        headers={"x-api-key": ETSY_API_KEY},
-        params=params,
-    )
-    update_api_usage(response)
+    max_retries = 3
+    for attempt in range(max_retries):
+        time.sleep(get_api_delay())
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/listings/active",
+                headers={"x-api-key": ETSY_API_KEY},
+                params=params,
+            )
+            update_api_usage(response)
 
-    if response.status_code == 429:
-        print(f"[{ts()}] 429 Rate Limited!")
-        return None, "rate_limited"
-    if response.status_code == 400:
-        return None, "bad_request"
-    response.raise_for_status()
+            if response.status_code == 429:
+                print(f"[{ts()}] 429 Rate Limited!")
+                return None, "rate_limited"
+            if response.status_code == 400:
+                return None, "bad_request"
+            response.raise_for_status()
 
-    data = response.json()
-    return data.get("results", []), data.get("count", 0)
+            data = response.json()
+            return data.get("results", []), data.get("count", 0)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"[{ts()}] Timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[{ts()}] Timeout after {max_retries} attempts, skipping batch")
+                return [], 0  # Return empty to skip this batch
 
 
 def fetch_shop(client, shop_id):
     """Fetch full shop data from API."""
-    time.sleep(get_api_delay())
-    try:
-        response = client.get(
-            f"{BASE_URL}/application/shops/{shop_id}",
-            headers={"x-api-key": ETSY_API_KEY},
-        )
-        update_api_usage(response)
-        if response.status_code == 404:
+    max_retries = 3
+    for attempt in range(max_retries):
+        time.sleep(get_api_delay())
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/shops/{shop_id}",
+                headers={"x-api-key": ETSY_API_KEY},
+            )
+            update_api_usage(response)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"[{ts()}] Shop {shop_id} timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[{ts()}] Shop {shop_id} timeout after {max_retries} attempts, skipping")
+                return None
+        except Exception as e:
+            print(f"  Error fetching shop {shop_id}: {e}")
             return None
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"  Error fetching shop {shop_id}: {e}")
-        return None
 
 
 def fetch_listings_batch_with_images(client, listing_ids):
@@ -467,68 +487,94 @@ def fetch_listings_batch_with_images(client, listing_ids):
     if not listing_ids:
         return {}
 
-    time.sleep(get_api_delay())
-    try:
-        response = client.get(
-            f"{BASE_URL}/application/listings/batch",
-            headers={"x-api-key": ETSY_API_KEY},
-            params={
-                "listing_ids": ",".join(str(lid) for lid in listing_ids),
-                "includes": "Images"
-            },
-        )
-        update_api_usage(response)
-        response.raise_for_status()
+    max_retries = 3
+    for attempt in range(max_retries):
+        time.sleep(get_api_delay())
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/listings/batch",
+                headers={"x-api-key": ETSY_API_KEY},
+                params={
+                    "listing_ids": ",".join(str(lid) for lid in listing_ids),
+                    "includes": "Images"
+                },
+            )
+            update_api_usage(response)
+            response.raise_for_status()
 
-        result = {}
-        for listing in response.json().get("results", []):
-            lid = listing.get("listing_id")
-            images = listing.get("images", [])
-            if lid and images:
-                result[lid] = images
-        return result
-    except Exception as e:
-        print(f"  Error fetching batch images: {e}")
-        return {}
+            result = {}
+            for listing in response.json().get("results", []):
+                lid = listing.get("listing_id")
+                images = listing.get("images", [])
+                if lid and images:
+                    result[lid] = images
+            return result
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"[{ts()}] Timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[{ts()}] Timeout after {max_retries} attempts, skipping batch")
+                return {}
+        except Exception as e:
+            print(f"  Error fetching batch images: {e}")
+            return {}
 
 
 def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     """Fetch reviews for a shop newer than last_timestamp."""
     reviews = []
     offset = 0
+    max_retries = 3
 
     while True:
-        time.sleep(get_api_delay())
-        try:
-            response = client.get(
-                f"{BASE_URL}/application/shops/{shop_id}/reviews",
-                headers={"x-api-key": ETSY_API_KEY},
-                params={"limit": 100, "offset": offset},
-            )
-            update_api_usage(response)
-            if response.status_code == 404:
-                break
-            response.raise_for_status()
+        success = False
+        for attempt in range(max_retries):
+            time.sleep(get_api_delay())
+            try:
+                response = client.get(
+                    f"{BASE_URL}/application/shops/{shop_id}/reviews",
+                    headers={"x-api-key": ETSY_API_KEY},
+                    params={"limit": 100, "offset": offset},
+                )
+                update_api_usage(response)
+                if response.status_code == 404:
+                    return reviews
+                response.raise_for_status()
 
-            results = response.json().get("results", [])
-            if not results:
-                break
+                results = response.json().get("results", [])
+                if not results:
+                    return reviews
 
-            found_old = False
-            for review in results:
-                if review.get("create_timestamp", 0) <= last_timestamp:
-                    found_old = True
-                    break
-                reviews.append(review)
+                found_old = False
+                for review in results:
+                    if review.get("create_timestamp", 0) <= last_timestamp:
+                        found_old = True
+                        break
+                    reviews.append(review)
 
-            if found_old:
-                break
+                if found_old:
+                    return reviews
 
-            offset += 100
-            if offset >= 10000:
+                offset += 100
+                if offset >= 10000:
+                    return reviews
+                success = True
                 break
-        except Exception as e:
-            print(f"  Error fetching reviews for shop {shop_id}: {e}")
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"[{ts()}] Reviews {shop_id} timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"[{ts()}] Reviews {shop_id} timeout after {max_retries} attempts, returning partial")
+                    return reviews
+            except Exception as e:
+                print(f"  Error fetching reviews for shop {shop_id}: {e}")
+                return reviews
+
+        if not success:
             break
 
     return reviews
@@ -657,7 +703,7 @@ def phase_repair_urls(client, conn):
                     """, (lid, image_id))
                     if not cursor.fetchone():
                         # New image - insert it
-                        insert_image(conn, lid, img, is_primary=(idx == 0))
+                        insert_image(conn, lid, image_id, is_primary=(idx == 0), url=url)
                         batch_inserted += 1
 
         # Delete orphaned entries (listings not returned by API = taken down)
