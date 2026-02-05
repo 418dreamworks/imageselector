@@ -23,7 +23,7 @@ import httpx
 load_dotenv()
 
 # Import from shared image_db module
-from image_db import get_connection as get_image_db_connection, insert_image, _retry_on_lock, commit_with_retry
+from image_db import get_connection, insert_image, _retry_on_lock, commit_with_retry
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,6 @@ ONE_MONTH = 30 * 24 * 3600
 
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
-PROGRESS_FILE = BASE_DIR / "sync_progress.json"
 DB_FILE = BASE_DIR / "etsy_data.db"
 TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
 KILL_FILE = BASE_DIR / "KILL"
@@ -598,7 +597,7 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
 
     own_conn = conn is None
     if own_conn:
-        conn = get_image_db_connection()
+        conn = get_connection()
 
     for idx, img in enumerate(images):
         image_id = img.get("listing_image_id")
@@ -614,10 +613,25 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
 
 # ─── Progress ────────────────────────────────────────────────────────────────
 
+def _ensure_progress_table(conn):
+    """Create sync_progress table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_progress (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            data TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
 def load_progress() -> dict:
-    if PROGRESS_FILE.exists():
-        with open(PROGRESS_FILE) as f:
-            return json.load(f)
+    conn = get_connection()
+    _ensure_progress_table(conn)
+    cursor = conn.execute("SELECT data FROM sync_progress WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
     return {
         "crawl_unit_index": 0,
         "offset": 0,
@@ -626,8 +640,13 @@ def load_progress() -> dict:
 
 
 def save_progress(progress):
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(progress, f)
+    conn = get_connection()
+    _ensure_progress_table(conn)
+    conn.execute("""
+        INSERT OR REPLACE INTO sync_progress (id, data) VALUES (1, ?)
+    """, (json.dumps(progress),))
+    commit_with_retry(conn)
+    conn.close()
 
 
 # ─── Signal Handling ─────────────────────────────────────────────────────────

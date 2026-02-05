@@ -36,6 +36,7 @@ EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
 IMAGES_DIR = BASE_DIR / 'images'
 BACKUPS_DIR = BASE_DIR / 'backups'
 DB_FILE = BASE_DIR / 'etsy_data.db'
+NONPRIMARY_DIR = Path('/Volumes/SSD_120/nonprimaryimages')
 
 # Config files
 QPS_CONFIG_FILE = BASE_DIR / 'qps_config.json'
@@ -89,7 +90,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=2000,
+        batch_size=3000,
     ),
     'mbp': Worker(
         name='mbp',
@@ -97,15 +98,15 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=2000,
+        batch_size=3000,
     ),
     'sleight': Worker(
         name='sleight',
         host='192.168.68.117',
         user='embed',
-        work_dir='E:/embed_work/imageselector',
-        python_path='E:/embed_work/imageselector/venv/Scripts/python.exe',
-        batch_size=2000,
+        work_dir='C:/Users/embed/imageselector',
+        python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
+        batch_size=10000,
         rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
 }
@@ -399,13 +400,36 @@ def import_batch(batch_dir: Path) -> int:
     start_row = get_next_faiss_row(conn)
     conn.close()
 
-    # 2. Copy bg-removed images
-    log(f"Copying {len(manifest)} bg-removed images...")
+    # 2. Copy bg-removed images (primary to images/, non-primary to SSD)
+    # Get is_primary status for all images in batch
+    conn = get_connection()
+    placeholders = ",".join(["(?,?)"] * len(manifest))
+    flat_ids = [x for lid, iid in manifest for x in (lid, iid)]
+    cursor = conn.execute(f"""
+        SELECT listing_id, image_id, is_primary
+        FROM image_status
+        WHERE (listing_id, image_id) IN ({placeholders})
+    """, flat_ids)
+    primary_lookup = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
+    conn.close()
+
+    primary_count = 0
+    nonprimary_count = 0
+    NONPRIMARY_DIR.mkdir(parents=True, exist_ok=True)
+
     for lid, iid in manifest:
         src = images_src / f"{lid}_{iid}.jpg"
         if src.exists():
-            dst = IMAGES_DIR / f"{lid}_{iid}.jpg"
+            is_primary = primary_lookup.get((lid, iid), 1)
+            if is_primary:
+                dst = IMAGES_DIR / f"{lid}_{iid}.jpg"
+                primary_count += 1
+            else:
+                dst = NONPRIMARY_DIR / f"{lid}_{iid}.jpg"
+                nonprimary_count += 1
             shutil.copy2(src, dst)
+
+    log(f"Copied {primary_count} primary to images/, {nonprimary_count} non-primary to SSD")
 
     # 3. Append to FAISS indexes
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -467,7 +491,7 @@ def get_worker_batch_path(worker: Worker, batch_name: str) -> str:
     if worker.host == 'localhost':
         return f"/Users/embed/imageselector/embed_exports/{batch_name}"
     elif worker.host == '192.168.68.117':
-        return f"E:/embed_work/imageselector/embed_exports/{batch_name}"
+        return f"C:/Users/embed/imageselector/embed_exports/{batch_name}"
     else:
         return f"{worker.work_dir}/embed_exports/{batch_name}"
 
@@ -477,7 +501,7 @@ def get_rsync_target(worker: Worker, batch_name: str) -> str:
     if worker.host == 'localhost':
         return f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}"
     elif worker.host == '192.168.68.117':
-        return f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
+        return f"{worker.user}@{worker.host}:/cygdrive/c/Users/embed/imageselector/embed_exports/{batch_name}"
     else:
         return f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
 
@@ -500,8 +524,9 @@ def start_worker_job(worker: Worker, batch_name: str) -> bool:
     worker_script = f"{worker.work_dir}/image_search_v2/embed_worker.py"
 
     if worker.host == '192.168.68.117':
-        # Windows - no nohup needed
-        remote_cmd = f'"{worker.python_path}" "{worker_script}" --input "{batch_path}"'
+        # Windows - run Python directly (SSH session stays open in local background via Popen)
+        # start /B via SSH is unreliable; running directly works
+        remote_cmd = f'cd /d "{worker.work_dir}\\image_search_v2" && "{worker.python_path}" embed_worker.py --input "{batch_path}"'
     else:
         # Mac - use nohup to keep process running after SSH exits
         remote_cmd = f'nohup {worker.python_path} {worker_script} --input {batch_path} > /dev/null 2>&1 &'
@@ -509,7 +534,7 @@ def start_worker_job(worker: Worker, batch_name: str) -> bool:
     ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
     ssh_cmd = ['ssh', f'{worker.user}@{ssh_host}', remote_cmd]
 
-    # Start non-blocking
+    # Start non-blocking (SSH runs in background, stays connected until command completes)
     subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
@@ -550,13 +575,57 @@ def cleanup_worker_batch(worker: Worker, batch_name: str):
 
     if worker.host == '192.168.68.117':
         # Windows
-        win_path = f"E:\\embed_work\\imageselector\\embed_exports\\{batch_name}"
+        win_path = f"C:\\Users\\embed\\imageselector\\embed_exports\\{batch_name}"
         cmd = ['ssh', f'{worker.user}@{ssh_host}', f'cmd /c rmdir /s /q "{win_path}"']
     else:
         remote_path = get_worker_batch_path(worker, batch_name)
         cmd = ['ssh', f'{worker.user}@{ssh_host}', f'rm -rf {remote_path}']
 
     subprocess.run(cmd, capture_output=True, timeout=60)
+
+
+def kill_worker_processes(worker: Worker) -> bool:
+    """Kill any running embed_worker processes on a worker."""
+    ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
+
+    try:
+        if worker.host == '192.168.68.117':
+            # Windows - kill Python processes running embed_worker
+            # wmic is flaky via SSH, use taskkill with image name
+            # This will kill ALL python.exe processes for the user
+            cmd = ['ssh', f'{worker.user}@{ssh_host}',
+                   'taskkill /F /IM python.exe 2>nul || echo no_process']
+        else:
+            # Mac - kill only embed_worker processes for this user
+            cmd = ['ssh', f'{worker.user}@{ssh_host}',
+                   'pkill -f embed_worker.py 2>/dev/null || true']
+
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        return True
+    except Exception as e:
+        log(f"  Warning: Could not kill processes on {worker.name}: {e}")
+        return False
+
+
+def clear_worker_exports(worker: Worker) -> bool:
+    """Clear all batch directories on a worker."""
+    ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
+
+    try:
+        if worker.host == '192.168.68.117':
+            # Windows - delete all batch_* dirs
+            cmd = ['ssh', f'{worker.user}@{ssh_host}',
+                   'for /d %i in (C:\\Users\\embed\\imageselector\\embed_exports\\batch_*) do rmdir /s /q "%i"']
+        else:
+            # Mac
+            cmd = ['ssh', f'{worker.user}@{ssh_host}',
+                   f'rm -rf {worker.work_dir}/embed_exports/batch_*']
+
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        return True
+    except Exception as e:
+        log(f"  Warning: Could not clear exports on {worker.name}: {e}")
+        return False
 
 
 # ============================================================
@@ -578,23 +647,12 @@ def main():
     EXPORTS_DIR.mkdir(exist_ok=True)
     EMBEDDINGS_DIR.mkdir(exist_ok=True)
 
-    # Clear leftover batches on all workers
-    log("Clearing worker batch directories...")
+    # Kill any running worker processes and clear batch directories
+    log("Cleaning up workers (killing processes + clearing batches)...")
     for name, worker in WORKERS.items():
-        try:
-            ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
-            if worker.host == '192.168.68.117':
-                # Windows
-                cmd = ['ssh', f'{worker.user}@{ssh_host}',
-                       'for /d %i in (E:\\embed_work\\imageselector\\embed_exports\\batch_*) do rmdir /s /q "%i"']
-            else:
-                # Mac
-                cmd = ['ssh', f'{worker.user}@{ssh_host}',
-                       f'rm -rf {worker.work_dir}/embed_exports/batch_*']
-            subprocess.run(cmd, capture_output=True, timeout=30)
-            log(f"  Cleared {name}")
-        except Exception as e:
-            log(f"  Warning: Could not clear {name}: {e}")
+        kill_worker_processes(worker)
+        clear_worker_exports(worker)
+        log(f"  Cleaned {name}")
 
     log("=" * 60)
     log("ORCHESTRATOR STARTED")
@@ -636,13 +694,10 @@ def main():
                     update_qps_config(limits)
                 last_qps_check = now
 
-            # Backup every 6 hours
+            # Backup every 6 hours (uses SQLite backup API - safe for concurrent access)
             if now - last_backup > BACKUP_INTERVAL:
                 log("Starting 6-hour backup...")
-                stop_data_scripts()
-                time.sleep(5)
                 do_backup()
-                start_data_scripts()
                 last_backup = now
 
             # Check each worker

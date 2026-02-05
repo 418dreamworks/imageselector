@@ -16,22 +16,12 @@ BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_CLEANUP"
 
-# Backup location for embedded images on HDD
-BACKUP_DIR = Path("/Volumes/HDD_1000/embedded_backup/images")
+# Backup location for non-primary images on external SSD
+BACKUP_DIR = Path("/Volumes/SSD_120/nonprimaryimages")
 
 # Add parent to path for imports
 sys.path.insert(0, str(BASE_DIR))
 from image_db import get_connection
-
-# All embedding models that must be complete before cleanup
-EMBED_MODELS = [
-    "clip_vitb32",
-    "clip_vitl14",
-    "dinov2_base",
-    "dinov2_large",
-    "dinov3_base",
-]
-
 
 def check_kill_file() -> bool:
     """Check if kill file exists."""
@@ -43,29 +33,15 @@ def check_kill_file() -> bool:
 
 
 def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
-    """Find non-primary images where listing has all embeddings complete.
+    """Find non-primary images that have been embedded (faiss_row IS NOT NULL).
 
-    Returns images that can be moved (non-primary, fully embedded).
+    Returns images that can be moved to backup.
     """
-    # Find non-primary images from listings where ALL images are fully embedded
     query = """
-        SELECT i.listing_id, i.image_id
-        FROM image_status i
-        WHERE i.is_primary = 0
-          AND i.embed_clip_vitb32 = 1
-          AND i.embed_clip_vitl14 = 1
-          AND i.embed_dinov2_base = 1
-          AND i.embed_dinov2_large = 1
-          AND i.embed_dinov3_base = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM image_status i2
-              WHERE i2.listing_id = i.listing_id
-                AND (i2.embed_clip_vitb32 = 0
-                     OR i2.embed_clip_vitl14 = 0
-                     OR i2.embed_dinov2_base = 0
-                     OR i2.embed_dinov2_large = 0
-                     OR i2.embed_dinov3_base = 0)
-          )
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE is_primary = 0
+          AND faiss_row IS NOT NULL
         LIMIT ?
     """
 
