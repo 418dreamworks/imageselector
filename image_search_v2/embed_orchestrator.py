@@ -426,7 +426,12 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
 
 
 def import_batch(batch_dir: Path) -> int:
-    """Import batch: copy bg-removed images, append FAISS, update DB faiss_row."""
+    """Import batch: copy bg-removed images, append FAISS, update DB faiss_row.
+
+    IMPORTANT: This function is atomic - once started, it must complete.
+    Do NOT add kill file checks inside this function.
+    If interrupted, consistency check will catch the mismatch on next startup.
+    """
     import numpy as np
     import faiss
 
@@ -701,6 +706,17 @@ def main():
     log("=" * 60)
     log("ORCHESTRATOR STARTED")
     log("=" * 60)
+
+    # CRITICAL: Check DB/FAISS consistency before doing any work
+    is_consistent, msg = check_db_faiss_consistency()
+    if not is_consistent:
+        log(f"FATAL: DB/FAISS inconsistent - {msg}")
+        log("Fix manually: either reset faiss_row to NULL and delete FAISS files,")
+        log("or restore from last consistent backup.")
+        release_lock()
+        return
+
+    log(f"Consistency check: {msg}")
     log(f"Workers: {list(WORKERS.keys())}")
     log("Stop with: touch KILL_ORCH")
 
