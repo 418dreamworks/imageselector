@@ -195,8 +195,9 @@ def main():
     # Setup output
     args.output.mkdir(parents=True, exist_ok=True)
 
-    # Copy manifest to output (for verification during import)
-    shutil.copy(args.input / "manifest.json", args.output / "manifest.json")
+    # Copy manifest to output (for verification during import) - skip if same dir
+    if args.input.resolve() != args.output.resolve():
+        shutil.copy(args.input / "manifest.json", args.output / "manifest.json")
 
     # Determine models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]

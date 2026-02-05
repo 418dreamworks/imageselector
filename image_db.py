@@ -77,20 +77,16 @@ def insert_image(
     conn: sqlite3.Connection,
     listing_id: int,
     image_id: int,
-    shop_id: int,
     hex_val: str,
     suffix: str,
     is_primary: bool,
-    when_made: str,
-    price: float = None,
-    to_download: bool = True,
 ):
     """Insert a new image. Used by sync_data.py when discovering new images."""
     conn.execute("""
         INSERT OR IGNORE INTO image_status (
-            listing_id, image_id, shop_id, hex, suffix, is_primary, when_made, price, to_download
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (listing_id, image_id, shop_id, hex_val, suffix, int(is_primary), when_made, price, int(to_download)))
+            listing_id, image_id, hex, suffix, is_primary
+        ) VALUES (?, ?, ?, ?, ?)
+    """, (listing_id, image_id, hex_val, suffix, int(is_primary)))
 
 
 # ============================================================
@@ -144,7 +140,7 @@ def get_images_to_download(conn: sqlite3.Connection, limit: int = 1000) -> list[
     cursor = conn.execute("""
         SELECT listing_id, image_id, hex, suffix
         FROM image_status
-        WHERE to_download = 1 AND download_done = 0
+        WHERE download_done = 0
         LIMIT ?
     """, (limit,))
     return [dict(row) for row in cursor.fetchall()]
@@ -260,9 +256,6 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     cursor.execute("SELECT COUNT(*) FROM image_status")
     stats["total"] = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM image_status WHERE to_download = 1")
-    stats["to_download"] = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM image_status WHERE download_done = 1")
     stats["download_done"] = cursor.fetchone()[0]
 
@@ -283,7 +276,6 @@ def print_stats():
     conn.close()
 
     print(f"Total images:      {stats['total']:,}")
-    print(f"To download:       {stats['to_download']:,}")
     print(f"Download done:     {stats['download_done']:,}")
     print(f"BG removed:        {stats['bg_removed']:,}")
     print(f"Embedded clip32:   {stats['embed_clip_vitb32']:,}")

@@ -191,10 +191,14 @@ def save_faiss_index(index, path: Path):
         raise
 
 
-def validate_results(results_dir: Path) -> tuple[list, dict]:
+def validate_results(results_dir: Path, required_models: list = None) -> tuple[list, dict, list]:
     """Validate worker results before importing.
 
-    Returns (manifest, numpy_files) if valid, raises exception if not.
+    Args:
+        results_dir: Directory containing worker output
+        required_models: List of model keys to expect. If None, accepts any models present.
+
+    Returns (manifest, numpy_files, models_found) if valid, raises exception if not.
     """
     # Check manifest exists
     manifest_file = results_dir / "manifest.json"
@@ -208,12 +212,29 @@ def validate_results(results_dir: Path) -> tuple[list, dict]:
     expected_count = len(manifest)
     print(f"Manifest: {expected_count} images")
 
-    # Check numpy files
+    # Check which models to validate
+    if required_models:
+        models_to_check = {k: MODELS[k] for k in required_models if k in MODELS}
+    else:
+        # Auto-detect which models are present
+        models_to_check = {}
+        for model_key, info in MODELS.items():
+            if (results_dir / f"{model_key}.npy").exists():
+                models_to_check[model_key] = info
+
+    if not models_to_check:
+        raise ValueError("No model .npy files found")
+
+    # Validate numpy files
     numpy_files = {}
-    for model_key, info in MODELS.items():
+    models_found = []
+
+    for model_key, info in models_to_check.items():
         npy_file = results_dir / f"{model_key}.npy"
         if not npy_file.exists():
-            raise ValueError(f"Missing {model_key}.npy")
+            if required_models:
+                raise ValueError(f"Missing {model_key}.npy")
+            continue
 
         arr = np.load(npy_file)
         if arr.shape[0] != expected_count:
@@ -226,24 +247,22 @@ def validate_results(results_dir: Path) -> tuple[list, dict]:
             )
 
         numpy_files[model_key] = arr
+        models_found.append(model_key)
 
         # Check text embeddings for CLIP
         if info["has_text"]:
             text_file = results_dir / f"{model_key}_text.npy"
-            if not text_file.exists():
-                raise ValueError(f"Missing {model_key}_text.npy")
-
-            text_arr = np.load(text_file)
-            if text_arr.shape[0] != expected_count:
-                raise ValueError(
-                    f"{model_key}_text.npy has {text_arr.shape[0]} rows, expected {expected_count}"
-                )
-
-            numpy_files[f"{model_key}_text"] = text_arr
+            if text_file.exists():
+                text_arr = np.load(text_file)
+                if text_arr.shape[0] != expected_count:
+                    raise ValueError(
+                        f"{model_key}_text.npy has {text_arr.shape[0]} rows, expected {expected_count}"
+                    )
+                numpy_files[f"{model_key}_text"] = text_arr
 
         print(f"  {model_key}: OK ({arr.shape})")
 
-    return manifest, numpy_files
+    return manifest, numpy_files, models_found
 
 
 def cmd_import(args):
@@ -254,23 +273,26 @@ def cmd_import(args):
         print(f"ERROR: Results directory not found: {results_dir}")
         return 1
 
+    # Parse models if specified
+    required_models = args.models.split(',') if hasattr(args, 'models') and args.models else None
+
     # Validate results
     print("Validating results...")
     try:
-        manifest, numpy_files = validate_results(results_dir)
+        manifest, numpy_files, models_found = validate_results(results_dir, required_models)
     except ValueError as e:
         print(f"ERROR: Validation failed: {e}")
         return 1
 
-    print("Validation passed!")
+    print(f"Validation passed! Models: {models_found}")
 
     if args.dry_run:
         print("\n[DRY RUN] Would import:")
         print(f"  Images: {len(manifest)}")
-        print(f"  Models: {list(MODELS.keys())}")
+        print(f"  Models: {models_found}")
         return 0
 
-    # Load existing image index
+    # Load shared image index
     if IMAGE_INDEX_FILE.exists():
         existing_index = json.loads(IMAGE_INDEX_FILE.read_text())
     else:
@@ -278,25 +300,20 @@ def cmd_import(args):
 
     existing_set = set(tuple(x) for x in existing_index)
 
-    # Check for duplicates
-    new_images = [img for img in manifest if tuple(img) not in existing_set]
-    if len(new_images) != len(manifest):
-        dup_count = len(manifest) - len(new_images)
-        print(f"WARNING: {dup_count} images already in index, skipping them")
-
-        if not new_images:
-            print("All images already imported, nothing to do")
-            return 0
-
-    print(f"\nImporting {len(new_images)} new images...")
-
-    # Filter numpy arrays to only new images
+    # Find new images (not in shared index)
     new_indices = [i for i, img in enumerate(manifest) if tuple(img) not in existing_set]
+
+    if not new_indices:
+        print("All images already in index, nothing to do")
+        return 0
+
+    print(f"\nImporting {len(new_indices)} new images for models: {models_found}")
 
     # Append to FAISS indexes
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for model_key, info in MODELS.items():
+    for model_key in models_found:
+        info = MODELS[model_key]
         faiss_file = EMBEDDINGS_DIR / f"{model_key}.faiss"
 
         # Load or create index
@@ -312,10 +329,10 @@ def cmd_import(args):
         index.add(new_emb)
 
         save_faiss_index(index, faiss_file)
-        print(f"  {model_key}: added {len(new_emb)} vectors (total: {index.ntotal})")
+        print(f"  {model_key}: added {len(new_indices)} vectors (total: {index.ntotal})")
 
         # Handle text embeddings
-        if info["has_text"]:
+        if info["has_text"] and f"{model_key}_text" in numpy_files:
             text_file = EMBEDDINGS_DIR / f"{model_key}_text.faiss"
             text_index = load_faiss_index(text_file)
             if text_index is None:
@@ -325,14 +342,14 @@ def cmd_import(args):
             text_index.add(new_text_emb)
             save_faiss_index(text_index, text_file)
 
-    # Update image index
+    # Update shared image index
     for i in new_indices:
         existing_index.append(manifest[i])
 
-    # Save image index atomically
+    # Save index atomically
     import tempfile
-    temp_fd, temp_path = tempfile.mkstemp(dir=EMBEDDINGS_DIR, suffix='.json.tmp')
     import os
+    temp_fd, temp_path = tempfile.mkstemp(dir=EMBEDDINGS_DIR, suffix='.json.tmp')
     os.close(temp_fd)
     try:
         with open(temp_path, 'w') as f:
@@ -345,19 +362,27 @@ def cmd_import(args):
 
     print(f"  image_index.json: {len(existing_index)} total entries")
 
-    # Update DB flags
+    # Update DB flags for each model separately
     print("Updating database flags...")
     conn = get_connection()
-    for i in new_indices:
-        lid, iid = manifest[i]
-        for model_key in MODELS:
-            mark_embedded(conn, lid, iid, model_key)
+
+    for model_key in models_found:
+        index_file = get_model_index_file(model_key)
+        if index_file.exists():
+            model_index = json.loads(index_file.read_text())
+            existing_set = set(tuple(x) for x in model_index)
+
+            # Mark all images that are now in this model's index
+            for img in manifest:
+                if tuple(img) in existing_set:
+                    lid, iid = img
+                    mark_embedded(conn, lid, iid, model_key)
+
     commit_with_retry(conn)
     conn.close()
 
     print(f"\nImport complete!")
-    print(f"  New images: {len(new_indices)}")
-    print(f"  Total in index: {len(existing_index)}")
+    print(f"  Total new embeddings added: {total_added}")
 
     return 0
 
@@ -453,6 +478,10 @@ def main():
     import_parser.add_argument(
         "--results-dir", required=True,
         help="Directory containing worker results"
+    )
+    import_parser.add_argument(
+        "--models",
+        help="Comma-separated list of models to import (default: auto-detect)"
     )
     import_parser.add_argument(
         "--dry-run", action="store_true",
