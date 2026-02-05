@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
 """Image downloader with manager/worker architecture.
 
-Manager:
-- Scans SQL for images where download_done=0
-- Checks if file exists on disk
-- If missing, creates marker file: {listing_id}_{image_id}.dl with URL inside
-- When real file detected (non-empty jpg), sets download_done=1
+Manager (main thread):
+- Fetches images where download_done=0, groups by listing_id
+- Calls /application/listings/batch?includes=Images to get URLs
+- Writes .dl marker files with URLs, then marks download_done=1
+- Checks for completed jpgs (>1kb), marks download_done=2, cleans up .dl files
 
-Worker:
-- Finds .dl marker files
-- Downloads the image
-- Saves as .jpg, removes .dl file
-- If killed mid-download, no problem - manager recreates marker
+Workers (4 threads, partitioned):
+- Each worker handles files where first_5_digits % 4 == worker_id
+- Reads URL from marker, downloads image, saves jpg, deletes marker
 
-Completely decoupled from sync_data.py.
+Kill file: touch KILL_DL to stop gracefully.
 """
-import argparse
 import os
 import sys
 import threading
 import time
 from pathlib import Path
+from collections import defaultdict
 
 import urllib.request
 import urllib.error
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_DL"
+NUM_WORKERS = 4
+
+ETSY_API_KEY = os.getenv("ETSY_API_KEY")
+BASE_URL = "https://openapi.etsy.com/v3"
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR))
-from image_db import (
-    get_connection, get_images_to_download, mark_download_done,
-    build_cdn_url, commit_with_retry
-)
+from image_db import get_connection, commit_with_retry
 
 
 def ts():
@@ -42,67 +45,193 @@ def ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def check_kill_file() -> bool:
-    """Check for kill file. Delete if found and return True."""
+def get_worker_kill_file(worker_id: int) -> Path:
+    return BASE_DIR / f"KILL_DL_{worker_id}"
+
+
+def check_manager_kill_file() -> bool:
+    """Check for kill file. If found, create worker kill files and return True."""
     if KILL_FILE.exists():
+        print(f"\n[{ts()}] Kill file detected. Notifying workers...")
+        for i in range(NUM_WORKERS):
+            get_worker_kill_file(i).touch()
         KILL_FILE.unlink()
-        print(f"\n[{ts()}] Kill file detected. Stopping...")
+        return True
+    return False
+
+
+def check_worker_kill_file(worker_id: int) -> bool:
+    """Check for worker-specific kill file. Delete if found and return True."""
+    kill_file = get_worker_kill_file(worker_id)
+    if kill_file.exists():
+        kill_file.unlink()
         return True
     return False
 
 
 # ============================================================
-# MANAGER - Creates marker files, updates SQL when done
+# MANAGER - Fetches URLs via API, creates markers, updates SQL
 # ============================================================
 
 def get_marker_path(listing_id: int, image_id: int) -> Path:
-    """Get path for download marker file."""
     return IMAGES_DIR / f"{listing_id}_{image_id}.dl"
 
 
 def get_image_path(listing_id: int, image_id: int) -> Path:
-    """Get path for actual image file."""
     return IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
 
 
-def manager_scan(batch_size: int = 1000) -> dict:
-    """Scan for images needing download, create markers, update completed.
+def get_images_needing_download(conn, max_listings: int = 100) -> list[dict]:
+    """Get images where download_done=0, limited to max_listings unique listings."""
+    cursor = conn.execute("""
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE download_done = 0
+        AND listing_id IN (
+            SELECT DISTINCT listing_id FROM image_status
+            WHERE download_done = 0
+            LIMIT ?
+        )
+    """, (max_listings,))
+    return [{"listing_id": row[0], "image_id": row[1]} for row in cursor.fetchall()]
 
-    Returns stats dict.
+
+def get_images_in_progress(conn, limit: int = 5000) -> list[dict]:
+    """Get images where download_done=1 (marker created, download in progress)."""
+    cursor = conn.execute("""
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE download_done = 1
+        LIMIT ?
+    """, (limit,))
+    return [{"listing_id": row[0], "image_id": row[1]} for row in cursor.fetchall()]
+
+
+def fetch_listing_images(listing_ids: list[int]) -> dict[int, dict[int, str]]:
+    """Fetch image URLs for multiple listings via /application/listings/batch.
+
+    Args:
+        listing_ids: List of listing IDs to fetch
+
+    Returns:
+        Dict mapping listing_id -> {image_id: url_570xN, ...}
     """
-    stats = {"markers_created": 0, "completed": 0, "already_done": 0}
+    if not listing_ids:
+        return {}
+
+    result = {}
+    headers = {"x-api-key": ETSY_API_KEY}
+
+    # Etsy batch endpoint accepts up to 100 listing IDs
+    for i in range(0, len(listing_ids), 100):
+        batch = listing_ids[i:i + 100]
+        ids_param = ",".join(str(lid) for lid in batch)
+
+        url = f"{BASE_URL}/application/listings/batch?listing_ids={ids_param}&includes=Images"
+
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            print(f"[{ts()}] API error: {e}")
+            continue
+
+        # Parse response
+        for listing in data.get("results", []):
+            lid = listing.get("listing_id")
+            images = listing.get("images", [])
+
+            if lid and images:
+                result[lid] = {}
+                for img in images:
+                    iid = img.get("listing_image_id")
+                    img_url = img.get("url_570xN")
+                    if iid and img_url:
+                        result[lid][iid] = img_url
+
+        # Rate limit
+        time.sleep(0.2)
+
+    return result
+
+
+def manager_scan() -> dict:
+    """
+    1. Check in-progress images (download_done=1) - if jpg exists, mark as 2
+    2. Fetch new images (download_done=0) - get URLs, write markers, mark as 1
+    """
+    stats = {"completed": 0, "markers_created": 0, "api_fetched": 0, "skipped": 0}
 
     conn = get_connection()
-    images = get_images_to_download(conn, limit=batch_size)
 
-    for img in images:
-        lid = img["listing_id"]
-        iid = img["image_id"]
-        hex_val = img["hex"]
-        suffix = img["suffix"]
+    # --- Phase 1: Check in-progress images for completion ---
+    in_progress = get_images_in_progress(conn)
 
+    for img in in_progress:
+        lid, iid = img["listing_id"], img["image_id"]
         img_path = get_image_path(lid, iid)
         marker_path = get_marker_path(lid, iid)
 
-        # Check if real image exists and has content
         if img_path.exists() and img_path.stat().st_size > 1000:
-            # Image is complete - mark as done in SQL
-            mark_download_done(conn, lid, iid)
+            # Image complete - mark as done
+            conn.execute("""
+                UPDATE image_status SET download_done = 2
+                WHERE listing_id = ? AND image_id = ? AND download_done = 1
+            """, (lid, iid))
             stats["completed"] += 1
-            # Remove any stale marker
+
+            # Clean up marker if it exists
             if marker_path.exists():
-                marker_path.unlink()
-        elif not marker_path.exists():
-            # No image, no marker - create marker with URL
-            url = build_cdn_url(hex_val, iid, suffix)
-            marker_path.write_text(url)
-            stats["markers_created"] += 1
-        else:
-            stats["already_done"] += 1
+                try:
+                    marker_path.unlink()
+                except FileNotFoundError:
+                    pass
 
-    commit_with_retry(conn)
+    if stats["completed"] > 0:
+        commit_with_retry(conn)
+
+    # --- Phase 2: Fetch URLs for new images, create markers ---
+    new_images = get_images_needing_download(conn, max_listings=100)
+
+    if new_images:
+        # Group by listing_id
+        by_listing = defaultdict(list)
+        for img in new_images:
+            by_listing[img["listing_id"]].append(img["image_id"])
+
+        # Fetch URLs from API
+        listing_ids = list(by_listing.keys())
+        url_data = fetch_listing_images(listing_ids)
+        stats["api_fetched"] = len(url_data)
+
+        # Step 1: Write ALL marker files first
+        markers_written = []
+        for lid, image_ids in by_listing.items():
+            listing_urls = url_data.get(lid, {})
+
+            for iid in image_ids:
+                url = listing_urls.get(iid)
+                marker_path = get_marker_path(lid, iid)
+
+                if url:
+                    marker_path.write_text(url)
+                    markers_written.append((lid, iid))
+                    stats["markers_created"] += 1
+                else:
+                    stats["skipped"] += 1
+
+        # Step 2: Batch update DB flags AFTER all markers written
+        for lid, iid in markers_written:
+            conn.execute("""
+                UPDATE image_status SET download_done = 1
+                WHERE listing_id = ? AND image_id = ? AND download_done = 0
+            """, (lid, iid))
+
+        commit_with_retry(conn)
+
     conn.close()
-
     return stats
 
 
@@ -110,13 +239,21 @@ def manager_scan(batch_size: int = 1000) -> dict:
 # WORKER - Downloads from marker files
 # ============================================================
 
+def get_file_partition(filename: str) -> int:
+    """Get partition number from filename using first 5 digits."""
+    digits = ''.join(c for c in filename if c.isdigit())
+    if len(digits) < 5:
+        digits = digits.zfill(5)
+    return int(digits[:5]) % NUM_WORKERS
+
+
 def download_one(marker_path: Path) -> bool:
     """Download image from marker file.
 
     1. Read URL from marker
-    2. Delete marker (claim the job)
-    3. Download image
-    4. Save as .jpg
+    2. Download image
+    3. Save as .jpg
+    4. Delete marker
 
     Returns True on success.
     """
@@ -127,17 +264,13 @@ def download_one(marker_path: Path) -> bool:
             return False
 
         # Parse listing_id and image_id from filename
-        # Format: {listing_id}_{image_id}.dl
         stem = marker_path.stem  # e.g., "123456_789012"
         parts = stem.split("_")
         if len(parts) != 2:
             return False
 
-        listing_id, image_id = parts
+        listing_id, image_id = int(parts[0]), int(parts[1])
         img_path = IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
-
-        # Delete marker (claim the job)
-        marker_path.unlink()
 
         # Download
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -146,172 +279,101 @@ def download_one(marker_path: Path) -> bool:
 
         # Save image
         img_path.write_bytes(data)
+
+        # Delete marker only after successful save
+        try:
+            marker_path.unlink()
+        except FileNotFoundError:
+            pass
+
         return True
 
     except FileNotFoundError:
-        # Another worker claimed it
         return False
-    except Exception as e:
-        # Download failed - recreate marker so manager can retry
+    except Exception:
+        # Download failed - leave marker for retry
+        return False
+
+
+def worker_loop(worker_id: int):
+    """Worker loop - find and process marker files for this partition."""
+    print(f"[{ts()}] Worker {worker_id} started")
+
+    while not check_worker_kill_file(worker_id):
+        # Find marker files for this worker's partition
         try:
-            if not marker_path.exists():
-                marker_path.write_text(url)
-        except:
-            pass
-        return False
-
-
-def worker_loop(rate_limit: float = 10.0):
-    """Worker loop - find and process marker files."""
-    min_interval = 1.0 / rate_limit
-    last_download = 0.0
-
-    while not check_kill_file():
-        # Find marker files
-        markers = list(IMAGES_DIR.glob("*.dl"))
+            markers = [m for m in IMAGES_DIR.glob("*.dl")
+                       if get_file_partition(m.name) == worker_id]
+        except Exception:
+            markers = []
 
         if not markers:
             time.sleep(1)
             continue
 
         for marker_path in markers:
-            if check_kill_file():
+            if check_worker_kill_file(worker_id):
                 return
 
-            # Rate limit
-            elapsed = time.time() - last_download
-            if elapsed < min_interval:
-                time.sleep(min_interval - elapsed)
-
             success = download_one(marker_path)
-            last_download = time.time()
-
             if success:
                 print(".", end="", flush=True)
 
+            # Small delay between downloads
+            time.sleep(0.05)
 
-def run_workers(num_workers: int = 4, rate_limit: float = 10.0):
-    """Run multiple worker threads."""
-    print(f"[{ts()}] Starting {num_workers} workers (rate limit: {rate_limit}/s)")
-    print("Stop with: touch KILL_DL")
-
-    threads = []
-    for _ in range(num_workers):
-        t = threading.Thread(target=worker_loop, args=(rate_limit / num_workers,))
-        t.start()
-        threads.append(t)
-
-    # Wait for all workers
-    for t in threads:
-        t.join()
-
-    print(f"\n[{ts()}] Workers stopped")
+    print(f"\n[{ts()}] Worker {worker_id} stopped")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def run_once(batch_size: int = 1000, num_workers: int = 4, rate_limit: float = 10.0):
-    """Run one cycle: manager scan + worker downloads."""
-    IMAGES_DIR.mkdir(exist_ok=True)
-
-    # Manager: create markers, update completed
-    print(f"[{ts()}] Manager scanning...")
-    stats = manager_scan(batch_size)
-    print(f"  Markers created: {stats['markers_created']}")
-    print(f"  Completed (file exists): {stats['completed']}")
-
-    if stats["markers_created"] == 0:
-        print("Nothing to download")
-        return
-
-    # Workers: download from markers
-    run_workers(num_workers, rate_limit)
-
-    # Final manager scan to mark completed
-    print(f"\n[{ts()}] Final scan...")
-    stats = manager_scan(batch_size)
-    print(f"  Newly completed: {stats['completed']}")
-
-
-def watch_mode(batch_size: int = 1000, num_workers: int = 4, rate_limit: float = 10.0, interval: int = 30):
-    """Watch mode - continuously scan and download."""
-    IMAGES_DIR.mkdir(exist_ok=True)
-
-    print(f"[{ts()}] Watch mode: batch={batch_size}, workers={num_workers}, rate={rate_limit}/s")
-    print("Stop with: touch KILL_DL")
-
-    while not check_kill_file():
-        # Manager scan
-        stats = manager_scan(batch_size)
-
-        if stats["markers_created"] > 0:
-            print(f"\n[{ts()}] Created {stats['markers_created']} markers, completed {stats['completed']}")
-
-            # Run workers until all markers processed
-            while True:
-                markers = list(IMAGES_DIR.glob("*.dl"))
-                if not markers or check_kill_file():
-                    break
-
-                # Process one batch
-                for marker_path in markers[:100]:
-                    if check_kill_file():
-                        break
-                    download_one(marker_path)
-                    print(".", end="", flush=True)
-                    time.sleep(1.0 / rate_limit)
-
-            # Mark completed
-            stats = manager_scan(batch_size)
-            print(f"\n  Completed: {stats['completed']}")
-        else:
-            print(".", end="", flush=True)
-            time.sleep(interval)
-
-
-def show_stats():
-    """Show current download stats."""
-    conn = get_connection()
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM image_status WHERE to_download = 1")
-    to_dl = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM image_status WHERE download_done = 1")
-    done = cursor.fetchone()[0]
-
-    conn.close()
-
-    # Count marker files
-    IMAGES_DIR.mkdir(exist_ok=True)
-    markers = len(list(IMAGES_DIR.glob("*.dl")))
-
-    print(f"To download:    {to_dl:,}")
-    print(f"Downloaded:     {done:,}")
-    print(f"Pending:        {to_dl - done:,}")
-    print(f"Marker files:   {markers:,}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Download images with manager/worker architecture")
-    parser.add_argument("--watch", action="store_true", help="Watch mode - run continuously")
-    parser.add_argument("--batch-size", type=int, default=1000, help="Images per manager scan")
-    parser.add_argument("--workers", type=int, default=4, help="Number of download workers")
-    parser.add_argument("--rate", type=float, default=10.0, help="Downloads per second")
-    parser.add_argument("--interval", type=int, default=30, help="Watch mode scan interval")
-    parser.add_argument("--stats", action="store_true", help="Show current stats")
-    args = parser.parse_args()
+    IMAGES_DIR.mkdir(exist_ok=True)
 
-    if args.stats:
-        show_stats()
-        return
+    if not ETSY_API_KEY:
+        print("ERROR: ETSY_API_KEY not set in environment")
+        sys.exit(1)
 
-    if args.watch:
-        watch_mode(args.batch_size, args.workers, args.rate, args.interval)
-    else:
-        run_once(args.batch_size, args.workers, args.rate)
+    print(f"{'='*60}")
+    print(f"IMAGE DOWNLOADER")
+    print(f"{'='*60}")
+    print(f"Workers: {NUM_WORKERS}")
+    print(f"Stop with: touch KILL_DL")
+    print(f"{'='*60}")
+
+    # Start worker threads
+    threads = []
+    for i in range(NUM_WORKERS):
+        t = threading.Thread(target=worker_loop, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Manager loop
+    scan_interval = 30
+    last_scan = 0
+
+    while not check_manager_kill_file():
+        now = time.time()
+
+        if now - last_scan >= scan_interval:
+            stats = manager_scan()
+            last_scan = now
+
+            if stats["markers_created"] > 0 or stats["completed"] > 0:
+                print(f"\n[{ts()}] Scan: markers={stats['markers_created']} "
+                      f"completed={stats['completed']} api={stats['api_fetched']} "
+                      f"skipped={stats['skipped']}")
+
+        time.sleep(1)
+
+    # Wait for workers to finish
+    print(f"[{ts()}] Waiting for workers to finish...")
+    for t in threads:
+        t.join(timeout=5)
+
+    print(f"\n[{ts()}] Downloader stopped")
 
 
 if __name__ == "__main__":

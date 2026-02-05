@@ -13,11 +13,10 @@ import sys
 import json
 import time
 import signal
-import re
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict
 from dotenv import load_dotenv
 import httpx
 
@@ -34,6 +33,7 @@ BASE_URL = "https://openapi.etsy.com/v3"
 API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
+ONE_MONTH = 30 * 24 * 3600
 
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "images"
@@ -76,18 +76,6 @@ def check_kill_file():
         print(f"[{ts()}] Kill file detected. Shutting down gracefully...")
         return True
     return False
-
-
-def extract_hex_suffix(url: str) -> Tuple[Optional[str], Optional[str]]:
-    match = re.search(r'/il/([a-f0-9]+)/(\d+)/il_[^.]+\.\d+_([a-z0-9]+)\.jpg', url)
-    if match:
-        return match.group(1), match.group(3)
-    return None, None
-
-
-def construct_image_url(hex_val: str, image_id: int, suffix: str) -> str:
-    """Reconstruct Etsy CDN URL from metadata components."""
-    return f"https://i.etsystatic.com/il/{hex_val}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
 
 
 # ─── Taxonomy Config ─────────────────────────────────────────────────────────
@@ -224,8 +212,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS image_status (
             listing_id INTEGER,
             image_id INTEGER,
-            hex TEXT,
-            suffix TEXT,
             is_primary INTEGER,
             download_done INTEGER DEFAULT 0,
             bg_removed INTEGER DEFAULT 0,
@@ -449,23 +435,6 @@ def fetch_shop(client, shop_id):
         return None
 
 
-def fetch_listings_batch(client, listing_ids):
-    """Fetch up to 100 listings via batch endpoint."""
-    time.sleep(get_api_delay())
-    try:
-        response = client.get(
-            f"{BASE_URL}/application/listings/batch",
-            headers={"x-api-key": ETSY_API_KEY},
-            params={"listing_ids": ",".join(str(lid) for lid in listing_ids)},
-        )
-        update_api_usage(response)
-        response.raise_for_status()
-        return response.json().get("results", [])
-    except Exception as e:
-        print(f"  Error fetching batch of {len(listing_ids)} listings: {e}")
-        return []
-
-
 def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     """Fetch reviews for a shop newer than last_timestamp."""
     reviews = []
@@ -530,11 +499,9 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
 
     for idx, img in enumerate(images):
         image_id = img.get("listing_image_id")
-        image_url = img.get("url_570xN", "")
-        hex_val, suffix = extract_hex_suffix(image_url)
         is_primary = (idx == 0)
 
-        insert_image(conn, listing_id, image_id, hex_val, suffix, is_primary)
+        insert_image(conn, listing_id, image_id, is_primary)
 
     if own_conn:
         commit_with_retry(conn)
@@ -548,7 +515,6 @@ def load_progress() -> dict:
         with open(PROGRESS_FILE) as f:
             return json.load(f)
     return {
-        "phase": "crawl",
         "crawl_unit_index": 0,
         "offset": 0,
         "exhausted": [],
@@ -574,7 +540,7 @@ signal.signal(signal.SIGTERM, _signal_handler)
 # ─── Phase 1-3: Taxonomy Crawl ──────────────────────────────────────────────
 
 def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
-                snapshot_ts, seen_in_crawl):
+                snapshot_ts):
 
     crawl_unit_index = progress.get("crawl_unit_index", 0)
     exhausted = set(progress.get("exhausted", []))
@@ -638,12 +604,19 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
         results = result
         total_count = error  # second return value is count when successful
 
-        if not results or offset >= MAX_OFFSET or offset + 100 >= total_count:
+        if offset >= MAX_OFFSET:
+            # Price categories should prevent this - error if it happens
+            raise RuntimeError(
+                f"FATAL: Offset {offset} hit 10k limit for {unit['name']}. "
+                f"Price breaks need to be narrower for this taxonomy."
+            )
+
+        if not results or offset + 100 >= total_count:
             if results:
                 # Process this last batch before marking exhausted
                 _process_crawl_batch(
                     results, conn, existing_listings, listing_last_ts,
-                    snapshot_ts, seen_in_crawl, stats
+                    snapshot_ts, stats
                 )
             exhausted.add(crawl_unit_index)
             print(f"  Exhausted: {unit['name']}")
@@ -661,7 +634,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
         # Process batch
         _process_crawl_batch(
             results, conn, existing_listings, listing_last_ts,
-            snapshot_ts, seen_in_crawl, stats
+            snapshot_ts, stats
         )
 
         offset += 100
@@ -675,15 +648,13 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
               f"dyn_upd={stats['existing_updated']} dyn_fresh={stats['skipped']} "
               f"API={_api_stats['used']}/{_api_stats['limit']}")
 
-    progress["phase"] = "shops"
-    save_progress(progress)
     print(f"\n[{ts()}] Crawl complete: {stats['new_with_images']} new+img, "
           f"{stats['new_no_images']} new-img, {stats['existing_updated']} dyn_upd, "
           f"{stats['skipped']} dyn_fresh")
 
 
 def _process_crawl_batch(results, conn, existing_listings, listing_last_ts,
-                         snapshot_ts, seen_in_crawl, stats):
+                         snapshot_ts, stats):
     """Process a batch of listings from the taxonomy crawl.
 
     For each listing:
@@ -693,7 +664,6 @@ def _process_crawl_batch(results, conn, existing_listings, listing_last_ts,
 
     for listing in results:
         lid = listing["listing_id"]
-        seen_in_crawl.add(lid)
 
         if lid in existing_listings:
             # Already known listing — update dynamic if > 1 week old
@@ -718,47 +688,6 @@ def _process_crawl_batch(results, conn, existing_listings, listing_last_ts,
                 stats["new_with_images"] += 1
             else:
                 stats["new_no_images"] += 1
-
-
-# ─── Phase 4: Mop-Up Pass ───────────────────────────────────────────────────
-
-def phase_mopup(client, conn, existing_listings, listing_last_ts, snapshot_ts, seen_in_crawl):
-
-    # Find listings in DB that were not seen in this crawl cycle
-    mopup_ids = [lid for lid in existing_listings if lid not in seen_in_crawl]
-
-    if not mopup_ids:
-        print(f"[{ts()}] Mop-up: nothing to do (all listings seen in crawl)")
-        return
-
-    print(f"[{ts()}] Mop-up: {len(mopup_ids)} listings not seen in crawl")
-
-    processed = 0
-    for batch_start in range(0, len(mopup_ids), 100):
-        if check_kill_file():
-            commit_with_retry(conn)
-            return
-
-        batch = mopup_ids[batch_start:batch_start + 100]
-        results = fetch_listings_batch(client, batch)
-
-        for listing in results:
-            lid = listing["listing_id"]
-
-            if lid not in existing_listings:
-                insert_listing_static(conn, listing, snapshot_ts)
-                insert_listing_dynamic(conn, listing, snapshot_ts)
-                existing_listings.add(lid)
-                listing_last_ts[lid] = snapshot_ts
-            elif snapshot_ts - listing_last_ts.get(lid, 0) > ONE_WEEK:
-                insert_listing_dynamic(conn, listing, snapshot_ts)
-                listing_last_ts[lid] = snapshot_ts
-
-        commit_with_retry(conn)
-        processed += len(batch)
-        print(f"  Mop-up: {processed}/{len(mopup_ids)}")
-
-    print(f"[{ts()}] Mop-up complete: {processed} listings processed")
 
 
 # ─── Phase: Shop Data ───────────────────────────────────────────────────────
@@ -841,48 +770,40 @@ def phase_shops(client, conn, snapshot_ts):
 
 # ─── Phase 5: Sync Check ────────────────────────────────────────────────────
 
-def phase_sync_check(conn, existing_listings):
-    """Check that downloaded images exist on disk."""
-    issues = []
-
-    # Check: images marked download_done=1 should exist on disk
-    cursor = conn.execute("""
-        SELECT listing_id, image_id FROM image_status
-        WHERE download_done = 1
-    """)
-    for row in cursor.fetchall():
-        lid, iid = row[0], row[1]
-        img_path = IMAGES_DIR / f"{lid}_{iid}.jpg"
-        if not img_path.exists() or img_path.stat().st_size == 0:
-            issues.append(f"Missing/empty image: {lid}_{iid}")
-
-    if issues:
-        print(f"\n[{ts()}] Sync check: {len(issues)} issues found")
-        for issue in issues[:20]:
-            print(f"  - {issue}")
-        if len(issues) > 20:
-            print(f"  ... and {len(issues) - 20} more")
-    else:
-        print(f"\n[{ts()}] Sync check: all data consistent")
-
-    return issues
-
-
 # ─── Phase: Reviews ───────────────────────────────────────────────────────
 
 def phase_reviews(client, conn, snapshot_ts):
     """Fetch reviews for shops with recent dynamic entries."""
-    cutoff_ts = snapshot_ts - ONE_WEEK
+    cutoff_ts = snapshot_ts - ONE_MONTH
 
-    # Get shop_ids with recent dynamic entries
+    # Get shop_ids with recent shops_dynamic entries
     cursor = conn.execute("""
         SELECT shop_id
         FROM shops_dynamic
         GROUP BY shop_id
         HAVING MAX(snapshot_timestamp) > ?
-        ORDER BY shop_id
     """, (cutoff_ts,))
-    shop_ids = [row[0] for row in cursor.fetchall()]
+    shops_with_recent_dynamic = set(row[0] for row in cursor.fetchall())
+    print(f"[{ts()}] Reviews: {len(shops_with_recent_dynamic)} shops with recent dynamic data")
+
+    # Get shop_ids that already have recent reviews
+    cursor = conn.execute("""
+        SELECT shop_id
+        FROM reviews
+        GROUP BY shop_id
+        HAVING MAX(create_timestamp) > ?
+    """, (cutoff_ts,))
+    shops_with_recent_reviews = set(row[0] for row in cursor.fetchall())
+    print(f"[{ts()}] Reviews: {len(shops_with_recent_reviews)} shops already have recent reviews")
+
+    # Only fetch for shops without recent reviews
+    shop_ids = list(shops_with_recent_dynamic - shops_with_recent_reviews)
+    print(f"[{ts()}] Reviews: {len(shop_ids)} shops need review fetching")
+
+    if not shop_ids:
+        # Reset progress for next cycle
+        save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []})
+        return
 
     last_review_ts = get_sync_state(conn, "last_review_timestamps", {})
     # Jan 1, 2000 as default
@@ -919,6 +840,9 @@ def phase_reviews(client, conn, snapshot_ts):
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
     print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops")
 
+    # Reset progress for next cycle
+    save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []})
+
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -950,61 +874,26 @@ def main():
     print(f"DB: {len(existing_listings)} listings")
 
     snapshot_ts = int(time.time())
-    seen_in_crawl = set()
-
-    current_phase = progress.get("phase", "crawl")
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        # Phase 1-3: Taxonomy crawl (listings + images)
-        if current_phase == "crawl":
-            print(f"\n--- Phase 1-3: Taxonomy Crawl ---")
-            phase_crawl(
-                client, conn, progress, existing_listings, listing_last_ts,
-                snapshot_ts, seen_in_crawl
-            )
-            current_phase = progress.get("phase", "crawl")
+        # Phase 1: Taxonomy crawl (listings + images)
+        print(f"\n--- Phase 1: Taxonomy Crawl ---")
+        phase_crawl(
+            client, conn, progress, existing_listings, listing_last_ts,
+            snapshot_ts
+        )
 
-        # Phase 4: Mop-up
-        if current_phase == "mopup":
-            print(f"\n--- Phase 4: Mop-Up ---")
-            phase_mopup(
-                client, conn, existing_listings, listing_last_ts,
-                snapshot_ts, seen_in_crawl
-            )
-            progress["phase"] = "shops"
-            save_progress(progress)
-            current_phase = "shops"
+        # Phase 2: Shops (stateless - skips shops with recent data)
+        print(f"\n--- Phase 2: Shops ---")
+        phase_shops(client, conn, snapshot_ts)
 
-        # Phase 5: Shops
-        if current_phase == "shops":
-            print(f"\n--- Phase 5: Shops ---")
-            phase_shops(client, conn, snapshot_ts)
-            progress["phase"] = "sync_check"
-            save_progress(progress)
-            current_phase = "sync_check"
-
-        # Phase 6: Sync check
-        if current_phase == "sync_check":
-            print(f"\n--- Phase 6: Sync Check ---")
-            phase_sync_check(conn, existing_listings)
-            progress["phase"] = "reviews"
-            save_progress(progress)
-            current_phase = "reviews"
-
-        # Phase 7: Reviews
-        if current_phase == "reviews":
-            print(f"\n--- Phase 7: Reviews ---")
-            phase_reviews(client, conn, snapshot_ts)
-            progress["phase"] = "complete"
-            save_progress(progress)
+        # Phase 3: Reviews (stateless - skips shops with recent reviews)
+        print(f"\n--- Phase 3: Reviews ---")
+        phase_reviews(client, conn, snapshot_ts)
 
     # Final save
     commit_with_retry(conn)
     conn.close()
-
-    # Reset progress for next cycle
-    progress = {"phase": "crawl", "crawl_unit_index": 0, "offset": 0, "exhausted": []}
-    save_progress(progress)
 
     print(f"\n{'='*60}")
     print(f"SYNC COMPLETE")

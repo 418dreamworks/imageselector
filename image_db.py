@@ -32,10 +32,6 @@ def _retry_on_lock(func):
                     raise
     return wrapper
 
-# CDN URL template for Etsy images (570xN size)
-CDN_URL_TEMPLATE = "https://i.etsystatic.com/il/{hex}/{image_id}/il_570xN.{image_id}_{suffix}.jpg"
-
-
 def get_connection() -> sqlite3.Connection:
     """Get a database connection with WAL mode for concurrent access."""
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
@@ -77,16 +73,14 @@ def insert_image(
     conn: sqlite3.Connection,
     listing_id: int,
     image_id: int,
-    hex_val: str,
-    suffix: str,
     is_primary: bool,
 ):
     """Insert a new image. Used by sync_data.py when discovering new images."""
     conn.execute("""
         INSERT OR IGNORE INTO image_status (
-            listing_id, image_id, hex, suffix, is_primary
-        ) VALUES (?, ?, ?, ?, ?)
-    """, (listing_id, image_id, hex_val, suffix, int(is_primary)))
+            listing_id, image_id, is_primary
+        ) VALUES (?, ?, ?)
+    """, (listing_id, image_id, int(is_primary)))
 
 
 # ============================================================
@@ -135,23 +129,12 @@ def mark_embedded(conn: sqlite3.Connection, listing_id: int, image_id: int, mode
 # QUERY WORK QUEUES (each script queries its own)
 # ============================================================
 
-def get_images_to_download(conn: sqlite3.Connection, limit: int = 1000) -> list[dict]:
-    """Get images that need downloading."""
-    cursor = conn.execute("""
-        SELECT listing_id, image_id, hex, suffix
-        FROM image_status
-        WHERE download_done = 0
-        LIMIT ?
-    """, (limit,))
-    return [dict(row) for row in cursor.fetchall()]
-
-
 def get_images_for_bg_removal(conn: sqlite3.Connection, limit: int = 1000) -> list[dict]:
-    """Get downloaded images that need background removal."""
+    """Get downloaded images that need background removal (download_done=2)."""
     cursor = conn.execute("""
         SELECT listing_id, image_id
         FROM image_status
-        WHERE download_done = 1 AND bg_removed = 0
+        WHERE download_done = 2 AND bg_removed = 0
         LIMIT ?
     """, (limit,))
     return [dict(row) for row in cursor.fetchall()]
