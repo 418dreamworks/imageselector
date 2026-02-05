@@ -10,6 +10,7 @@
 
 **ALWAYS DO THESE:**
 - ✅ Use KILL files to stop scripts gracefully
+- ✅ Check `lsof etsy_data.db` before any kill/SIG commands to verify no DB write conflicts
 - ✅ Confirm YES:GIT before git push/pull
 - ✅ Read `IMAC_OPERATIONS.md` for detailed operations guide
 

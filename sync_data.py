@@ -582,15 +582,16 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
 # ─── Image SQL Insert ────────────────────────────────────────────────────────
 
 def add_images_to_sql(listing_id: int, images: list, conn=None):
-    """Insert images to SQL image_status table.
+    """Upsert images to SQL image_status table.
 
     Args:
         listing_id: The listing ID
-        images: List of image dicts from API (with listing_image_id, url_570xN)
+        images: List of image dicts from API (with listing_image_id, url_570xN, rank)
         conn: Optional existing database connection (to avoid lock conflicts)
 
-    Downloads are handled separately by image_downloader.py.
-    Only inserts NEW images (ignores if already exists).
+    For existing rows: updates is_primary always, url only if missing.
+    For new rows: inserts with download_done=0.
+    Preserves download_done and faiss_row for existing rows.
     """
     if not images:
         return
@@ -599,12 +600,40 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
     if own_conn:
         conn = get_connection()
 
-    for idx, img in enumerate(images):
+    for img in images:
         image_id = img.get("listing_image_id")
         url = img.get("url_570xN", "")
-        is_primary = (idx == 0)
+        rank = img.get("rank", 1)
+        is_primary = 1 if rank == 1 else 0
 
-        insert_image(conn, listing_id, image_id, is_primary, url)
+        if not image_id:
+            continue
+
+        # Check if exists
+        cursor = conn.execute("""
+            SELECT url FROM image_status WHERE listing_id = ? AND image_id = ?
+        """, (listing_id, image_id))
+        row = cursor.fetchone()
+
+        if row:
+            # Exists - update is_primary always, url only if missing
+            existing_url = row[0]
+            if not existing_url:
+                conn.execute("""
+                    UPDATE image_status SET is_primary = ?, url = ?
+                    WHERE listing_id = ? AND image_id = ?
+                """, (is_primary, url, listing_id, image_id))
+            else:
+                conn.execute("""
+                    UPDATE image_status SET is_primary = ?
+                    WHERE listing_id = ? AND image_id = ?
+                """, (is_primary, listing_id, image_id))
+        else:
+            # New - insert
+            conn.execute("""
+                INSERT INTO image_status (listing_id, image_id, is_primary, url, download_done)
+                VALUES (?, ?, ?, ?, 0)
+            """, (listing_id, image_id, is_primary, url))
 
     if own_conn:
         commit_with_retry(conn)
@@ -639,14 +668,17 @@ def load_progress() -> dict:
     }
 
 
-def save_progress(progress):
-    conn = get_connection()
+def save_progress(progress, conn=None):
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     _ensure_progress_table(conn)
     conn.execute("""
         INSERT OR REPLACE INTO sync_progress (id, data) VALUES (1, ?)
     """, (json.dumps(progress),))
     commit_with_retry(conn)
-    conn.close()
+    if own_conn:
+        conn.close()
 
 
 # ─── Signal Handling ─────────────────────────────────────────────────────────
@@ -660,92 +692,6 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
 
-# ─── Phase 0: URL Repair ────────────────────────────────────────────────────
-
-def phase_repair_urls(client, conn):
-    """Repair phase: fetch URLs for images with download_done=0 and no URL.
-
-    Also handles:
-    - Inserting new images discovered during repair
-    - Deleting orphaned entries (listings no longer on Etsy)
-    """
-    cursor = conn.execute("""
-        SELECT DISTINCT listing_id
-        FROM image_status
-        WHERE download_done = 0 AND (url IS NULL OR url = '')
-    """)
-    listing_ids = [row[0] for row in cursor.fetchall()]
-
-    if not listing_ids:
-        print(f"[{ts()}] URL Repair: No URLs to repair")
-        return
-
-    print(f"[{ts()}] URL Repair: {len(listing_ids)} listings need URL repair...")
-
-    repaired = 0
-    inserted = 0
-    deleted = 0
-
-    # Process 100 listings at a time (batch API limit)
-    for i in range(0, len(listing_ids), 100):
-        if check_kill_file():
-            commit_with_retry(conn)
-            return
-
-        batch = listing_ids[i:i+100]
-        images_by_listing = fetch_listings_batch_with_images(client, batch)
-
-        batch_repaired = 0
-        batch_inserted = 0
-        batch_deleted = 0
-
-        # Process listings that were returned (still exist on Etsy)
-        for lid, images in images_by_listing.items():
-            for idx, img in enumerate(images):
-                image_id = img.get("listing_image_id")
-                url = img.get("url_570xN")
-                if not image_id or not url:
-                    continue
-
-                # Try to update existing entry
-                cursor = conn.execute("""
-                    UPDATE image_status SET url = ?
-                    WHERE listing_id = ? AND image_id = ? AND (url IS NULL OR url = '')
-                """, (url, lid, image_id))
-
-                if cursor.rowcount > 0:
-                    batch_repaired += 1
-                else:
-                    # Check if entry exists at all
-                    cursor = conn.execute("""
-                        SELECT 1 FROM image_status WHERE listing_id = ? AND image_id = ?
-                    """, (lid, image_id))
-                    if not cursor.fetchone():
-                        # New image - insert it
-                        insert_image(conn, lid, image_id, is_primary=(idx == 0), url=url)
-                        batch_inserted += 1
-
-        # Delete orphaned entries (listings not returned by API = taken down)
-        returned_lids = set(int(lid) for lid in images_by_listing.keys())
-        for lid in batch:
-            if lid not in returned_lids:
-                cursor = conn.execute("""
-                    DELETE FROM image_status WHERE listing_id = ?
-                """, (lid,))
-                batch_deleted += cursor.rowcount
-
-        repaired += batch_repaired
-        inserted += batch_inserted
-        deleted += batch_deleted
-
-        commit_with_retry(conn)
-
-        if (i + 100) % 100 == 0:
-            print(f"  URL Repair: {i + len(batch)}/{len(listing_ids)} | "
-                  f"repaired={repaired}, new={inserted}, deleted={deleted} | "
-                  f"API={_api_stats['used']}/{_api_stats['limit']}")
-
-    print(f"[{ts()}] URL Repair complete: {repaired} repaired, {inserted} new, {deleted} deleted")
 
 
 # ─── Phase 1-3: Taxonomy Crawl ──────────────────────────────────────────────
@@ -773,7 +719,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = offset
             progress["exhausted"] = list(exhausted)
-            save_progress(progress)
+            save_progress(progress, conn)
             commit_with_retry(conn)
             return
 
@@ -796,7 +742,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = offset
             progress["exhausted"] = list(exhausted)
-            save_progress(progress)
+            save_progress(progress, conn)
             commit_with_retry(conn)
             return
 
@@ -809,7 +755,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = 0
             progress["exhausted"] = list(exhausted)
-            save_progress(progress)
+            save_progress(progress, conn)
             continue
 
         results = result
@@ -838,7 +784,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = 0
             progress["exhausted"] = list(exhausted)
-            save_progress(progress)
+            save_progress(progress, conn)
             commit_with_retry(conn)
             continue
 
@@ -852,7 +798,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
         progress["crawl_unit_index"] = crawl_unit_index
         progress["offset"] = offset
         progress["exhausted"] = list(exhausted)
-        save_progress(progress)
+        save_progress(progress, conn)
         commit_with_retry(conn)
 
         print(f"  offset={offset} | new+img={stats['new_with_images']} new-img={stats['new_no_images']} "
@@ -870,12 +816,13 @@ def _process_crawl_batch(client, results, conn, existing_listings, listing_last_
 
     For each listing:
     - Insert listing data into listings_static/listings_dynamic
-    - For new listings, fetch images via batch API and insert into image_status
+    - Fetch images via batch API for ALL listings (updates is_primary, fills missing URLs)
     """
-    new_listing_ids = []
+    all_listing_ids = []
 
     for listing in results:
         lid = listing["listing_id"]
+        all_listing_ids.append(lid)
 
         if lid in existing_listings:
             # Already known listing — update dynamic if > 1 week old
@@ -892,19 +839,16 @@ def _process_crawl_batch(client, results, conn, existing_listings, listing_last_
             insert_listing_dynamic(conn, listing, snapshot_ts)
             existing_listings.add(lid)
             listing_last_ts[lid] = snapshot_ts
-            new_listing_ids.append(lid)
+            stats["new_with_images"] += 1
 
-    # Fetch images for all new listings in one batch API call
-    if new_listing_ids:
-        images_by_listing = fetch_listings_batch_with_images(client, new_listing_ids)
+    # Fetch images for ALL listings in one batch API call
+    if all_listing_ids:
+        images_by_listing = fetch_listings_batch_with_images(client, all_listing_ids)
 
-        for lid in new_listing_ids:
+        for lid in all_listing_ids:
             images = images_by_listing.get(lid, [])
             if images:
                 add_images_to_sql(lid, images, conn=conn)
-                stats["new_with_images"] += 1
-            else:
-                stats["new_no_images"] += 1
 
 
 # ─── Phase: Shop Data ───────────────────────────────────────────────────────
@@ -1019,7 +963,7 @@ def phase_reviews(client, conn, snapshot_ts):
 
     if not shop_ids:
         # Reset progress for next cycle
-        save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []})
+        save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []}, conn)
         return
 
     last_review_ts = get_sync_state(conn, "last_review_timestamps", {})
@@ -1058,7 +1002,7 @@ def phase_reviews(client, conn, snapshot_ts):
     print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops")
 
     # Reset progress for next cycle
-    save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []})
+    save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []}, conn)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -1097,16 +1041,6 @@ def main():
     snapshot_ts = int(time.time())
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        # Phase 0: URL Repair (fetch URLs for reset images)
-        print(f"\n--- Phase 0: URL Repair ---")
-        phase_repair_urls(client, conn)
-
-        if check_kill_file():
-            commit_with_retry(conn)
-            conn.close()
-            release_lock()
-            return
-
         # Phase 1: Taxonomy crawl (listings + images)
         print(f"\n--- Phase 1: Taxonomy Crawl ---")
         phase_crawl(

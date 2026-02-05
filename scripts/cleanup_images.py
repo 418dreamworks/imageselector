@@ -17,7 +17,7 @@ IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_CLEANUP"
 
 # Backup location for non-primary images on external SSD
-BACKUP_DIR = Path("/Volumes/SSD_120/nonprimaryimages")
+BACKUP_DIR = Path("/Volumes/SSD_120/embeddedimages")
 
 # Add parent to path for imports
 sys.path.insert(0, str(BASE_DIR))

@@ -36,7 +36,7 @@ EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
 IMAGES_DIR = BASE_DIR / 'images'
 BACKUPS_DIR = BASE_DIR / 'backups'
 DB_FILE = BASE_DIR / 'etsy_data.db'
-NONPRIMARY_DIR = Path('/Volumes/SSD_120/nonprimaryimages')
+EMBEDDED_DIR = Path('/Volumes/SSD_120/embeddedimages')
 
 # Config files
 QPS_CONFIG_FILE = BASE_DIR / 'qps_config.json'
@@ -145,8 +145,8 @@ def release_lock():
 
 
 def check_kill_file() -> bool:
+    """Check for kill file. Does NOT auto-remove - user must manually delete."""
     if KILL_FILE.exists():
-        KILL_FILE.unlink()
         log("Kill file detected. Shutting down...")
         return True
     return False
@@ -255,9 +255,59 @@ def start_data_scripts():
     start_script(BASE_DIR / "scripts/image_downloader.py", BASE_DIR / "image_downloader.log", "image_downloader")
 
 
-def do_backup():
-    """Backup DB and FAISS indexes."""
+def check_db_faiss_consistency() -> tuple[bool, str]:
+    """Check if DB faiss_row count matches FAISS vector counts.
+
+    Returns (is_consistent, message).
+    """
     import sqlite3
+    import faiss
+
+    # Get DB count
+    conn = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True)
+    cursor = conn.execute('SELECT COUNT(*) FROM image_status WHERE faiss_row IS NOT NULL')
+    db_count = cursor.fetchone()[0]
+    conn.close()
+
+    # Get FAISS counts (all should match)
+    faiss_counts = {}
+    if EMBEDDINGS_DIR.exists():
+        for f in EMBEDDINGS_DIR.glob("*.faiss"):
+            if '_text' not in f.name:  # Skip text embeddings
+                index = faiss.read_index(str(f))
+                faiss_counts[f.name] = index.ntotal
+
+    if not faiss_counts:
+        # No FAISS files yet - consistent if DB also has 0
+        if db_count == 0:
+            return True, "Both empty"
+        return False, f"DB has {db_count} but no FAISS files"
+
+    # All FAISS files should have same count
+    counts = list(faiss_counts.values())
+    if len(set(counts)) > 1:
+        return False, f"FAISS files have different counts: {faiss_counts}"
+
+    faiss_count = counts[0]
+    if db_count != faiss_count:
+        return False, f"DB has {db_count}, FAISS has {faiss_count}"
+
+    return True, f"Consistent: {db_count} entries"
+
+
+def do_backup():
+    """Backup DB and FAISS folder after checking consistency.
+
+    Raises RuntimeError if inconsistent - orchestrator must stop.
+    """
+    import sqlite3
+
+    # Check consistency first - FATAL if inconsistent
+    is_consistent, msg = check_db_faiss_consistency()
+    if not is_consistent:
+        raise RuntimeError(f"FATAL: DB/FAISS inconsistent - {msg}. Fix before continuing.")
+
+    log(f"Consistency check passed: {msg}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -273,13 +323,15 @@ def do_backup():
     os.chmod(backup_db, 0o444)  # Read-only
     log(f"  Database backed up")
 
-    # Backup FAISS indexes
-    if EMBEDDINGS_DIR.exists():
-        for f in EMBEDDINGS_DIR.glob("*.faiss"):
-            backup_faiss = BACKUPS_DIR / f"embeddings_{timestamp}_{f.name}"
-            shutil.copy2(f, backup_faiss)
-            os.chmod(backup_faiss, 0o444)
-        log(f"  FAISS indexes backed up")
+    # Backup entire embeddings folder
+    if EMBEDDINGS_DIR.exists() and any(EMBEDDINGS_DIR.glob("*.faiss")):
+        backup_emb_dir = BACKUPS_DIR / f"embeddings_{timestamp}"
+        shutil.copytree(EMBEDDINGS_DIR, backup_emb_dir)
+        # Make all files read-only
+        for f in backup_emb_dir.glob("*"):
+            os.chmod(f, 0o444)
+        os.chmod(backup_emb_dir, 0o555)
+        log(f"  FAISS folder backed up to {backup_emb_dir.name}")
 
     log("Backup complete")
 
@@ -400,36 +452,24 @@ def import_batch(batch_dir: Path) -> int:
     start_row = get_next_faiss_row(conn)
     conn.close()
 
-    # 2. Copy bg-removed images (primary to images/, non-primary to SSD)
-    # Get is_primary status for all images in batch
-    conn = get_connection()
-    placeholders = ",".join(["(?,?)"] * len(manifest))
-    flat_ids = [x for lid, iid in manifest for x in (lid, iid)]
-    cursor = conn.execute(f"""
-        SELECT listing_id, image_id, is_primary
-        FROM image_status
-        WHERE (listing_id, image_id) IN ({placeholders})
-    """, flat_ids)
-    primary_lookup = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
-    conn.close()
-
-    primary_count = 0
-    nonprimary_count = 0
-    NONPRIMARY_DIR.mkdir(parents=True, exist_ok=True)
+    # 2. Move all bg-removed images to embeddedimages, remove from images/
+    EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
+    moved_count = 0
 
     for lid, iid in manifest:
         src = images_src / f"{lid}_{iid}.jpg"
         if src.exists():
-            is_primary = primary_lookup.get((lid, iid), 1)
-            if is_primary:
-                dst = IMAGES_DIR / f"{lid}_{iid}.jpg"
-                primary_count += 1
-            else:
-                dst = NONPRIMARY_DIR / f"{lid}_{iid}.jpg"
-                nonprimary_count += 1
+            # Copy to embeddedimages
+            dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
             shutil.copy2(src, dst)
+            moved_count += 1
 
-    log(f"Copied {primary_count} primary to images/, {nonprimary_count} non-primary to SSD")
+            # Remove from images/
+            orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
+            if orig.exists():
+                orig.unlink()
+
+    log(f"Moved {moved_count} images to embeddedimages, removed from images/")
 
     # 3. Append to FAISS indexes
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -633,6 +673,10 @@ def clear_worker_exports(worker: Worker) -> bool:
 # ============================================================
 
 def main():
+    if KILL_FILE.exists():
+        print(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        return
+
     if not acquire_lock():
         print("Error: Another orchestrator instance is already running")
         return
