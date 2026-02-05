@@ -34,6 +34,7 @@ BASE_DIR = Path(__file__).parent.parent
 EXPORTS_DIR = BASE_DIR / 'embed_exports'
 EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
 IMAGES_DIR = BASE_DIR / 'images'
+BACKUPS_DIR = BASE_DIR / 'backups'
 DB_FILE = BASE_DIR / 'etsy_data.db'
 
 # Config files
@@ -48,6 +49,7 @@ API_BASE_URL = "https://openapi.etsy.com/v3"
 
 # Timing
 QPS_CHECK_INTERVAL = 300  # 5 minutes
+BACKUP_INTERVAL = 6 * 3600  # 6 hours
 POLL_INTERVAL = 10  # seconds between worker checks
 DB_CHUNK_SIZE = 100  # commit every N images
 
@@ -200,6 +202,85 @@ def update_qps_config(limits: dict):
     config["limit"] = limit
 
     QPS_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+# ============================================================
+# BACKUP & PROCESS MANAGEMENT
+# ============================================================
+
+def soft_kill_script(kill_file: Path, name: str, timeout: int = 60):
+    """Create kill file and wait for script to stop."""
+    log(f"Stopping {name}...")
+    kill_file.touch()
+
+    pid_file = BASE_DIR / f"{name}.pid"
+    start = time.time()
+    while time.time() - start < timeout:
+        if not pid_file.exists():
+            log(f"  {name} stopped")
+            return True
+        time.sleep(2)
+
+    log(f"  {name} did not stop in {timeout}s")
+    return False
+
+
+def start_script(script_path: Path, log_file: Path, name: str):
+    """Start a script with unbuffered output."""
+    log(f"Starting {name}...")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    subprocess.Popen(
+        [sys.executable, str(script_path)],
+        stdout=open(log_file, "a"),
+        stderr=subprocess.STDOUT,
+        cwd=str(BASE_DIR),
+        env=env,
+        start_new_session=True
+    )
+    log(f"  {name} started")
+
+
+def stop_data_scripts():
+    """Stop sync_data and image_downloader for backup."""
+    soft_kill_script(BASE_DIR / "KILL", "sync_data")
+    soft_kill_script(BASE_DIR / "KILL_DL", "image_downloader")
+
+
+def start_data_scripts():
+    """Restart sync_data and image_downloader after backup."""
+    start_script(BASE_DIR / "sync_data.py", BASE_DIR / "sync_data.log", "sync_data")
+    start_script(BASE_DIR / "scripts/image_downloader.py", BASE_DIR / "image_downloader.log", "image_downloader")
+
+
+def do_backup():
+    """Backup DB and FAISS indexes."""
+    import sqlite3
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Backup DB using SQLite backup API (safe for concurrent access)
+    backup_db = BACKUPS_DIR / f"etsy_data_{timestamp}.db"
+    log(f"Backing up database to {backup_db.name}...")
+    src = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True)
+    dst = sqlite3.connect(str(backup_db))
+    src.backup(dst)
+    src.close()
+    dst.close()
+    os.chmod(backup_db, 0o444)  # Read-only
+    log(f"  Database backed up")
+
+    # Backup FAISS indexes
+    if EMBEDDINGS_DIR.exists():
+        for f in EMBEDDINGS_DIR.glob("*.faiss"):
+            backup_faiss = BACKUPS_DIR / f"embeddings_{timestamp}_{f.name}"
+            shutil.copy2(f, backup_faiss)
+            os.chmod(backup_faiss, 0o444)
+        log(f"  FAISS indexes backed up")
+
+    log("Backup complete")
 
 
 # ============================================================
@@ -534,6 +615,16 @@ def main():
     batch_counter = 0
     total_imported = 0
 
+    # Find most recent backup to avoid immediate backup on restart
+    last_backup = 0
+    if BACKUPS_DIR.exists():
+        backup_files = list(BACKUPS_DIR.glob("etsy_data_*.db"))
+        if backup_files:
+            # Get most recent backup's mtime
+            most_recent = max(backup_files, key=lambda f: f.stat().st_mtime)
+            last_backup = most_recent.stat().st_mtime
+            log(f"Last backup: {most_recent.name}")
+
     try:
         while not check_kill_file():
             now = time.time()
@@ -545,9 +636,20 @@ def main():
                     update_qps_config(limits)
                 last_qps_check = now
 
+            # Backup every 6 hours
+            if now - last_backup > BACKUP_INTERVAL:
+                log("Starting 6-hour backup...")
+                stop_data_scripts()
+                time.sleep(5)
+                do_backup()
+                start_data_scripts()
+                last_backup = now
+
             # Check each worker
+            should_exit = False
             for name, state in worker_states.items():
                 if check_kill_file():
+                    should_exit = True
                     break
 
                 worker = state.worker
@@ -588,8 +690,11 @@ def main():
                             log(f"{name}: no pending images, going idle")
                         state.status = 'idle'
 
+            if should_exit:
+                break
+
             # Process import queue (one batch per loop iteration)
-            if import_queue and not check_kill_file():
+            if import_queue:
                 worker_name, batch_dir = import_queue.pop(0)
                 imported = import_batch(batch_dir)
                 total_imported += imported
