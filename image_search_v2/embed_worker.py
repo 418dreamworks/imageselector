@@ -34,6 +34,8 @@ Output (in same folder):
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+# Enable MPS fallback for unsupported ops (upsample_bicubic2d in DINOv2)
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 import argparse
 import json
