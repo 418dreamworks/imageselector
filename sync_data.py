@@ -42,6 +42,7 @@ DB_FILE = BASE_DIR / "etsy_data.db"
 TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
 KILL_FILE = BASE_DIR / "KILL"
 QPS_CONFIG_FILE = BASE_DIR / "qps_config.json"
+PID_FILE = BASE_DIR / "sync_data.pid"
 
 
 def get_api_delay() -> float:
@@ -76,6 +77,30 @@ def check_kill_file():
         print(f"[{ts()}] Kill file detected. Shutting down gracefully...")
         return True
     return False
+
+
+def acquire_lock() -> bool:
+    """Acquire PID lock. Returns False if another instance is running."""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            # Check if process is still running
+            os.kill(old_pid, 0)
+            # Process exists - another instance is running
+            return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            # PID file is stale or process doesn't exist
+            pass
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    """Release PID lock."""
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
 # ─── Taxonomy Config ─────────────────────────────────────────────────────────
@@ -892,6 +917,10 @@ def main():
         print("Error: ETSY_API_KEY not set in .env")
         return
 
+    if not acquire_lock():
+        print("Error: Another sync_data.py instance is already running")
+        return
+
     IMAGES_DIR.mkdir(exist_ok=True)
 
     print(f"{'='*60}")
@@ -924,9 +953,21 @@ def main():
             snapshot_ts
         )
 
+        if check_kill_file():
+            commit_with_retry(conn)
+            conn.close()
+            release_lock()
+            return
+
         # Phase 2: Shops (stateless - skips shops with recent data)
         print(f"\n--- Phase 2: Shops ---")
         phase_shops(client, conn, snapshot_ts)
+
+        if check_kill_file():
+            commit_with_retry(conn)
+            conn.close()
+            release_lock()
+            return
 
         # Phase 3: Reviews (stateless - skips shops with recent reviews)
         print(f"\n--- Phase 3: Reviews ---")
@@ -935,6 +976,7 @@ def main():
     # Final save
     commit_with_retry(conn)
     conn.close()
+    release_lock()
 
     print(f"\n{'='*60}")
     print(f"SYNC COMPLETE")
@@ -945,4 +987,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        release_lock()

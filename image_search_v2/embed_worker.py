@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Stateless embedding worker. Takes images, outputs numpy arrays.
+"""Stateless worker: bg removal + embeddings.
 
 This script has NO access to databases or FAISS indexes.
-It simply reads images and produces embeddings as numpy files.
+It removes backgrounds, then produces embeddings as numpy files.
 Safe to run on any machine (macOS, Windows, Linux).
 
 Usage:
-    python embed_worker.py --input /path/to/batch --output /path/to/results
-    python embed_worker.py --input ~/embed_work/batch_001  # uses default output
+    python embed_worker.py --input /path/to/batch
+    python embed_worker.py --input ~/embed_work/batch_001
 
 Input folder structure:
     batch/
     ├── manifest.json      # [[listing_id, image_id], ...]
     ├── listings.json      # {"listing_id": "title. materials", ...}
     └── images/
-        ├── 123_456.jpg
+        ├── 123_456.jpg    # original images
         └── ...
 
-Output folder structure:
-    results/
-    ├── manifest.json           # copy from input (for verification)
+Output (in same folder):
+    batch/
+    ├── manifest.json           # unchanged
+    ├── listings.json           # unchanged
+    ├── images/
+    │   ├── 123_456.jpg         # bg-removed (overwritten)
+    │   └── ...
     ├── clip_vitb32.npy         # (N, 512) float32
     ├── clip_vitb32_text.npy    # (N, 512) float32
     ├── clip_vitl14.npy         # (N, 768) float32
@@ -34,7 +38,6 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import argparse
 import json
 import platform
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +46,9 @@ from PIL import Image
 from tqdm import tqdm
 
 from models import MODELS, get_loader
+
+# Global rembg session
+_rembg_session = None
 
 
 def get_device() -> str:
@@ -54,36 +60,75 @@ def get_device() -> str:
     return "cpu"
 
 
-def get_default_work_dir() -> Path:
-    """Get OS-appropriate default work directory."""
-    if platform.system() == "Windows":
-        return Path("E:/embed_work")
+def init_rembg():
+    """Initialize rembg with GPU acceleration."""
+    global _rembg_session
+    from rembg import new_session
+
+    device = get_device()
+    if device == "cuda":
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    elif device == "mps":
+        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     else:
-        return Path.home() / "embed_work"
+        providers = ["CPUExecutionProvider"]
+
+    try:
+        _rembg_session = new_session("u2net", providers=providers)
+        print(f"rembg initialized with providers: {providers}")
+    except Exception as e:
+        print(f"GPU provider failed ({e}), falling back to CPU")
+        _rembg_session = new_session("u2net")
 
 
-def load_all_images(manifest: list, images_dir: Path) -> list:
-    """Load all images into RAM upfront.
+def remove_background(img: Image.Image) -> Image.Image:
+    """Remove background from image, return RGB with white background."""
+    global _rembg_session
+    from rembg import remove
 
-    This is optimal for HDD machines - one sequential read pass,
-    then all processing happens from memory.
+    # Remove background (returns RGBA)
+    img_nobg = remove(img, session=_rembg_session)
+
+    # Convert to RGB with white background
+    rgb_img = Image.new("RGB", img_nobg.size, (255, 255, 255))
+    rgb_img.paste(img_nobg, mask=img_nobg.split()[3])
+
+    return rgb_img
+
+
+def load_and_process_images(manifest: list, images_dir: Path) -> list:
+    """Load images, remove backgrounds, save back to disk, keep in memory.
+
+    Flow:
+    1. Load original image
+    2. Remove background (GPU accelerated)
+    3. Save bg-removed image back to disk (overwrite)
+    4. Keep in memory for embedding
     """
-    print(f"Loading {len(manifest)} images into memory...")
+    print(f"Processing {len(manifest)} images (bg removal + load)...")
+    init_rembg()
+
     images = []
 
-    for lid, iid in tqdm(manifest, desc="Loading images"):
+    for lid, iid in tqdm(manifest, desc="BG removal"):
         img_path = images_dir / f"{lid}_{iid}.jpg"
         try:
             img = Image.open(img_path).convert("RGB")
-            # Force load into memory (PIL is lazy by default)
             img.load()
-            images.append(img)
+
+            # Remove background
+            img_nobg = remove_background(img)
+
+            # Save back to disk (overwrite original)
+            img_nobg.save(img_path, "JPEG", quality=90)
+
+            images.append(img_nobg)
         except Exception as e:
-            print(f"Warning: Failed to load {img_path}: {e}")
+            print(f"Warning: Failed to process {img_path}: {e}")
             # Placeholder for failed images
             images.append(Image.new("RGB", (224, 224), (128, 128, 128)))
 
-    print(f"Loaded {len(images)} images into memory")
+    print(f"Processed {len(images)} images")
     return images
 
 
@@ -140,15 +185,11 @@ def process_model(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stateless embedding worker - images to numpy"
+        description="Worker: bg removal + embeddings"
     )
     parser.add_argument(
         "--input", type=Path, required=True,
-        help="Input directory with manifest.json, listings.json, images/"
-    )
-    parser.add_argument(
-        "--output", type=Path, default=None,
-        help="Output directory for numpy files (default: <input>_results)"
+        help="Batch directory with manifest.json, listings.json, images/"
     )
     parser.add_argument(
         "--batch-size", type=int, default=32,
@@ -161,19 +202,18 @@ def main():
     )
     args = parser.parse_args()
 
-    # Default output directory
-    if args.output is None:
-        args.output = args.input.parent / f"{args.input.name}_results"
+    # Output is same directory as input
+    batch_dir = args.input
 
     # Validate input
-    if not args.input.exists():
-        print(f"ERROR: Input directory not found: {args.input}")
+    if not batch_dir.exists():
+        print(f"ERROR: Batch directory not found: {batch_dir}")
         return 1
-    if not (args.input / "manifest.json").exists():
-        print(f"ERROR: manifest.json not found in {args.input}")
+    if not (batch_dir / "manifest.json").exists():
+        print(f"ERROR: manifest.json not found in {batch_dir}")
         return 1
-    if not (args.input / "listings.json").exists():
-        print(f"ERROR: listings.json not found in {args.input}")
+    if not (batch_dir / "listings.json").exists():
+        print(f"ERROR: listings.json not found in {batch_dir}")
         return 1
 
     # Show device info
@@ -183,34 +223,27 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # Load manifest and listings
-    manifest = json.loads((args.input / "manifest.json").read_text())
-    listings = json.loads((args.input / "listings.json").read_text())
-    images_dir = args.input / "images"
+    manifest = json.loads((batch_dir / "manifest.json").read_text())
+    listings = json.loads((batch_dir / "listings.json").read_text())
+    images_dir = batch_dir / "images"
 
     print(f"Manifest: {len(manifest)} images")
 
-    # Load all images into RAM (one-time disk read)
-    images = load_all_images(manifest, images_dir)
-
-    # Setup output
-    args.output.mkdir(parents=True, exist_ok=True)
-
-    # Copy manifest to output (for verification during import) - skip if same dir
-    if args.input.resolve() != args.output.resolve():
-        shutil.copy(args.input / "manifest.json", args.output / "manifest.json")
+    # Load images, remove backgrounds, save back to disk
+    images = load_and_process_images(manifest, images_dir)
 
     # Determine models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
 
-    # Process each model
+    # Process each model (save .npy to batch dir)
     for model_key in models_to_run:
         process_model(
             model_key, manifest, images, listings,
-            args.output, args.batch_size
+            batch_dir, args.batch_size
         )
 
     print(f"\n{'='*50}")
-    print(f"Done! Results in {args.output}")
+    print(f"Done! Results in {batch_dir}")
     print(f"{'='*50}")
     return 0
 

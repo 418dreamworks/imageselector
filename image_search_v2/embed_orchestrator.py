@@ -1,35 +1,70 @@
 #!/usr/bin/env python3
 """
-Distributed Embedding Orchestrator
+Distributed Orchestrator
 
-Manages distributed embedding across multiple workers:
-- iMac (local): embed@localhost, MPS
-- MBP: embed@mbp.local, MPS
-- Windows: embed@192.168.68.117, CUDA (GTX 1070)
+Manages the entire pipeline:
+1. QPS management - checks API limits every 5 mins, adjusts sync_data delay
+2. 6-hour backups - stops sync_data/image_downloader, backs up DB/FAISS/images
+3. Distributed work - sends batches to workers (iMac/MBP/Sleight)
 
-Architecture:
-1. Export batches of images for each worker
-2. SSH to start worker processes
-3. Rsync to poll for completion and retrieve results
-4. Import results into FAISS indexes
+Workers do: bg_removal + all 5 embeddings
+Orchestrator does: coordinate, verify, import results, update DB
+
+Stop with: touch KILL_ORCH
 """
 
 import os
 import sys
 import json
 import time
+import shutil
 import subprocess
-import argparse
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
-import sqlite3
+from datetime import datetime
+from typing import List, Dict, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from image_db import DB_FILE, get_connection, get_images_for_embedding
+from image_db import get_connection, commit_with_retry
 
-# Worker configurations
+# Paths
+BASE_DIR = Path(__file__).parent.parent
+EXPORTS_DIR = BASE_DIR / 'embed_exports'
+EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
+IMAGES_DIR = BASE_DIR / 'images'
+BACKUPS_DIR = BASE_DIR / 'backups'
+DB_FILE = BASE_DIR / 'etsy_data.db'
+IMAGE_INDEX_FILE = EMBEDDINGS_DIR / 'image_index.json'
+
+# Config files
+QPS_CONFIG_FILE = BASE_DIR / 'qps_config.json'
+ORCH_STATE_FILE = BASE_DIR / 'orchestrator_state.json'
+PID_FILE = BASE_DIR / 'orchestrator.pid'
+KILL_FILE = BASE_DIR / 'KILL_ORCH'
+
+# API config
+ETSY_API_KEY = os.getenv("ETSY_API_KEY")
+API_BASE_URL = "https://openapi.etsy.com/v3"
+
+# Timing
+QPS_CHECK_INTERVAL = 300  # 5 minutes
+BACKUP_INTERVAL = 6 * 3600  # 6 hours
+BATCH_SIZE = 1000  # Images per worker batch
+COMPLETED_THRESHOLD = 50000  # Import results after this many complete
+
+# QPS limits
+MIN_DELAY = 0.2    # 5 QPS max
+MAX_DELAY = 2.0    # 0.5 QPS min
+RATE_THRESHOLD = 10000  # Remaining quota threshold
+
+# All models
+ALL_MODELS = ['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base']
+
+
 @dataclass
 class Worker:
     name: str
@@ -37,8 +72,8 @@ class Worker:
     user: str
     work_dir: str
     python_path: str
-    models: List[str]  # Models this worker should process
-    speed_factor: float  # Relative speed (higher = faster)
+    speed_factor: float
+
 
 WORKERS = {
     'imac': Worker(
@@ -47,7 +82,6 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        models=['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base'],
         speed_factor=1.0,
     ),
     'mbp': Worker(
@@ -56,583 +90,654 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        models=['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base'],
-        speed_factor=2.1,  # ~2x faster than iMac based on benchmark
+        speed_factor=2.1,
     ),
-    'windows': Worker(
-        name='windows',
+    'sleight': Worker(
+        name='sleight',
         host='192.168.68.117',
         user='embed',
         work_dir='E:/embed_work/imageselector',
         python_path='E:/embed_work/imageselector/venv/Scripts/python.exe',
-        models=['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base'],
-        speed_factor=2.4,  # Fastest based on benchmark
+        speed_factor=2.4,
     ),
 }
 
-# All available models
-ALL_MODELS = ['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base']
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-class Orchestrator:
-    def __init__(self, base_dir: Path):
-        self.base_dir = base_dir
-        self.exports_dir = base_dir / 'embed_exports'
-        self.exports_dir.mkdir(exist_ok=True)
-        self.db_path = DB_FILE
+def log(msg: str):
+    print(f"[{ts()}] {msg}", flush=True)
 
-    def get_pending_images(self, model: str, limit: int = 1000) -> List[Tuple[int, int]]:
-        """Get images that need embedding for a specific model."""
-        conn = get_connection()
-        cursor = conn.cursor()
 
-        # Get images where bg_removed=1 but embed_{model}=0
-        cursor.execute(f"""
-            SELECT listing_id, image_id
-            FROM image_status
-            WHERE bg_removed = 1 AND embed_{model} = 0
-            LIMIT ?
-        """, (limit,))
-
-        results = [(row[0], row[1]) for row in cursor.fetchall()]
-        conn.close()
-        return results
-
-    def get_pending_by_all_models(self, limit: int = 1000) -> Dict[str, List[Tuple[int, int]]]:
-        """Get pending images grouped by model."""
-        return {model: self.get_pending_images(model, limit) for model in ALL_MODELS}
-
-    def export_batch(self, batch_name: str, images: List[Tuple[int, int]],
-                     models: List[str]) -> Path:
-        """Export a batch of images for processing."""
-        batch_dir = self.exports_dir / batch_name
-        batch_dir.mkdir(exist_ok=True)
-        images_dir = batch_dir / 'images'
-        images_dir.mkdir(exist_ok=True)
-
-        # Get listing info for text embeddings
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        listings_data = {}
-        manifest = []
-
-        for listing_id, image_id in images:
-            # Get listing info
-            cursor.execute("""
-                SELECT title, materials
-                FROM listings
-                WHERE listing_id = ?
-            """, (listing_id,))
-            row = cursor.fetchone()
-
-            if row:
-                title, materials = row
-                text = f"{title}. {materials}" if materials else title
-                listings_data[str(listing_id)] = text
-
-            # Copy image
-            src_path = self.base_dir / 'images' / f"{listing_id}_{image_id}.jpg"
-            if src_path.exists():
-                dst_path = images_dir / f"{listing_id}_{image_id}.jpg"
-                if not dst_path.exists():
-                    import shutil
-                    shutil.copy2(src_path, dst_path)
-                manifest.append([listing_id, image_id])
-
-        conn.close()
-
-        # Write manifest
-        with open(batch_dir / 'manifest.json', 'w') as f:
-            json.dump(manifest, f)
-
-        # Write listings
-        with open(batch_dir / 'listings.json', 'w') as f:
-            json.dump(listings_data, f)
-
-        # Write models to process
-        with open(batch_dir / 'models.json', 'w') as f:
-            json.dump(models, f)
-
-        print(f"Exported {len(manifest)} images to {batch_dir}")
-        return batch_dir
-
-    def rsync_to_worker(self, worker: Worker, batch_dir: Path) -> bool:
-        """Rsync batch to worker."""
-        batch_name = batch_dir.name
-
-        if worker.host == 'localhost':
-            target = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}"
-        elif worker.host == '192.168.68.117':
-            # Windows with cwrsync uses /cygdrive/e/ style paths
-            target = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
-        else:
-            target = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
-
-        cmd = ['rsync', '-av', '--delete', f"{batch_dir}/", target]
-        print(f"Syncing to {worker.name}: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(f"Rsync failed: {result.stderr}")
+def acquire_lock() -> bool:
+    """Acquire PID lock. Returns False if another instance is running."""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)
             return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def check_kill_file() -> bool:
+    if KILL_FILE.exists():
+        KILL_FILE.unlink()
+        log("Kill file detected. Shutting down...")
         return True
+    return False
 
-    def start_worker(self, worker: Worker, batch_name: str, models: List[str]) -> bool:
-        """Start worker process via SSH."""
-        worker_script = f"{worker.work_dir}/image_search_v2/embed_worker.py"
-        batch_path = f"{worker.work_dir}/embed_exports/{batch_name}"
 
-        # Worker uses --input and --model (one at a time)
-        # Run each model sequentially
-        for model in models:
-            if worker.host == '192.168.68.117':
-                # Windows paths
-                remote_cmd = f'"{worker.python_path}" "{worker_script}" --input "{batch_path}" --output "{batch_path}" --model {model}'
-            else:
-                # Mac (localhost or mbp)
-                remote_cmd = f'{worker.python_path} {worker_script} --input {batch_path} --output {batch_path} --model {model}'
+def load_state() -> dict:
+    if ORCH_STATE_FILE.exists():
+        try:
+            return json.loads(ORCH_STATE_FILE.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {
+        "last_qps_check": 0,
+        "last_backup": 0,
+        "pending_images": [],
+        "completed_images": [],
+    }
 
-            # All workers use SSH (including localhost via embed@localhost)
-            ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
-            ssh_cmd = ['ssh', f'{worker.user}@{ssh_host}', remote_cmd]
-            print(f"Starting {worker.name} ({model}): {' '.join(ssh_cmd)}")
 
-            subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def save_state(state: dict):
+    ORCH_STATE_FILE.write_text(json.dumps(state, indent=2))
 
-        print(f"Started worker on {worker.name} for models: {models}")
-        return True
 
-    def check_completion_local(self, batch_name: str, models: List[str]) -> Dict[str, bool]:
-        """Check which model outputs exist locally (after rsync pull)."""
-        results = {}
-        batch_dir = self.exports_dir / batch_name
-        for model in models:
-            npy_file = batch_dir / f"{model}.npy"
-            results[model] = npy_file.exists()
-        return results
+# ============================================================
+# QPS MANAGEMENT
+# ============================================================
 
-    def rsync_results(self, worker: Worker, batch_name: str) -> bool:
-        """Rsync only .npy results back from worker (fast - ignores images)."""
-        local_batch = self.exports_dir / batch_name
-
-        if worker.host == 'localhost':
-            src = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}/"
-        elif worker.host == '192.168.68.117':
-            src = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}/"
-        else:
-            src = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}/"
-
-        # Only sync .npy files - fast even with 50k images in directory
-        cmd = ['rsync', '-av', '--include=*.npy', '--exclude=*', src, f"{local_batch}/"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            print(f"Rsync failed: {result.stderr}")
-            return False
-        return True
-
-    def get_images_needing_models(self, models: List[str], limit: int = 1000) -> List[Tuple[int, int]]:
-        """Get images that need embedding for ANY of the specified models."""
-        conn = get_connection()
-        cursor = conn.cursor()
-
-        # Get images where ANY of the specified model flags are 0
-        model_conditions = ' OR '.join(f'embed_{m} = 0' for m in models)
-        cursor.execute(f"""
-            SELECT listing_id, image_id
-            FROM image_status
-            WHERE bg_removed = 1 AND ({model_conditions})
-            LIMIT ?
-        """, (limit,))
-
-        results = [(row[0], row[1]) for row in cursor.fetchall()]
-        conn.close()
-        return results
-
-    def distribute_work(self, total_images: int, workers: List[str],
-                       models: List[str], assignments: Optional[Dict[str, List[Tuple[int, int]]]] = None) -> Dict[str, Dict]:
-        """
-        Distribute images across workers. Each worker processes ALL models for their images.
-
-        Args:
-            total_images: Total images to process
-            workers: List of worker names to use
-            models: Models each worker should process
-            assignments: Optional explicit {worker: [(listing_id, image_id), ...]} assignments
-
-        Returns dict of worker_name -> {images: [(listing_id, image_id), ...], models: [...]}
-        """
-        # Get active workers
-        active_workers = [WORKERS[w] for w in workers if w in WORKERS]
-
-        if not active_workers:
-            print("No workers specified!")
-            return {}
-
-        # If explicit assignments provided, use those
-        if assignments:
-            distribution = {}
-            for worker_name, images in assignments.items():
-                if worker_name in WORKERS:
-                    worker = WORKERS[worker_name]
-                    worker_models = [m for m in models if m in worker.models]
-                    distribution[worker_name] = {
-                        'images': images,
-                        'models': worker_models,
-                    }
-            return distribution
-
-        # Auto-distribute: get images needing any of the specified models
-        pending_list = self.get_images_needing_models(models, total_images)
-
-        if not pending_list:
-            print("No pending images found!")
-            return {}
-
-        # Calculate total speed factor
-        total_speed = sum(w.speed_factor for w in active_workers)
-
-        # Distribute images proportionally by speed
-        distribution = {}
-        start_idx = 0
-
-        for i, worker in enumerate(active_workers):
-            # Last worker gets remainder
-            if i == len(active_workers) - 1:
-                worker_images = pending_list[start_idx:]
-            else:
-                proportion = worker.speed_factor / total_speed
-                count = int(len(pending_list) * proportion)
-                worker_images = pending_list[start_idx:start_idx + count]
-                start_idx += count
-
-            # Each worker processes ALL models for their images
-            worker_models = [m for m in models if m in worker.models]
-
-            distribution[worker.name] = {
-                'images': worker_images,
-                'models': worker_models,
+def check_rate_limit() -> dict | None:
+    """Check API rate limits, returns limits dict or None on error."""
+    try:
+        import httpx
+        with httpx.Client(timeout=30) as client:
+            response = client.get(
+                f"{API_BASE_URL}/application/openapi-ping",
+                headers={"x-api-key": ETSY_API_KEY}
+            )
+            return {
+                "remaining": int(response.headers.get("x-remaining-today", 0)),
+                "limit": int(response.headers.get("x-limit-per-day", 0)),
             }
-
-        return distribution
-
-    def assign_specific_images(self, worker_name: str, listing_image_pairs: List[Tuple[int, int]],
-                                models: List[str]) -> Dict[str, Dict]:
-        """Assign specific images to a specific worker."""
-        if worker_name not in WORKERS:
-            print(f"Unknown worker: {worker_name}")
-            return {}
-
-        worker = WORKERS[worker_name]
-        worker_models = [m for m in models if m in worker.models]
-
-        return {
-            worker_name: {
-                'images': listing_image_pairs,
-                'models': worker_models,
-            }
-        }
+    except Exception as e:
+        log(f"Error checking rate limit: {e}")
+        return None
 
 
-def cmd_status(args):
-    """Show current embedding status."""
-    orch = Orchestrator(Path(args.base_dir))
+def update_qps_config(limits: dict):
+    """Update QPS config based on rate limits.
+
+    If remaining > RATE_THRESHOLD: speed up (more headroom)
+    If remaining <= RATE_THRESHOLD: slow down (approaching limit)
+    """
+    remaining = limits["remaining"]
+    limit = limits["limit"]
+
+    # Load current config
+    config = {}
+    if QPS_CONFIG_FILE.exists():
+        try:
+            config = json.loads(QPS_CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    current_delay = config.get("api_delay", MIN_DELAY)
+
+    # Adjust based on remaining quota (same logic as pipeline_monitor)
+    if remaining > RATE_THRESHOLD:
+        new_delay = max(current_delay / 1.1, MIN_DELAY)  # Speed up
+        action = "INCREASE"
+    else:
+        new_delay = min(current_delay / 0.9, MAX_DELAY)  # Slow down
+        action = "DECREASE"
+
+    log(f"API: {remaining:,}/{limit:,} remaining | {action} QPS: {1/current_delay:.2f} -> {1/new_delay:.2f}")
+
+    config["api_delay"] = new_delay
+    config["last_updated"] = datetime.now().isoformat()
+    config["remaining"] = remaining
+    config["limit"] = limit
+
+    QPS_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+# ============================================================
+# PROCESS MANAGEMENT
+# ============================================================
+
+def soft_kill_script(kill_file: Path, name: str, timeout: int = 30):
+    """Create kill file and wait for script to stop."""
+    log(f"Stopping {name}...")
+    kill_file.touch()
+
+    # Wait for process to exit (check PID file)
+    pid_file = BASE_DIR / f"{name}.pid"
+    start = time.time()
+    while time.time() - start < timeout:
+        if not pid_file.exists():
+            log(f"{name} stopped")
+            return True
+        time.sleep(1)
+
+    log(f"{name} did not stop in {timeout}s")
+    return False
+
+
+def start_script(script_path: Path, log_file: Path, name: str):
+    """Start a script with unbuffered output."""
+    log(f"Starting {name}...")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    subprocess.Popen(
+        [sys.executable, str(script_path)],
+        stdout=open(log_file, "a"),
+        stderr=subprocess.STDOUT,
+        cwd=str(BASE_DIR),
+        env=env,
+        start_new_session=True
+    )
+    log(f"{name} started")
+
+
+def stop_data_scripts():
+    """Stop sync_data and image_downloader for backup."""
+    soft_kill_script(BASE_DIR / "KILL", "sync_data")
+    soft_kill_script(BASE_DIR / "KILL_DL", "image_downloader")
+
+
+def start_data_scripts():
+    """Restart sync_data and image_downloader after backup."""
+    start_script(BASE_DIR / "sync_data.py", BASE_DIR / "sync_data.log", "sync_data")
+    start_script(BASE_DIR / "scripts/image_downloader.py", BASE_DIR / "image_downloader.log", "image_downloader")
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+def do_backup():
+    """Backup DB, FAISS, and image_index.json to backups/ folder."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_subdir = BACKUPS_DIR / f"backup_{timestamp}"
+    backup_subdir.mkdir(parents=True, exist_ok=True)
+
+    log(f"Backing up to {backup_subdir}")
+
+    # Backup DB
+    if DB_FILE.exists():
+        shutil.copy2(DB_FILE, backup_subdir / "etsy_data.db")
+        log("  Backed up etsy_data.db")
+
+    # Backup FAISS files and image_index.json
+    if EMBEDDINGS_DIR.exists():
+        emb_backup = backup_subdir / "embeddings"
+        emb_backup.mkdir()
+        for f in EMBEDDINGS_DIR.glob("*"):
+            if f.is_file():
+                shutil.copy2(f, emb_backup / f.name)
+        log("  Backed up embeddings/")
+
+    log("Backup complete")
+
+
+# ============================================================
+# WORKER COORDINATION
+# ============================================================
+
+def get_pending_images(limit: int = 100000) -> List[Tuple[int, int]]:
+    """Get images needing processing (download_done=2, bg_removed=0)."""
+    conn = get_connection()
+    cursor = conn.execute("""
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE download_done = 2 AND bg_removed = 0
+        LIMIT ?
+    """, (limit,))
+    results = [(row[0], row[1]) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+def get_listing_texts(listing_ids: List[int]) -> dict:
+    """Get title + materials for CLIP text embeddings."""
+    if not listing_ids:
+        return {}
 
     conn = get_connection()
-    cursor = conn.cursor()
+    placeholders = ",".join(["?"] * len(listing_ids))
+    cursor = conn.execute(f"""
+        SELECT listing_id, title, materials
+        FROM listings_static
+        WHERE listing_id IN ({placeholders})
+    """, listing_ids)
 
-    print("Embedding status by model:")
-    print(f"  {'Model':<15} {'Embedded':>10} {'Pending':>10}")
-    print(f"  {'-'*15} {'-'*10} {'-'*10}")
-
-    for model in ALL_MODELS:
-        cursor.execute(f"SELECT COUNT(*) FROM image_status WHERE embed_{model} = 1")
-        embedded = cursor.fetchone()[0]
-        cursor.execute(f"SELECT COUNT(*) FROM image_status WHERE bg_removed = 1 AND embed_{model} = 0")
-        pending = cursor.fetchone()[0]
-        print(f"  {model:<15} {embedded:>10,} {pending:>10,}")
+    texts = {}
+    for row in cursor.fetchall():
+        lid, title, materials = row
+        parts = [title] if title else []
+        if materials:
+            try:
+                mats = json.loads(materials)
+                if mats:
+                    parts.append(", ".join(mats))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        texts[str(lid)] = ". ".join(parts)
 
     conn.close()
-
-    print("\nWorkers:")
-    for name, worker in WORKERS.items():
-        print(f"  {name}: {worker.host} ({worker.speed_factor}x speed)")
+    return texts
 
 
-def parse_assignment(assignment_str: str, orch: 'Orchestrator') -> Tuple[str, List[Tuple[int, int]], List[str]]:
-    """
-    Parse assignment string like:
-      'windows:1000:clip_vitb32,clip_vitl14'  -> worker, count, models
-      'mbp:500'                                -> worker, count, all models
-      'imac:2000:dinov2_base'                  -> worker, count, specific model
+def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
+    """Export batch of images for worker processing."""
+    batch_dir = EXPORTS_DIR / batch_name
+    if batch_dir.exists():
+        shutil.rmtree(batch_dir)
 
-    Returns (worker_name, images, models)
-    """
-    parts = assignment_str.split(':')
-    worker_name = parts[0]
+    batch_dir.mkdir(parents=True)
+    images_out = batch_dir / "images"
+    images_out.mkdir()
 
-    if len(parts) < 2:
-        raise ValueError(f"Assignment must have at least worker:count, got: {assignment_str}")
+    # Copy images
+    manifest = []
+    for lid, iid in images:
+        src = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if src.exists():
+            shutil.copy2(src, images_out / f"{lid}_{iid}.jpg")
+            manifest.append([lid, iid])
 
-    count = int(parts[1])
+    # Write manifest
+    (batch_dir / "manifest.json").write_text(json.dumps(manifest))
 
-    # Models are optional - default to all
-    if len(parts) >= 3:
-        models = parts[2].split(',')
+    # Write listings for CLIP text
+    listing_ids = list(set(lid for lid, _ in manifest))
+    texts = get_listing_texts(listing_ids)
+    (batch_dir / "listings.json").write_text(json.dumps(texts))
+
+    log(f"Exported {len(manifest)} images to {batch_name}")
+    return batch_dir
+
+
+def get_worker_batch_path(worker: Worker, batch_name: str) -> str:
+    """Get remote path for batch on worker."""
+    if worker.host == 'localhost':
+        return f"/Users/embed/imageselector/embed_exports/{batch_name}"
+    elif worker.host == '192.168.68.117':
+        return f"/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
     else:
-        models = ALL_MODELS
-
-    # Get pending images for this worker's models
-    images = orch.get_images_needing_models(models, count)
-
-    return worker_name, images, models
+        return f"{worker.work_dir}/embed_exports/{batch_name}"
 
 
-def cmd_run(args):
-    """Run distributed embedding job."""
-    orch = Orchestrator(Path(args.base_dir))
+def rsync_to_worker(worker: Worker, batch_dir: Path) -> bool:
+    """Rsync batch to worker."""
+    batch_name = batch_dir.name
 
-    # Check for explicit assignments
-    if args.assign:
-        distribution = {}
-        used_images = set()  # Track images to avoid duplicates across workers
-
-        for assignment_str in args.assign:
-            worker_name, images, models = parse_assignment(assignment_str, orch)
-
-            # Filter out already-assigned images
-            images = [(lid, iid) for lid, iid in images if (lid, iid) not in used_images]
-            used_images.update(images)
-
-            if worker_name in WORKERS:
-                distribution[worker_name] = {
-                    'images': images,
-                    'models': models,
-                }
-
-        print("Explicit assignments:")
-        for worker_name, work in distribution.items():
-            print(f"  {worker_name}: {len(work['images'])} images, models={work['models']}")
+    if worker.host == 'localhost':
+        target = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}"
+    elif worker.host == '192.168.68.117':
+        target = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
     else:
-        # Auto-distribute mode
-        workers = args.workers.split(',') if args.workers else list(WORKERS.keys())
-        models = args.models.split(',') if args.models else ALL_MODELS
+        target = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
 
-        print(f"Workers: {workers}")
-        print(f"Models: {models}")
-        print(f"Images per batch: {args.batch_size}")
+    cmd = ['rsync', '-av', '--delete', f"{batch_dir}/", target]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
 
-        # Distribute work
-        distribution = orch.distribute_work(args.batch_size, workers, models)
 
-    if not distribution:
-        print("No work to distribute!")
-        return
+def start_worker(worker: Worker, batch_name: str) -> bool:
+    """SSH to start worker process."""
+    batch_path = get_worker_batch_path(worker, batch_name)
+    worker_script = f"{worker.work_dir}/image_search_v2/embed_worker.py"
 
-    # Show distribution
-    print("\nWork distribution:")
-    for worker_name, work in distribution.items():
-        print(f"  {worker_name}: {len(work['images'])} images, models={work['models']}")
+    if worker.host == '192.168.68.117':
+        remote_cmd = f'"{worker.python_path}" "{worker_script}" --input "{batch_path}"'
+    else:
+        remote_cmd = f'{worker.python_path} {worker_script} --input {batch_path}'
 
-    if args.dry_run:
-        print("\nDry run - not executing")
-        return
+    ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
+    ssh_cmd = ['ssh', f'{worker.user}@{ssh_host}', remote_cmd]
 
-    # Export and start each worker
-    batch_id = f"batch_{int(time.time())}"
+    log(f"Starting worker on {worker.name}")
+    subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def rsync_poll_npy(worker: Worker, batch_name: str) -> Dict[str, bool]:
+    """Rsync only .npy files back, check which models are complete."""
+    batch_dir = EXPORTS_DIR / batch_name
+
+    if worker.host == 'localhost':
+        src = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}/"
+    elif worker.host == '192.168.68.117':
+        src = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}/"
+    else:
+        src = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}/"
+
+    cmd = ['rsync', '-av', '--include=*.npy', '--exclude=*', src, f"{batch_dir}/"]
+    subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check which models completed
+    return {model: (batch_dir / f"{model}.npy").exists() for model in ALL_MODELS}
+
+
+def rsync_images_back(worker: Worker, batch_name: str) -> bool:
+    """Rsync bg-removed images back from worker."""
+    batch_dir = EXPORTS_DIR / batch_name
+
+    if worker.host == 'localhost':
+        src = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}/images/"
+    elif worker.host == '192.168.68.117':
+        src = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}/images/"
+    else:
+        src = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}/images/"
+
+    images_dir = batch_dir / "images"
+    cmd = ['rsync', '-av', src, f"{images_dir}/"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def reset_worker_batch(worker: Worker, batch_name: str):
+    """Reset batch folder on worker after completion."""
+    if worker.host == 'localhost':
+        target = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}"
+    elif worker.host == '192.168.68.117':
+        target = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
+    else:
+        target = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
+
+    # Delete remote directory
+    ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
+    if worker.host == '192.168.68.117':
+        rm_cmd = ['ssh', f'{worker.user}@{ssh_host}', f'cmd /c rmdir /s /q E:\\embed_work\\imageselector\\embed_exports\\{batch_name}']
+    else:
+        rm_cmd = ['ssh', f'{worker.user}@{ssh_host}', f'rm -rf {get_worker_batch_path(worker, batch_name)}']
+
+    subprocess.run(rm_cmd, capture_output=True)
+
+
+# ============================================================
+# IMPORT RESULTS
+# ============================================================
+
+def verify_batch(batch_dir: Path) -> Tuple[bool, str]:
+    """Verify batch has all required files."""
+    manifest_file = batch_dir / "manifest.json"
+    if not manifest_file.exists():
+        return False, "Missing manifest.json"
+
+    manifest = json.loads(manifest_file.read_text())
+
+    # Check all .npy files exist
+    for model in ALL_MODELS:
+        npy_file = batch_dir / f"{model}.npy"
+        if not npy_file.exists():
+            return False, f"Missing {model}.npy"
+
+    # Check all images exist
+    images_dir = batch_dir / "images"
+    for lid, iid in manifest:
+        img_file = images_dir / f"{lid}_{iid}.jpg"
+        if not img_file.exists():
+            return False, f"Missing image {lid}_{iid}.jpg"
+
+    return True, "OK"
+
+
+def import_batch(batch_dir: Path) -> int:
+    """Import verified batch: copy images, append FAISS, update DB."""
+    import numpy as np
+    import faiss
+
+    manifest = json.loads((batch_dir / "manifest.json").read_text())
+    images_src = batch_dir / "images"
+
+    # 1. Copy bg-removed images to images/ folder
+    log(f"Copying {len(manifest)} images to images/")
+    for lid, iid in manifest:
+        src = images_src / f"{lid}_{iid}.jpg"
+        dst = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        shutil.copy2(src, dst)
+
+    # 2. Load/update image_index.json
+    if IMAGE_INDEX_FILE.exists():
+        image_index = json.loads(IMAGE_INDEX_FILE.read_text())
+    else:
+        image_index = []
+
+    existing_set = set(tuple(x) for x in image_index)
+    new_indices = [i for i, img in enumerate(manifest) if tuple(img) not in existing_set]
+
+    if not new_indices:
+        log("All images already in index")
+        return 0
+
+    # 3. Append to FAISS indexes
+    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for model in ALL_MODELS:
+        npy_file = batch_dir / f"{model}.npy"
+        embeddings = np.load(npy_file)
+        new_emb = embeddings[new_indices].astype("float32")
+
+        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
+        if faiss_file.exists():
+            index = faiss.read_index(str(faiss_file))
+        else:
+            dim = embeddings.shape[1]
+            index = faiss.IndexFlatIP(dim)
+
+        index.add(new_emb)
+        faiss.write_index(index, str(faiss_file))
+
+        # Handle text embeddings for CLIP
+        text_npy = batch_dir / f"{model}_text.npy"
+        if text_npy.exists():
+            text_emb = np.load(text_npy)[new_indices].astype("float32")
+            text_faiss = EMBEDDINGS_DIR / f"{model}_text.faiss"
+            if text_faiss.exists():
+                text_index = faiss.read_index(str(text_faiss))
+            else:
+                text_index = faiss.IndexFlatIP(text_emb.shape[1])
+            text_index.add(text_emb)
+            faiss.write_index(text_index, str(text_faiss))
+
+    # 4. Update image_index.json
+    for i in new_indices:
+        image_index.append(manifest[i])
+    IMAGE_INDEX_FILE.write_text(json.dumps(image_index))
+
+    # 5. Batch update DB
+    log(f"Updating DB for {len(new_indices)} images")
+    conn = get_connection()
+
+    for i in new_indices:
+        lid, iid = manifest[i]
+        conn.execute("""
+            UPDATE image_status
+            SET bg_removed = 1,
+                embed_clip_vitb32 = 1,
+                embed_clip_vitl14 = 1,
+                embed_dinov2_base = 1,
+                embed_dinov2_large = 1,
+                embed_dinov3_base = 1
+            WHERE listing_id = ? AND image_id = ?
+        """, (lid, iid))
+
+    commit_with_retry(conn)
+    conn.close()
+
+    log(f"Imported {len(new_indices)} images")
+    return len(new_indices)
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def distribute_and_process():
+    """Main work distribution loop. Returns number of images processed."""
+    # Get pending images
+    pending = get_pending_images(limit=BATCH_SIZE * len(WORKERS))
+    if not pending:
+        return 0
+
+    log(f"Found {len(pending)} images to process")
+
+    # Distribute to workers proportionally by speed
+    total_speed = sum(w.speed_factor for w in WORKERS.values())
     worker_batches = {}
+    start_idx = 0
+    batch_id = f"batch_{int(time.time())}"
 
-    for worker_name, work in distribution.items():
-        if not work['images']:
+    for name, worker in WORKERS.items():
+        proportion = worker.speed_factor / total_speed
+        count = int(len(pending) * proportion)
+        if name == list(WORKERS.keys())[-1]:  # Last worker gets remainder
+            worker_images = pending[start_idx:]
+        else:
+            worker_images = pending[start_idx:start_idx + count]
+            start_idx += count
+
+        if not worker_images:
             continue
 
-        batch_name = f"{batch_id}_{worker_name}"
-        worker = WORKERS[worker_name]
+        batch_name = f"{batch_id}_{name}"
+        batch_dir = export_batch(batch_name, worker_images)
 
-        # Export batch
-        batch_dir = orch.export_batch(batch_name, work['images'], work['models'])
-
-        # Rsync to worker
-        if not orch.rsync_to_worker(worker, batch_dir):
-            print(f"Failed to sync to {worker_name}")
-            continue
-
-        # Start worker
-        orch.start_worker(worker, batch_name, work['models'])
-        worker_batches[worker_name] = batch_name
+        if rsync_to_worker(worker, batch_dir):
+            start_worker(worker, batch_name)
+            worker_batches[name] = batch_name
+        else:
+            log(f"Failed to sync to {name}")
 
     if not worker_batches:
-        print("No workers started!")
-        return
+        return 0
 
-    # Poll for completion by pulling results periodically
-    print("\nWaiting for workers to complete (pulling results periodically)...")
-    poll_interval = 30  # seconds
+    # Poll for completion
+    log("Waiting for workers to complete...")
+    poll_interval = 30
     timeout = 3600  # 1 hour max
     start_time = time.time()
 
-    completed = {w: set() for w in worker_batches}
-
     while time.time() - start_time < timeout:
+        if check_kill_file():
+            return 0
+
         all_done = True
-
-        for worker_name, batch_name in worker_batches.items():
-            worker = WORKERS[worker_name]
-            work = distribution[worker_name]
-
-            # Pull results from worker (rsync/scp)
-            orch.rsync_results(worker, batch_name)
-
-            # Check locally what files arrived
-            status = orch.check_completion_local(batch_name, work['models'])
-
-            for model, done in status.items():
-                if done and model not in completed[worker_name]:
-                    completed[worker_name].add(model)
-                    print(f"  {worker_name}: {model} complete")
+        for name, batch_name in worker_batches.items():
+            worker = WORKERS[name]
+            status = rsync_poll_npy(worker, batch_name)
 
             if not all(status.values()):
                 all_done = False
+            else:
+                # All .npy files present - rsync images back
+                batch_dir = EXPORTS_DIR / batch_name
+                done_marker = batch_dir / ".images_synced"
+                if not done_marker.exists():
+                    log(f"{name}: all models complete, syncing images back")
+                    rsync_images_back(worker, batch_name)
+                    done_marker.touch()
 
         if all_done:
-            print("\nAll workers complete!")
+            log("All workers complete!")
             break
 
-        elapsed = int(time.time() - start_time)
-        print(f"  [{elapsed}s] Waiting...")
         time.sleep(poll_interval)
     else:
-        print("\nTimeout waiting for workers!")
+        log("Timeout waiting for workers")
+        return 0
 
-    # Import results into FAISS/DB
-    print("\nImporting results into FAISS/DB...")
-    for worker_name, batch_name in worker_batches.items():
-        work = distribution[worker_name]
-        batch_dir = orch.exports_dir / batch_name
-        models_str = ','.join(work['models'])
-
-        print(f"  Importing {worker_name} ({batch_name})...")
-        import_cmd = [
-            sys.executable,
-            str(Path(__file__).parent / 'embed_manager.py'),
-            'import',
-            '--results-dir', str(batch_dir),
-            '--models', models_str
-        ]
-        result = subprocess.run(import_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"    Import failed: {result.stderr}")
-        else:
-            print(f"    {result.stdout.strip().split(chr(10))[-1]}")  # Last line of output
-
-    # Cleanup: remove batch directories locally and on workers
-    print("\nCleaning up batch directories...")
-    for worker_name, batch_name in worker_batches.items():
-        worker = WORKERS[worker_name]
-        batch_dir = orch.exports_dir / batch_name
-
-        # Remove local batch directory
-        if batch_dir.exists():
-            import shutil
+    # Verify and import each batch
+    total_imported = 0
+    for name, batch_name in worker_batches.items():
+        batch_dir = EXPORTS_DIR / batch_name
+        ok, msg = verify_batch(batch_dir)
+        if ok:
+            imported = import_batch(batch_dir)
+            total_imported += imported
+            # Clean up local and remote
+            reset_worker_batch(WORKERS[name], batch_name)
             shutil.rmtree(batch_dir)
-            print(f"  Removed local: {batch_dir}")
-
-        # Remove on worker using rsync --delete with empty dir
-        empty_dir = orch.exports_dir / '.empty'
-        empty_dir.mkdir(exist_ok=True)
-
-        if worker.host == 'localhost':
-            target = f"embed@localhost:/Users/embed/imageselector/embed_exports/{batch_name}"
-        elif worker.host == '192.168.68.117':
-            target = f"{worker.user}@{worker.host}:/cygdrive/e/embed_work/imageselector/embed_exports/{batch_name}"
         else:
-            target = f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
+            log(f"Verification failed for {name}: {msg}")
 
-        # rsync empty dir with --delete removes all files in target
-        cmd = ['rsync', '-av', '--delete', f"{empty_dir}/", target]
-        subprocess.run(cmd, capture_output=True)
-        print(f"  Cleaned worker: {worker_name}")
-
-        # Also remove the now-empty dir on worker
-        if worker.host == 'localhost':
-            rm_cmd = ['ssh', 'embed@localhost', f'rmdir /Users/embed/imageselector/embed_exports/{batch_name}']
-        elif worker.host == '192.168.68.117':
-            rm_cmd = ['ssh', f'{worker.user}@{worker.host}', f'cmd /c rmdir E:\\embed_work\\imageselector\\embed_exports\\{batch_name}']
-        else:
-            rm_cmd = ['ssh', f'{worker.user}@{worker.host}', f'rmdir {worker.work_dir}/embed_exports/{batch_name}']
-        subprocess.run(rm_cmd, capture_output=True)
-
-    # Show final status
-    print("\nFinal status:")
-    subprocess.run([sys.executable, str(Path(__file__)), 'status'])
-
-
-def cmd_export(args):
-    """Export a batch for manual processing."""
-    orch = Orchestrator(Path(args.base_dir))
-
-    models = args.models.split(',') if args.models else ALL_MODELS
-
-    # Get pending images
-    all_pending = set()
-    for model in models:
-        pending = orch.get_pending_images(model, args.count)
-        all_pending.update(pending)
-
-    images = list(all_pending)[:args.count]
-
-    if not images:
-        print("No pending images!")
-        return
-
-    batch_dir = orch.export_batch(args.name, images, models)
-    print(f"Exported to: {batch_dir}")
-
-    if args.worker:
-        worker = WORKERS.get(args.worker)
-        if worker:
-            orch.rsync_to_worker(worker, batch_dir)
-        else:
-            print(f"Unknown worker: {args.worker}")
+    return total_imported
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Distributed Embedding Orchestrator')
-    parser.add_argument('--base-dir', default='/Users/tzuohannlaw/Documents/418Dreamworks/imageselector',
-                       help='Base directory')
+    if not acquire_lock():
+        print("Error: Another orchestrator instance is already running")
+        return
 
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    BACKUPS_DIR.mkdir(exist_ok=True)
 
-    # Status command
-    status_parser = subparsers.add_parser('status', help='Show embedding status')
-    status_parser.set_defaults(func=cmd_status)
+    log("=" * 60)
+    log("ORCHESTRATOR STARTED")
+    log("=" * 60)
+    log(f"Workers: {list(WORKERS.keys())}")
+    log("Stop with: touch KILL_ORCH")
 
-    # Run command
-    run_parser = subparsers.add_parser('run', help='Run distributed embedding')
-    run_parser.add_argument('--workers', help='Comma-separated worker names (default: all)')
-    run_parser.add_argument('--models', help='Comma-separated model names (default: all)')
-    run_parser.add_argument('--batch-size', type=int, default=1000, help='Total images to process')
-    run_parser.add_argument('--assign', action='append', metavar='WORKER:COUNT[:MODELS]',
-                           help='Explicit assignment: worker:count or worker:count:model1,model2. Can be repeated.')
-    run_parser.add_argument('--dry-run', action='store_true', help='Show distribution without running')
-    run_parser.set_defaults(func=cmd_run)
+    state = load_state()
 
-    # Export command
-    export_parser = subparsers.add_parser('export', help='Export batch for manual processing')
-    export_parser.add_argument('name', help='Batch name')
-    export_parser.add_argument('--count', type=int, default=100, help='Number of images')
-    export_parser.add_argument('--models', help='Comma-separated model names')
-    export_parser.add_argument('--worker', help='Worker to sync to')
-    export_parser.set_defaults(func=cmd_export)
+    try:
+        while not check_kill_file():
+            now = time.time()
 
-    args = parser.parse_args()
+            # QPS check every 5 minutes
+            if now - state["last_qps_check"] > QPS_CHECK_INTERVAL:
+                limits = check_rate_limit()
+                if limits:
+                    update_qps_config(limits)
+                state["last_qps_check"] = now
+                save_state(state)
 
-    if args.command:
-        args.func(args)
-    else:
-        parser.print_help()
+            # Backup every 6 hours
+            if now - state["last_backup"] > BACKUP_INTERVAL:
+                log("Starting 6-hour backup...")
+                stop_data_scripts()
+                time.sleep(5)  # Let them finish
+                do_backup()
+                start_data_scripts()
+                state["last_backup"] = now
+                save_state(state)
+
+            # Distributed work
+            processed = distribute_and_process()
+            if processed == 0:
+                # No work available, wait before checking again
+                log("No pending images, waiting...")
+                time.sleep(300)  # 5 minutes
+
+    except KeyboardInterrupt:
+        log("Interrupted")
+
+    finally:
+        release_lock()
+        log("Orchestrator stopped")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

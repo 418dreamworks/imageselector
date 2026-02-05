@@ -12,6 +12,7 @@ Workers (4 threads, partitioned):
 
 Kill file: touch KILL_DL to stop gracefully.
 """
+import os
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ import urllib.error
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_DL"
+PID_FILE = BASE_DIR / "image_downloader.pid"
 NUM_WORKERS = 4
 
 # Import from shared image_db module
@@ -33,6 +35,27 @@ from image_db import get_connection, commit_with_retry
 def ts():
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
+
+
+def acquire_lock() -> bool:
+    """Acquire PID lock. Returns False if another instance is running."""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)
+            return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    """Release PID lock."""
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def get_worker_kill_file(worker_id: int) -> Path:
@@ -243,6 +266,10 @@ def worker_loop(worker_id: int):
 # ============================================================
 
 def main():
+    if not acquire_lock():
+        print("Error: Another image_downloader.py instance is already running")
+        return
+
     IMAGES_DIR.mkdir(exist_ok=True)
 
     print(f"{'='*60}")
@@ -281,8 +308,12 @@ def main():
     for t in threads:
         t.join(timeout=5)
 
+    release_lock()
     print(f"\n[{ts()}] Downloader stopped")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        release_lock()
