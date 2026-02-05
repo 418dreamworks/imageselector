@@ -51,8 +51,12 @@ from models import MODELS, get_loader
 _rembg_session = None
 
 
+_force_cpu = False
+
 def get_device() -> str:
     """Auto-detect best available device."""
+    if _force_cpu:
+        return "cpu"
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -94,6 +98,22 @@ def remove_background(img: Image.Image) -> Image.Image:
     rgb_img.paste(img_nobg, mask=img_nobg.split()[3])
 
     return rgb_img
+
+
+def load_images_only(manifest: list, images_dir: Path) -> list:
+    """Load images without bg removal (for testing/already processed)."""
+    print(f"Loading {len(manifest)} images (no bg removal)...")
+    images = []
+    for lid, iid in tqdm(manifest, desc="Loading"):
+        img_path = images_dir / f"{lid}_{iid}.jpg"
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img.load()
+            images.append(img)
+        except Exception as e:
+            print(f"Warning: Failed to load {img_path}: {e}")
+            images.append(Image.new("RGB", (224, 224), (128, 128, 128)))
+    return images
 
 
 def load_and_process_images(manifest: list, images_dir: Path) -> list:
@@ -200,7 +220,20 @@ def main():
         choices=list(MODELS.keys()) + ["all"],
         help="Which model(s) to run"
     )
+    parser.add_argument(
+        "--skip-bg", action="store_true",
+        help="Skip bg removal (images already processed)"
+    )
+    parser.add_argument(
+        "--cpu", action="store_true",
+        help="Force CPU (for testing consistency)"
+    )
     args = parser.parse_args()
+
+    # Force CPU if requested
+    if args.cpu:
+        global _force_cpu
+        _force_cpu = True
 
     # Output is same directory as input
     batch_dir = args.input
@@ -229,8 +262,11 @@ def main():
 
     print(f"Manifest: {len(manifest)} images")
 
-    # Load images, remove backgrounds, save back to disk
-    images = load_and_process_images(manifest, images_dir)
+    # Load images (with or without bg removal)
+    if args.skip_bg:
+        images = load_images_only(manifest, images_dir)
+    else:
+        images = load_and_process_images(manifest, images_dir)
 
     # Determine models to run
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]

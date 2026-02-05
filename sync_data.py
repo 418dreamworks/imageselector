@@ -72,10 +72,13 @@ def ts():
 
 def check_kill_file():
     """Check for kill file and delete if found. Returns True if should exit."""
-    if KILL_FILE.exists():
-        KILL_FILE.unlink()
-        print(f"[{ts()}] Kill file detected. Shutting down gracefully...")
-        return True
+    try:
+        if KILL_FILE.exists():
+            KILL_FILE.unlink()
+            print(f"[{ts()}] Kill file detected at {KILL_FILE}. Shutting down gracefully...")
+            return True
+    except Exception as e:
+        print(f"[{ts()}] Error checking kill file: {e}")
     return False
 
 
@@ -240,12 +243,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             is_primary INTEGER,
             url TEXT,
             download_done INTEGER DEFAULT 0,
-            bg_removed INTEGER DEFAULT 0,
-            embed_clip_vitb32 INTEGER DEFAULT 0,
-            embed_clip_vitl14 INTEGER DEFAULT 0,
-            embed_dinov2_base INTEGER DEFAULT 0,
-            embed_dinov2_large INTEGER DEFAULT 0,
-            embed_dinov3_base INTEGER DEFAULT 0,
+            faiss_row INTEGER,
             PRIMARY KEY (listing_id, image_id)
         );
 
@@ -597,6 +595,94 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
 
+# ─── Phase 0: URL Repair ────────────────────────────────────────────────────
+
+def phase_repair_urls(client, conn):
+    """Repair phase: fetch URLs for images with download_done=0 and no URL.
+
+    Also handles:
+    - Inserting new images discovered during repair
+    - Deleting orphaned entries (listings no longer on Etsy)
+    """
+    cursor = conn.execute("""
+        SELECT DISTINCT listing_id
+        FROM image_status
+        WHERE download_done = 0 AND (url IS NULL OR url = '')
+    """)
+    listing_ids = [row[0] for row in cursor.fetchall()]
+
+    if not listing_ids:
+        print(f"[{ts()}] URL Repair: No URLs to repair")
+        return
+
+    print(f"[{ts()}] URL Repair: {len(listing_ids)} listings need URL repair...")
+
+    repaired = 0
+    inserted = 0
+    deleted = 0
+
+    # Process 100 listings at a time (batch API limit)
+    for i in range(0, len(listing_ids), 100):
+        if check_kill_file():
+            commit_with_retry(conn)
+            return
+
+        batch = listing_ids[i:i+100]
+        images_by_listing = fetch_listings_batch_with_images(client, batch)
+
+        batch_repaired = 0
+        batch_inserted = 0
+        batch_deleted = 0
+
+        # Process listings that were returned (still exist on Etsy)
+        for lid, images in images_by_listing.items():
+            for idx, img in enumerate(images):
+                image_id = img.get("listing_image_id")
+                url = img.get("url_570xN")
+                if not image_id or not url:
+                    continue
+
+                # Try to update existing entry
+                cursor = conn.execute("""
+                    UPDATE image_status SET url = ?
+                    WHERE listing_id = ? AND image_id = ? AND (url IS NULL OR url = '')
+                """, (url, lid, image_id))
+
+                if cursor.rowcount > 0:
+                    batch_repaired += 1
+                else:
+                    # Check if entry exists at all
+                    cursor = conn.execute("""
+                        SELECT 1 FROM image_status WHERE listing_id = ? AND image_id = ?
+                    """, (lid, image_id))
+                    if not cursor.fetchone():
+                        # New image - insert it
+                        insert_image(conn, lid, img, is_primary=(idx == 0))
+                        batch_inserted += 1
+
+        # Delete orphaned entries (listings not returned by API = taken down)
+        returned_lids = set(int(lid) for lid in images_by_listing.keys())
+        for lid in batch:
+            if lid not in returned_lids:
+                cursor = conn.execute("""
+                    DELETE FROM image_status WHERE listing_id = ?
+                """, (lid,))
+                batch_deleted += cursor.rowcount
+
+        repaired += batch_repaired
+        inserted += batch_inserted
+        deleted += batch_deleted
+
+        commit_with_retry(conn)
+
+        if (i + 100) % 100 == 0:
+            print(f"  URL Repair: {i + len(batch)}/{len(listing_ids)} | "
+                  f"repaired={repaired}, new={inserted}, deleted={deleted} | "
+                  f"API={_api_stats['used']}/{_api_stats['limit']}")
+
+    print(f"[{ts()}] URL Repair complete: {repaired} repaired, {inserted} new, {deleted} deleted")
+
+
 # ─── Phase 1-3: Taxonomy Crawl ──────────────────────────────────────────────
 
 def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
@@ -946,6 +1032,16 @@ def main():
     snapshot_ts = int(time.time())
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        # Phase 0: URL Repair (fetch URLs for reset images)
+        print(f"\n--- Phase 0: URL Repair ---")
+        phase_repair_urls(client, conn)
+
+        if check_kill_file():
+            commit_with_retry(conn)
+            conn.close()
+            release_lock()
+            return
+
         # Phase 1: Taxonomy crawl (listings + images)
         print(f"\n--- Phase 1: Taxonomy Crawl ---")
         phase_crawl(
