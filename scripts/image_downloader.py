@@ -2,9 +2,8 @@
 """Image downloader with manager/worker architecture.
 
 Manager (main thread):
-- Fetches images where download_done=0, groups by listing_id
-- Calls /application/listings/batch?includes=Images to get URLs
-- Writes .dl marker files with URLs, then marks download_done=1
+- Scans for images where download_done=0, reads URL from DB
+- Creates .dl marker files with URLs, marks download_done=1
 - Checks for completed jpgs (>1kb), marks download_done=2, cleans up .dl files
 
 Workers (4 threads, partitioned):
@@ -13,27 +12,18 @@ Workers (4 threads, partitioned):
 
 Kill file: touch KILL_DL to stop gracefully.
 """
-import os
 import sys
 import threading
 import time
 from pathlib import Path
-from collections import defaultdict
 
 import urllib.request
 import urllib.error
-import httpx
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_DL"
 NUM_WORKERS = 4
-
-ETSY_API_KEY = os.getenv("ETSY_API_KEY")
-BASE_URL = "https://openapi.etsy.com/v3"
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR))
@@ -70,7 +60,7 @@ def check_worker_kill_file(worker_id: int) -> bool:
 
 
 # ============================================================
-# MANAGER - Fetches URLs via API, creates markers, updates SQL
+# MANAGER - Reads URLs from DB, creates markers, updates flags
 # ============================================================
 
 def get_marker_path(listing_id: int, image_id: int) -> Path:
@@ -81,96 +71,26 @@ def get_image_path(listing_id: int, image_id: int) -> Path:
     return IMAGES_DIR / f"{listing_id}_{image_id}.jpg"
 
 
-def get_images_needing_download(conn, max_listings: int = 100) -> list[dict]:
-    """Get images where download_done=0, limited to max_listings unique listings."""
-    cursor = conn.execute("""
-        SELECT listing_id, image_id
-        FROM image_status
-        WHERE download_done = 0
-        AND listing_id IN (
-            SELECT DISTINCT listing_id FROM image_status
-            WHERE download_done = 0
-            LIMIT ?
-        )
-    """, (max_listings,))
-    return [{"listing_id": row[0], "image_id": row[1]} for row in cursor.fetchall()]
-
-
-def get_images_in_progress(conn, limit: int = 5000) -> list[dict]:
-    """Get images where download_done=1 (marker created, download in progress)."""
-    cursor = conn.execute("""
-        SELECT listing_id, image_id
-        FROM image_status
-        WHERE download_done = 1
-        LIMIT ?
-    """, (limit,))
-    return [{"listing_id": row[0], "image_id": row[1]} for row in cursor.fetchall()]
-
-
-def fetch_listing_images(listing_ids: list[int]) -> dict[int, dict[int, str]]:
-    """Fetch image URLs for multiple listings via /application/listings/batch.
-
-    Args:
-        listing_ids: List of listing IDs to fetch
-
-    Returns:
-        Dict mapping listing_id -> {image_id: url_570xN, ...}
-    """
-    if not listing_ids:
-        return {}
-
-    result = {}
-    headers = {"x-api-key": ETSY_API_KEY}
-
-    # Etsy batch endpoint accepts up to 100 listing IDs
-    for i in range(0, len(listing_ids), 100):
-        batch = listing_ids[i:i + 100]
-        ids_param = ",".join(str(lid) for lid in batch)
-
-        url = f"{BASE_URL}/application/listings/batch?listing_ids={ids_param}&includes=Images"
-
-        try:
-            with httpx.Client(timeout=30) as client:
-                resp = client.get(url, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as e:
-            print(f"[{ts()}] API error: {e}")
-            continue
-
-        # Parse response
-        for listing in data.get("results", []):
-            lid = listing.get("listing_id")
-            images = listing.get("images", [])
-
-            if lid and images:
-                result[lid] = {}
-                for img in images:
-                    iid = img.get("listing_image_id")
-                    img_url = img.get("url_570xN")
-                    if iid and img_url:
-                        result[lid][iid] = img_url
-
-        # Rate limit
-        time.sleep(0.2)
-
-    return result
-
-
 def manager_scan() -> dict:
     """
     1. Check in-progress images (download_done=1) - if jpg exists, mark as 2
-    2. Fetch new images (download_done=0) - get URLs, write markers, mark as 1
+    2. Create markers for new images (download_done=0) - read URL from DB
     """
-    stats = {"completed": 0, "markers_created": 0, "api_fetched": 0, "skipped": 0}
+    stats = {"completed": 0, "markers_created": 0, "skipped": 0}
 
     conn = get_connection()
 
     # --- Phase 1: Check in-progress images for completion ---
-    in_progress = get_images_in_progress(conn)
+    cursor = conn.execute("""
+        SELECT listing_id, image_id
+        FROM image_status
+        WHERE download_done = 1
+        LIMIT 5000
+    """)
+    in_progress = cursor.fetchall()
 
-    for img in in_progress:
-        lid, iid = img["listing_id"], img["image_id"]
+    for row in in_progress:
+        lid, iid = row[0], row[1]
         img_path = get_image_path(lid, iid)
         marker_path = get_marker_path(lid, iid)
 
@@ -192,43 +112,36 @@ def manager_scan() -> dict:
     if stats["completed"] > 0:
         commit_with_retry(conn)
 
-    # --- Phase 2: Fetch URLs for new images, create markers ---
-    new_images = get_images_needing_download(conn, max_listings=100)
+    # --- Phase 2: Create markers for new images ---
+    cursor = conn.execute("""
+        SELECT listing_id, image_id, url
+        FROM image_status
+        WHERE download_done = 0 AND url IS NOT NULL AND url != ''
+        LIMIT 1000
+    """)
+    new_images = cursor.fetchall()
 
-    if new_images:
-        # Group by listing_id
-        by_listing = defaultdict(list)
-        for img in new_images:
-            by_listing[img["listing_id"]].append(img["image_id"])
+    # Step 1: Write ALL marker files first
+    markers_written = []
+    for row in new_images:
+        lid, iid, url = row[0], row[1], row[2]
+        marker_path = get_marker_path(lid, iid)
 
-        # Fetch URLs from API
-        listing_ids = list(by_listing.keys())
-        url_data = fetch_listing_images(listing_ids)
-        stats["api_fetched"] = len(url_data)
+        if not marker_path.exists():
+            marker_path.write_text(url)
+            markers_written.append((lid, iid))
+            stats["markers_created"] += 1
+        else:
+            stats["skipped"] += 1
 
-        # Step 1: Write ALL marker files first
-        markers_written = []
-        for lid, image_ids in by_listing.items():
-            listing_urls = url_data.get(lid, {})
+    # Step 2: Batch update DB flags AFTER all markers written
+    for lid, iid in markers_written:
+        conn.execute("""
+            UPDATE image_status SET download_done = 1
+            WHERE listing_id = ? AND image_id = ? AND download_done = 0
+        """, (lid, iid))
 
-            for iid in image_ids:
-                url = listing_urls.get(iid)
-                marker_path = get_marker_path(lid, iid)
-
-                if url:
-                    marker_path.write_text(url)
-                    markers_written.append((lid, iid))
-                    stats["markers_created"] += 1
-                else:
-                    stats["skipped"] += 1
-
-        # Step 2: Batch update DB flags AFTER all markers written
-        for lid, iid in markers_written:
-            conn.execute("""
-                UPDATE image_status SET download_done = 1
-                WHERE listing_id = ? AND image_id = ? AND download_done = 0
-            """, (lid, iid))
-
+    if markers_written:
         commit_with_retry(conn)
 
     conn.close()
@@ -332,10 +245,6 @@ def worker_loop(worker_id: int):
 def main():
     IMAGES_DIR.mkdir(exist_ok=True)
 
-    if not ETSY_API_KEY:
-        print("ERROR: ETSY_API_KEY not set in environment")
-        sys.exit(1)
-
     print(f"{'='*60}")
     print(f"IMAGE DOWNLOADER")
     print(f"{'='*60}")
@@ -363,8 +272,7 @@ def main():
 
             if stats["markers_created"] > 0 or stats["completed"] > 0:
                 print(f"\n[{ts()}] Scan: markers={stats['markers_created']} "
-                      f"completed={stats['completed']} api={stats['api_fetched']} "
-                      f"skipped={stats['skipped']}")
+                      f"completed={stats['completed']} skipped={stats['skipped']}")
 
         time.sleep(1)
 

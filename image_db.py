@@ -74,13 +74,14 @@ def insert_image(
     listing_id: int,
     image_id: int,
     is_primary: bool,
+    url: str,
 ):
     """Insert a new image. Used by sync_data.py when discovering new images."""
     conn.execute("""
         INSERT OR IGNORE INTO image_status (
-            listing_id, image_id, is_primary
-        ) VALUES (?, ?, ?)
-    """, (listing_id, image_id, int(is_primary)))
+            listing_id, image_id, is_primary, url
+        ) VALUES (?, ?, ?, ?)
+    """, (listing_id, image_id, int(is_primary), url))
 
 
 # ============================================================

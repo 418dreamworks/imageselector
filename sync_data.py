@@ -213,6 +213,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             listing_id INTEGER,
             image_id INTEGER,
             is_primary INTEGER,
+            url TEXT,
             download_done INTEGER DEFAULT 0,
             bg_removed INTEGER DEFAULT 0,
             embed_clip_vitb32 INTEGER DEFAULT 0,
@@ -435,6 +436,39 @@ def fetch_shop(client, shop_id):
         return None
 
 
+def fetch_listings_batch_with_images(client, listing_ids):
+    """Fetch listings with images via batch endpoint.
+
+    Returns dict mapping listing_id -> list of image dicts with url_570xN.
+    """
+    if not listing_ids:
+        return {}
+
+    time.sleep(get_api_delay())
+    try:
+        response = client.get(
+            f"{BASE_URL}/application/listings/batch",
+            headers={"x-api-key": ETSY_API_KEY},
+            params={
+                "listing_ids": ",".join(str(lid) for lid in listing_ids),
+                "includes": "Images"
+            },
+        )
+        update_api_usage(response)
+        response.raise_for_status()
+
+        result = {}
+        for listing in response.json().get("results", []):
+            lid = listing.get("listing_id")
+            images = listing.get("images", [])
+            if lid and images:
+                result[lid] = images
+        return result
+    except Exception as e:
+        print(f"  Error fetching batch images: {e}")
+        return {}
+
+
 def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     """Fetch reviews for a shop newer than last_timestamp."""
     reviews = []
@@ -499,9 +533,10 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
 
     for idx, img in enumerate(images):
         image_id = img.get("listing_image_id")
+        url = img.get("url_570xN", "")
         is_primary = (idx == 0)
 
-        insert_image(conn, listing_id, image_id, is_primary)
+        insert_image(conn, listing_id, image_id, is_primary, url)
 
     if own_conn:
         commit_with_retry(conn)
@@ -615,7 +650,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
             if results:
                 # Process this last batch before marking exhausted
                 _process_crawl_batch(
-                    results, conn, existing_listings, listing_last_ts,
+                    client, results, conn, existing_listings, listing_last_ts,
                     snapshot_ts, stats
                 )
             exhausted.add(crawl_unit_index)
@@ -633,7 +668,7 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
 
         # Process batch
         _process_crawl_batch(
-            results, conn, existing_listings, listing_last_ts,
+            client, results, conn, existing_listings, listing_last_ts,
             snapshot_ts, stats
         )
 
@@ -653,14 +688,15 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
           f"{stats['skipped']} dyn_fresh")
 
 
-def _process_crawl_batch(results, conn, existing_listings, listing_last_ts,
+def _process_crawl_batch(client, results, conn, existing_listings, listing_last_ts,
                          snapshot_ts, stats):
     """Process a batch of listings from the taxonomy crawl.
 
     For each listing:
     - Insert listing data into listings_static/listings_dynamic
-    - Insert image data into image_status
+    - For new listings, fetch images via batch API and insert into image_status
     """
+    new_listing_ids = []
 
     for listing in results:
         lid = listing["listing_id"]
@@ -675,14 +711,19 @@ def _process_crawl_batch(results, conn, existing_listings, listing_last_ts,
             else:
                 stats["skipped"] += 1
         else:
-            # New listing — insert static + dynamic + images
+            # New listing — insert static + dynamic
             insert_listing_static(conn, listing, snapshot_ts)
             insert_listing_dynamic(conn, listing, snapshot_ts)
             existing_listings.add(lid)
             listing_last_ts[lid] = snapshot_ts
+            new_listing_ids.append(lid)
 
-            # Insert images (from the listing response, already included via includes=Images)
-            images = listing.get("images", [])
+    # Fetch images for all new listings in one batch API call
+    if new_listing_ids:
+        images_by_listing = fetch_listings_batch_with_images(client, new_listing_ids)
+
+        for lid in new_listing_ids:
+            images = images_by_listing.get(lid, [])
             if images:
                 add_images_to_sql(lid, images, conn=conn)
                 stats["new_with_images"] += 1
