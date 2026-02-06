@@ -93,7 +93,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=1000,
+        batch_size=5000,
     ),
     'mbp': Worker(
         name='mbp',
@@ -101,7 +101,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=1000,
+        batch_size=10000,
     ),
     'sleight': Worker(
         name='sleight',
@@ -109,7 +109,7 @@ WORKERS = {
         user='embed',
         work_dir='C:/Users/embed/imageselector',
         python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
-        batch_size=1000,
+        batch_size=20000,
         rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
 }

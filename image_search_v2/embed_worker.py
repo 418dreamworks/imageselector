@@ -73,7 +73,7 @@ def init_rembg():
 
     device = get_device()
     if device == "cuda":
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        providers = ["DmlExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
     elif device == "mps":
         providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     else:
