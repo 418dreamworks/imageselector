@@ -241,7 +241,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             is_primary INTEGER,
             url TEXT,
             download_done INTEGER DEFAULT 0,
-            faiss_row INTEGER,
             PRIMARY KEY (listing_id, image_id)
         );
 
@@ -603,7 +602,7 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
 
     For existing rows: updates is_primary always, url only if missing.
     For new rows: inserts with download_done=0.
-    Preserves download_done and faiss_row for existing rows.
+    Preserves download_done for existing rows.
     """
     if not images:
         return

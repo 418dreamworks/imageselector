@@ -33,7 +33,7 @@ def check_kill_file() -> bool:
 
 
 def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
-    """Find non-primary images that have been embedded (faiss_row IS NOT NULL).
+    """Find non-primary images that have been downloaded.
 
     Returns images that can be moved to backup.
     """
@@ -41,7 +41,7 @@ def get_cleanable_images(conn, limit: int = 10000) -> list[dict]:
         SELECT listing_id, image_id
         FROM image_status
         WHERE is_primary = 0
-          AND faiss_row IS NOT NULL
+          AND download_done = 2
         LIMIT ?
     """
 

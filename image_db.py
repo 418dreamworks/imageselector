@@ -4,7 +4,7 @@ All scripts use this module to update flags in image_status table.
 Each UPDATE is atomic - no race conditions between scripts.
 
 Schema (image_status):
-    listing_id, image_id, is_primary, url, download_done, faiss_row
+    listing_id, image_id, is_primary, url, download_done
 """
 import sqlite3
 import time
@@ -106,14 +106,8 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     cursor.execute("SELECT COUNT(*) FROM image_status WHERE download_done = 2")
     stats["downloaded"] = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM image_status WHERE faiss_row IS NOT NULL")
-    stats["embedded"] = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM image_status WHERE download_done = 0")
     stats["pending_download"] = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM image_status WHERE download_done = 2 AND faiss_row IS NULL")
-    stats["pending_embed"] = cursor.fetchone()[0]
 
     return stats
 
@@ -126,9 +120,7 @@ def print_stats():
 
     print(f"Total images:       {stats['total']:,}")
     print(f"Downloaded:         {stats['downloaded']:,}")
-    print(f"Embedded (faiss):   {stats['embedded']:,}")
     print(f"Pending download:   {stats['pending_download']:,}")
-    print(f"Pending embed:      {stats['pending_embed']:,}")
 
 
 if __name__ == "__main__":

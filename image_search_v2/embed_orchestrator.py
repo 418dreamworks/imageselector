@@ -93,7 +93,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=3000,
+        batch_size=1000,
     ),
     'mbp': Worker(
         name='mbp',
@@ -101,7 +101,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=3000,
+        batch_size=1000,
     ),
     'sleight': Worker(
         name='sleight',
@@ -109,7 +109,7 @@ WORKERS = {
         user='embed',
         work_dir='C:/Users/embed/imageselector',
         python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
-        batch_size=10000,
+        batch_size=1000,
         rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
 }
@@ -263,11 +263,14 @@ def start_data_scripts():
 
 
 def check_faiss_consistency() -> tuple[bool, str]:
-    """Check that all FAISS files have the same vector count.
+    """Check that image_index.json and all FAISS files have the same count.
 
     Returns (is_consistent, message).
     """
     import faiss
+
+    index_data = load_image_index()
+    index_count = len(index_data)
 
     faiss_counts = {}
     if EMBEDDINGS_DIR.exists():
@@ -276,15 +279,22 @@ def check_faiss_consistency() -> tuple[bool, str]:
                 index = faiss.read_index(str(f))
                 faiss_counts[f.name] = index.ntotal
 
-    if not faiss_counts:
-        return True, "No FAISS files yet"
+    if not faiss_counts and index_count == 0:
+        return True, "Both empty"
+
+    if not faiss_counts and index_count > 0:
+        return False, f"image_index has {index_count} but no FAISS files"
 
     # All FAISS files should have same count
     counts = list(faiss_counts.values())
     if len(set(counts)) > 1:
         return False, f"FAISS files have different counts: {faiss_counts}"
 
-    return True, f"Consistent: {counts[0]} entries"
+    faiss_count = counts[0]
+    if index_count != faiss_count:
+        return False, f"image_index has {index_count}, FAISS has {faiss_count}"
+
+    return True, f"Consistent: {index_count} entries"
 
 
 def do_backup():
@@ -329,42 +339,34 @@ def do_backup():
 
 
 # ============================================================
-# FAISS ID ENCODING (listing_id + image_id → int64)
+# IMAGE INDEX (JSON row ↔ FAISS row, with vector hash for integrity)
 # ============================================================
 
-def encode_faiss_id(listing_id: int, image_id: int) -> int:
-    """Encode listing_id and image_id into a single int64 for FAISS IndexIDMap."""
-    return (listing_id << 33) | image_id
+IMAGE_INDEX_FILE = EMBEDDINGS_DIR / 'image_index.json'
 
 
-def decode_faiss_id(faiss_id: int) -> Tuple[int, int]:
-    """Decode FAISS int64 ID back to (listing_id, image_id)."""
-    listing_id = faiss_id >> 33
-    image_id = faiss_id & ((1 << 33) - 1)
-    return listing_id, image_id
+def vector_hash(v) -> str:
+    """Short hash of a numpy vector for integrity checking."""
+    import hashlib
+    return hashlib.md5(v.tobytes()).hexdigest()[:12]
 
 
-def get_embedded_set_from_faiss() -> set:
-    """Read all IDs from a FAISS IndexIDMap file to build the embedded set.
+def load_image_index() -> List[dict]:
+    """Load image_index.json. Each entry: {lid, iid, row, hash}."""
+    if IMAGE_INDEX_FILE.exists():
+        return json.loads(IMAGE_INDEX_FILE.read_text())
+    return []
 
-    Uses the first available model's .faiss file (all have the same IDs).
-    Returns set of (listing_id, image_id) tuples.
-    """
-    import faiss
 
-    for model in ALL_MODELS:
-        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
-        if faiss_file.exists():
-            index = faiss.read_index(str(faiss_file))
-            n = index.ntotal
-            if n == 0:
-                return set()
-            # Reconstruct all IDs from the IndexIDMap
-            id_map = faiss.downcast_index(index)
-            ids = faiss.vector_to_array(id_map.id_map)
-            return {decode_faiss_id(int(fid)) for fid in ids}
+def save_image_index(index: List[dict]):
+    """Save image_index.json."""
+    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGE_INDEX_FILE.write_text(json.dumps(index))
 
-    return set()
+
+def load_embedded_set(image_index: List[dict]) -> set:
+    """Build set of (listing_id, image_id) from image_index."""
+    return {(e[0], e[1]) for e in image_index}
 
 
 def get_pending_images(limit: int, embedded_set: set) -> List[Tuple[int, int]]:
@@ -450,8 +452,8 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
     return batch_dir
 
 
-def import_batch(batch_dir: Path, embedded_set: set) -> int:
-    """Import batch: copy bg-removed images, append to FAISS IndexIDMap.
+def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) -> int:
+    """Import batch: copy bg-removed images, append FAISS, append image_index.
 
     IMPORTANT: This function is atomic - once started, it must complete.
     Do NOT add kill file checks inside this function.
@@ -459,6 +461,7 @@ def import_batch(batch_dir: Path, embedded_set: set) -> int:
 
     Args:
         batch_dir: Path to the batch directory with manifest, images, and .npy files
+        image_index: The current image_index list (mutated in place and saved)
         embedded_set: Set of (listing_id, image_id) already embedded (updated in place)
 
     Returns:
@@ -501,45 +504,60 @@ def import_batch(batch_dir: Path, embedded_set: set) -> int:
 
     log(f"Moved {moved_count} images to embeddedimages, removed from images/")
 
-    # 2. Build ID array for this batch
-    ids = np.array([encode_faiss_id(lid, iid) for lid, iid in manifest], dtype=np.int64)
+    # 2. Load all embeddings for hashing
+    all_embeddings = {}  # model_key -> numpy array
+    for model in ALL_MODELS:
+        all_embeddings[model] = np.load(batch_dir / f"{model}.npy").astype("float32")
+        text_npy = batch_dir / f"{model}_text.npy"
+        if text_npy.exists():
+            all_embeddings[f"{model}_text"] = np.load(text_npy).astype("float32")
 
-    # 3. Append to FAISS IndexIDMap indexes
+    # Hash order: clip_vitb32, clip_vitb32_text, clip_vitl14, clip_vitl14_text,
+    #             dinov2_base, dinov2_large, dinov3_base
+    hash_keys = []
+    for model in ALL_MODELS:
+        hash_keys.append(model)
+        if f"{model}_text" in all_embeddings:
+            hash_keys.append(f"{model}_text")
+
+    start_row = len(image_index)
+
+    # 3. Append to FAISS indexes
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     for model in ALL_MODELS:
-        npy_file = batch_dir / f"{model}.npy"
-        embeddings = np.load(npy_file).astype("float32")
+        embeddings = all_embeddings[model]
 
         faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
         if faiss_file.exists():
             index = faiss.read_index(str(faiss_file))
         else:
             dim = embeddings.shape[1]
-            base = faiss.IndexFlatIP(dim)
-            index = faiss.IndexIDMap(base)
+            index = faiss.IndexFlatIP(dim)
 
-        index.add_with_ids(embeddings, ids)
+        index.add(embeddings)
         faiss.write_index(index, str(faiss_file))
 
         # Handle CLIP text embeddings
-        text_npy = batch_dir / f"{model}_text.npy"
-        if text_npy.exists():
-            text_emb = np.load(text_npy).astype("float32")
-            text_faiss = EMBEDDINGS_DIR / f"{model}_text.faiss"
+        text_key = f"{model}_text"
+        if text_key in all_embeddings:
+            text_emb = all_embeddings[text_key]
+            text_faiss = EMBEDDINGS_DIR / f"{text_key}.faiss"
             if text_faiss.exists():
                 text_index = faiss.read_index(str(text_faiss))
             else:
-                text_base = faiss.IndexFlatIP(text_emb.shape[1])
-                text_index = faiss.IndexIDMap(text_base)
-            text_index.add_with_ids(text_emb, ids)
+                text_index = faiss.IndexFlatIP(text_emb.shape[1])
+            text_index.add(text_emb)
             faiss.write_index(text_index, str(text_faiss))
 
-    # 4. Update embedded_set
-    for lid, iid in manifest:
+    # 4. Append to image_index.json with per-model vector hashes
+    for i, (lid, iid) in enumerate(manifest):
+        hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
+        image_index.append([lid, iid, start_row + i] + hashes)
         embedded_set.add((lid, iid))
+    save_image_index(image_index)
 
-    log(f"Imported {len(manifest)} images")
+    log(f"Imported {len(manifest)} images (rows {start_row}-{start_row + len(manifest) - 1})")
     return len(manifest)
 
 
@@ -744,8 +762,9 @@ def main():
 
     log(f"Consistency check: {msg}")
 
-    # Load embedded set from FAISS (IDs are stored in IndexIDMap)
-    embedded_set = get_embedded_set_from_faiss()
+    # Load image index and build embedded set
+    image_index = load_image_index()
+    embedded_set = load_embedded_set(image_index)
     log(f"Already embedded: {len(embedded_set)} images")
     log(f"Workers: {list(WORKERS.keys())}")
     log("Stop with: touch KILL_ORCH")
@@ -859,7 +878,7 @@ def main():
             # Process import queue (one batch per loop iteration)
             if import_queue:
                 worker_name, batch_dir = import_queue.pop(0)
-                imported = import_batch(batch_dir, embedded_set)
+                imported = import_batch(batch_dir, image_index, embedded_set)
                 total_imported += imported
 
                 # Cleanup
