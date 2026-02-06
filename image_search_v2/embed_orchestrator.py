@@ -84,6 +84,10 @@ class WorkerState:
     started_at: float = 0
     status: str = 'idle'  # idle, working, done, frozen
     check_failures: int = 0
+    # Pre-staged next batch (exported + rsynced to worker while current batch runs)
+    next_batch: Optional[str] = None
+    next_batch_images: List[Tuple[int, int]] = field(default_factory=list)
+    next_staged: bool = False  # True = rsynced to worker and ready to start
 
 
 WORKERS = {
@@ -369,23 +373,66 @@ def load_embedded_set(image_index: List[dict]) -> set:
     return {(e[0], e[1]) for e in image_index}
 
 
-def get_pending_images(limit: int, embedded_set: set) -> List[Tuple[int, int]]:
-    """Get images needing embedding (download_done=2, not yet embedded)."""
+BUFFER_TARGET = 50000  # Keep ~50K images in work buffer
+
+
+def top_up_buffer(work_buffer: dict, embedded_set: set):
+    """Fill work buffer to BUFFER_TARGET with new pending images from DB.
+
+    Only grabs images that are:
+    - download_done=2 (ready for embedding)
+    - NOT in embedded_set (not already in FAISS)
+    - NOT already in work_buffer (not grabbed/exported)
+    """
+    grabbed_count = sum(1 for s in work_buffer.values() if s == 'grabbed')
+    needed = BUFFER_TARGET - grabbed_count
+    if needed <= 0:
+        return 0
+
     conn = get_connection()
     cursor = conn.execute("""
         SELECT listing_id, image_id
         FROM image_status
         WHERE download_done = 2
     """)
-    results = []
+    added = 0
     for row in cursor:
         key = (row[0], row[1])
-        if key not in embedded_set:
+        if key not in embedded_set and key not in work_buffer:
+            work_buffer[key] = 'grabbed'
+            added += 1
+            if added >= needed:
+                break
+    conn.close()
+    if added > 0:
+        log(f"Buffer topped up: +{added} = {len(work_buffer)} total")
+    return added
+
+
+def get_from_buffer(work_buffer: dict, limit: int) -> List[Tuple[int, int]]:
+    """Get up to `limit` grabbed images from buffer, mark as exported."""
+    results = []
+    for key, status in work_buffer.items():
+        if status == 'grabbed':
             results.append(key)
             if len(results) >= limit:
                 break
-    conn.close()
+    for key in results:
+        work_buffer[key] = 'exported'
     return results
+
+
+def buffer_return(work_buffer: dict, images: List[Tuple[int, int]]):
+    """Return images to buffer as grabbed (e.g., on rsync failure)."""
+    for key in images:
+        if key in work_buffer:
+            work_buffer[key] = 'grabbed'
+
+
+def buffer_clear_imported(work_buffer: dict, images: List[Tuple[int, int]]):
+    """Clear imported images from buffer. Safe because DB embedded_set prevents re-grab."""
+    for key in images:
+        work_buffer.pop(key, None)
 
 
 def get_listing_texts(listing_ids: List[int]) -> dict:
@@ -453,14 +500,16 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
 
 
 def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) -> int:
-    """Import batch: copy bg-removed images, append FAISS, append image_index.
+    """Import batch: move original images to SSD, append FAISS, append image_index.
 
     IMPORTANT: This function is atomic - once started, it must complete.
     Do NOT add kill file checks inside this function.
     If interrupted, consistency check will catch the mismatch on next startup.
 
+    Raises Exception on failure so orchestrator can stop.
+
     Args:
-        batch_dir: Path to the batch directory with manifest, images, and .npy files
+        batch_dir: Path to the batch directory with manifest and .npy files
         image_index: The current image_index list (mutated in place and saved)
         embedded_set: Set of (listing_id, image_id) already embedded (updated in place)
 
@@ -472,37 +521,29 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
 
     manifest_file = batch_dir / "manifest.json"
     if not manifest_file.exists():
-        log(f"No manifest in {batch_dir}")
-        return 0
+        raise RuntimeError(f"No manifest in {batch_dir}")
 
     manifest = json.loads(manifest_file.read_text())
     if not manifest:
         return 0
 
-    images_src = batch_dir / "images"
-
     # Verify all .npy files exist
     for model in ALL_MODELS:
         if not (batch_dir / f"{model}.npy").exists():
-            log(f"Missing {model}.npy in {batch_dir}")
-            return 0
+            raise RuntimeError(f"Missing {model}.npy in {batch_dir}")
 
-    # 1. Move all bg-removed images to embeddedimages, remove from images/
+    # 1. Move original images from images/ to embeddedimages/ on SSD
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
     moved_count = 0
 
     for lid, iid in manifest:
-        src = images_src / f"{lid}_{iid}.jpg"
-        if src.exists():
+        orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if orig.exists():
             dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
-            shutil.copy2(src, dst)
+            shutil.move(str(orig), str(dst))
             moved_count += 1
 
-            orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
-            if orig.exists():
-                orig.unlink()
-
-    log(f"Moved {moved_count} images to embeddedimages, removed from images/")
+    log(f"Moved {moved_count} images to embeddedimages")
 
     # 2. Load all embeddings for hashing
     all_embeddings = {}  # model_key -> numpy array
@@ -644,23 +685,6 @@ def check_worker_done(worker: Worker, batch_name: str) -> bool:
     return all((batch_dir / f"{model}.npy").exists() for model in ALL_MODELS)
 
 
-def rsync_images_back(worker: Worker, batch_name: str) -> bool:
-    """Rsync bg-removed images back from worker."""
-    batch_dir = EXPORTS_DIR / batch_name
-    src = get_rsync_target(worker, batch_name) + "/images/"
-
-    cmd = ['rsync', '-av', src, f"{batch_dir}/images/"]
-    if worker.host == '192.168.68.117':
-        cmd = ['rsync', '-av', f'--rsync-path={worker.rsync_path}', src, f"{batch_dir}/images/"]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        log(f"  {worker.name}: rsync images back timed out")
-        return False
-
-
 def cleanup_worker_batch(worker: Worker, batch_name: str):
     """Clean up batch on worker after import."""
     ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
@@ -777,8 +801,12 @@ def main():
         for name, worker in WORKERS.items()
     }
 
-    # Import queue: completed batches waiting to be imported
-    import_queue: List[Tuple[str, Path]] = []  # (worker_name, batch_dir)
+    # Work buffer: (listing_id, image_id) -> 'grabbed' | 'exported'
+    # 'grabbed' = in buffer, available for assignment
+    # 'exported' = assigned to a worker, waiting for completion
+    # After import, entries are cleared (DB embedded_set prevents re-grab)
+    work_buffer: Dict[Tuple[int, int], str] = {}
+    top_up_buffer(work_buffer, embedded_set)
 
     last_qps_check = 0
     batch_counter = 0
@@ -827,7 +855,7 @@ def main():
                     continue
 
                 if state.status == 'working':
-                    # Check if done
+                    # Check if done (also rsyncs npy files to local batch dir)
                     result = check_worker_done(worker, state.current_batch)
 
                     if result is None:
@@ -837,29 +865,98 @@ def main():
                         if state.check_failures >= MAX_CHECK_RETRIES:
                             log(f"  {name}: FROZEN after {MAX_CHECK_RETRIES} timeouts")
                             state.status = 'frozen'
-                    elif result:
-                        # Done
-                        state.check_failures = 0
-                        log(f"{name}: batch complete, syncing images back")
-                        rsync_images_back(worker, state.current_batch)
 
-                        batch_dir = EXPORTS_DIR / state.current_batch
-                        import_queue.append((name, batch_dir))
-                        state.status = 'done'
-                    # else: not done yet, keep waiting
+                    elif result:
+                        # Worker done! npy files already synced by check_worker_done
+                        state.check_failures = 0
+                        completed_batch = state.current_batch
+                        completed_images = state.batch_images
+
+                        # Step 1: Start worker on pre-staged next batch immediately
+                        if state.next_batch and state.next_staged:
+                            log(f"{name}: batch complete, starting pre-staged {state.next_batch}")
+                            start_worker_job(worker, state.next_batch)
+                            state.current_batch = state.next_batch
+                            state.batch_images = state.next_batch_images
+                            state.started_at = now
+                            state.next_batch = None
+                            state.next_batch_images = []
+                            state.next_staged = False
+                            # status stays 'working'
+
+                            # Initiate N+2 pre-stage
+                            grabbed_count = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                            if grabbed_count < worker.batch_size:
+                                top_up_buffer(work_buffer, embedded_set)
+                            next_images = get_from_buffer(work_buffer, worker.batch_size)
+                            if next_images:
+                                batch_counter += 1
+                                next_name = f"batch_{batch_counter:05d}_{name}"
+                                log(f"{name}: pre-staging {next_name} ({len(next_images)} images)")
+                                next_dir = export_batch(next_name, next_images)
+                                if rsync_to_worker(worker, next_dir):
+                                    state.next_batch = next_name
+                                    state.next_batch_images = next_images
+                                    state.next_staged = True
+                                else:
+                                    log(f"{name}: pre-stage rsync failed for {next_name}")
+                                    buffer_return(work_buffer, next_images)
+                                    shutil.rmtree(next_dir)
+                        else:
+                            log(f"{name}: batch complete, no pre-staged batch")
+                            state.status = 'done'
+
+                        # Step 2: Import completed batch (npy files already local)
+                        batch_dir = EXPORTS_DIR / completed_batch
+                        try:
+                            imported = import_batch(batch_dir, image_index, embedded_set)
+                            total_imported += imported
+                            buffer_clear_imported(work_buffer, completed_images)
+
+                            # Cleanup: remove batch on worker and locally
+                            cleanup_worker_batch(worker, completed_batch)
+                            shutil.rmtree(batch_dir)
+                            log(f"Total imported: {total_imported}")
+                        except Exception as e:
+                            log(f"FATAL: Import failed for {completed_batch}: {e}")
+                            log("Stopping orchestrator due to import failure")
+                            should_exit = True
+                            break
+
+                    else:
+                        # Not done yet - pre-stage next batch if not already done
+                        if not state.next_batch:
+                            grabbed_count = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                            if grabbed_count < worker.batch_size:
+                                top_up_buffer(work_buffer, embedded_set)
+                            images = get_from_buffer(work_buffer, worker.batch_size)
+                            if images:
+                                batch_counter += 1
+                                batch_name = f"batch_{batch_counter:05d}_{name}"
+                                log(f"{name}: pre-staging {batch_name} ({len(images)} images)")
+                                batch_dir = export_batch(batch_name, images)
+                                if rsync_to_worker(worker, batch_dir):
+                                    state.next_batch = batch_name
+                                    state.next_batch_images = images
+                                    state.next_staged = True
+                                else:
+                                    log(f"{name}: pre-stage rsync failed for {batch_name}")
+                                    buffer_return(work_buffer, images)
+                                    shutil.rmtree(batch_dir)
 
                 elif state.status in ('idle', 'done'):
-                    # Get new batch for this worker
-                    images = get_pending_images(worker.batch_size, embedded_set)
+                    # Ensure buffer has enough grabbed entries
+                    grabbed_count = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                    if grabbed_count < worker.batch_size:
+                        top_up_buffer(work_buffer, embedded_set)
 
+                    images = get_from_buffer(work_buffer, worker.batch_size)
                     if images:
                         batch_counter += 1
                         batch_name = f"batch_{batch_counter:05d}_{name}"
-
                         log(f"{name}: starting batch {batch_name} ({len(images)} images)")
 
                         batch_dir = export_batch(batch_name, images)
-
                         if rsync_to_worker(worker, batch_dir):
                             start_worker_job(worker, batch_name)
                             state.current_batch = batch_name
@@ -868,6 +965,7 @@ def main():
                             state.status = 'working'
                         else:
                             log(f"{name}: rsync failed, will retry")
+                            buffer_return(work_buffer, images)
                             shutil.rmtree(batch_dir)
                     else:
                         if state.status != 'idle':
@@ -877,23 +975,11 @@ def main():
             if should_exit:
                 break
 
-            # Process import queue (one batch per loop iteration)
-            if import_queue:
-                worker_name, batch_dir = import_queue.pop(0)
-                imported = import_batch(batch_dir, image_index, embedded_set)
-                total_imported += imported
-
-                # Cleanup
-                cleanup_worker_batch(WORKERS[worker_name], batch_dir.name)
-                shutil.rmtree(batch_dir)
-
-                log(f"Total imported: {total_imported}")
-
             # Status summary
             working = sum(1 for s in worker_states.values() if s.status == 'working')
             idle = sum(1 for s in worker_states.values() if s.status == 'idle')
 
-            if working == 0 and idle == len(worker_states) and not import_queue:
+            if working == 0 and idle == len(worker_states):
                 log("All workers idle, no pending work. Waiting...")
                 time.sleep(60)
             else:

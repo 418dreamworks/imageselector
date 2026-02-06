@@ -25,7 +25,7 @@ BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images"
 KILL_FILE = BASE_DIR / "KILL_DL"
 PID_FILE = BASE_DIR / "image_downloader.pid"
-NUM_WORKERS = 4
+NUM_WORKERS = 1
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR))
