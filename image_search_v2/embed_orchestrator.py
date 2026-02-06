@@ -5,7 +5,7 @@ Distributed Embedding Orchestrator
 Single-threaded polling loop that:
 1. Keeps 3 workers busy (iMac, MBP, Sleight)
 2. Collects results as they complete
-3. Imports to FAISS + updates DB faiss_row
+3. Imports to FAISS (IndexIDMap with encoded listing_id|image_id)
 4. Manages QPS for sync_data
 
 Stop with: touch KILL_ORCH
@@ -27,7 +27,7 @@ load_dotenv()
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from image_db import get_connection, commit_with_retry
+from image_db import get_connection
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent
@@ -52,7 +52,6 @@ API_BASE_URL = "https://openapi.etsy.com/v3"
 QPS_CHECK_INTERVAL = 300  # 5 minutes
 BACKUP_INTERVAL = 6 * 3600  # 6 hours
 POLL_INTERVAL = 10  # seconds between worker checks
-DB_CHUNK_SIZE = 100  # commit every N images
 
 # QPS limits
 MIN_DELAY = 0.2    # 5 QPS max
@@ -263,21 +262,13 @@ def start_data_scripts():
     start_script(BASE_DIR / "scripts/image_downloader.py", BASE_DIR / "image_downloader.log", "image_downloader")
 
 
-def check_db_faiss_consistency() -> tuple[bool, str]:
-    """Check if DB faiss_row count matches FAISS vector counts.
+def check_faiss_consistency() -> tuple[bool, str]:
+    """Check that all FAISS files have the same vector count.
 
     Returns (is_consistent, message).
     """
-    import sqlite3
     import faiss
 
-    # Get DB count
-    conn = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True)
-    cursor = conn.execute('SELECT COUNT(*) FROM image_status WHERE faiss_row IS NOT NULL')
-    db_count = cursor.fetchone()[0]
-    conn.close()
-
-    # Get FAISS counts (all should match)
     faiss_counts = {}
     if EMBEDDINGS_DIR.exists():
         for f in EMBEDDINGS_DIR.glob("*.faiss"):
@@ -286,21 +277,14 @@ def check_db_faiss_consistency() -> tuple[bool, str]:
                 faiss_counts[f.name] = index.ntotal
 
     if not faiss_counts:
-        # No FAISS files yet - consistent if DB also has 0
-        if db_count == 0:
-            return True, "Both empty"
-        return False, f"DB has {db_count} but no FAISS files"
+        return True, "No FAISS files yet"
 
     # All FAISS files should have same count
     counts = list(faiss_counts.values())
     if len(set(counts)) > 1:
         return False, f"FAISS files have different counts: {faiss_counts}"
 
-    faiss_count = counts[0]
-    if db_count != faiss_count:
-        return False, f"DB has {db_count}, FAISS has {faiss_count}"
-
-    return True, f"Consistent: {db_count} entries"
+    return True, f"Consistent: {counts[0]} entries"
 
 
 def do_backup():
@@ -311,7 +295,7 @@ def do_backup():
     import sqlite3
 
     # Check consistency first - FATAL if inconsistent
-    is_consistent, msg = check_db_faiss_consistency()
+    is_consistent, msg = check_faiss_consistency()
     if not is_consistent:
         raise RuntimeError(f"FATAL: DB/FAISS inconsistent - {msg}. Fix before continuing.")
 
@@ -345,26 +329,59 @@ def do_backup():
 
 
 # ============================================================
-# DATABASE
+# FAISS ID ENCODING (listing_id + image_id → int64)
 # ============================================================
 
-def get_next_faiss_row(conn) -> int:
-    """Get the next available faiss_row index."""
-    cursor = conn.execute("SELECT MAX(faiss_row) FROM image_status")
-    result = cursor.fetchone()[0]
-    return 0 if result is None else result + 1
+def encode_faiss_id(listing_id: int, image_id: int) -> int:
+    """Encode listing_id and image_id into a single int64 for FAISS IndexIDMap."""
+    return (listing_id << 33) | image_id
 
 
-def get_pending_images(limit: int) -> List[Tuple[int, int]]:
-    """Get images needing embedding (download_done=2, faiss_row IS NULL)."""
+def decode_faiss_id(faiss_id: int) -> Tuple[int, int]:
+    """Decode FAISS int64 ID back to (listing_id, image_id)."""
+    listing_id = faiss_id >> 33
+    image_id = faiss_id & ((1 << 33) - 1)
+    return listing_id, image_id
+
+
+def get_embedded_set_from_faiss() -> set:
+    """Read all IDs from a FAISS IndexIDMap file to build the embedded set.
+
+    Uses the first available model's .faiss file (all have the same IDs).
+    Returns set of (listing_id, image_id) tuples.
+    """
+    import faiss
+
+    for model in ALL_MODELS:
+        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
+        if faiss_file.exists():
+            index = faiss.read_index(str(faiss_file))
+            n = index.ntotal
+            if n == 0:
+                return set()
+            # Reconstruct all IDs from the IndexIDMap
+            id_map = faiss.downcast_index(index)
+            ids = faiss.vector_to_array(id_map.id_map)
+            return {decode_faiss_id(int(fid)) for fid in ids}
+
+    return set()
+
+
+def get_pending_images(limit: int, embedded_set: set) -> List[Tuple[int, int]]:
+    """Get images needing embedding (download_done=2, not yet embedded)."""
     conn = get_connection()
     cursor = conn.execute("""
         SELECT listing_id, image_id
         FROM image_status
-        WHERE download_done = 2 AND faiss_row IS NULL
-        LIMIT ?
-    """, (limit,))
-    results = [(row[0], row[1]) for row in cursor.fetchall()]
+        WHERE download_done = 2
+    """)
+    results = []
+    for row in cursor:
+        key = (row[0], row[1])
+        if key not in embedded_set:
+            results.append(key)
+            if len(results) >= limit:
+                break
     conn.close()
     return results
 
@@ -433,12 +450,19 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
     return batch_dir
 
 
-def import_batch(batch_dir: Path) -> int:
-    """Import batch: copy bg-removed images, append FAISS, update DB faiss_row.
+def import_batch(batch_dir: Path, embedded_set: set) -> int:
+    """Import batch: copy bg-removed images, append to FAISS IndexIDMap.
 
     IMPORTANT: This function is atomic - once started, it must complete.
     Do NOT add kill file checks inside this function.
     If interrupted, consistency check will catch the mismatch on next startup.
+
+    Args:
+        batch_dir: Path to the batch directory with manifest, images, and .npy files
+        embedded_set: Set of (listing_id, image_id) already embedded (updated in place)
+
+    Returns:
+        Number of images imported
     """
     import numpy as np
     import faiss
@@ -454,37 +478,33 @@ def import_batch(batch_dir: Path) -> int:
 
     images_src = batch_dir / "images"
 
-    # Verify all files exist
+    # Verify all .npy files exist
     for model in ALL_MODELS:
         if not (batch_dir / f"{model}.npy").exists():
             log(f"Missing {model}.npy in {batch_dir}")
             return 0
 
-    # 1. Get starting faiss_row
-    conn = get_connection()
-    start_row = get_next_faiss_row(conn)
-    conn.close()
-
-    # 2. Move all bg-removed images to embeddedimages, remove from images/
+    # 1. Move all bg-removed images to embeddedimages, remove from images/
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
     moved_count = 0
 
     for lid, iid in manifest:
         src = images_src / f"{lid}_{iid}.jpg"
         if src.exists():
-            # Copy to embeddedimages
             dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
             shutil.copy2(src, dst)
             moved_count += 1
 
-            # Remove from images/
             orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
             if orig.exists():
                 orig.unlink()
 
     log(f"Moved {moved_count} images to embeddedimages, removed from images/")
 
-    # 3. Append to FAISS indexes
+    # 2. Build ID array for this batch
+    ids = np.array([encode_faiss_id(lid, iid) for lid, iid in manifest], dtype=np.int64)
+
+    # 3. Append to FAISS IndexIDMap indexes
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     for model in ALL_MODELS:
@@ -496,9 +516,10 @@ def import_batch(batch_dir: Path) -> int:
             index = faiss.read_index(str(faiss_file))
         else:
             dim = embeddings.shape[1]
-            index = faiss.IndexFlatIP(dim)
+            base = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIDMap(base)
 
-        index.add(embeddings)
+        index.add_with_ids(embeddings, ids)
         faiss.write_index(index, str(faiss_file))
 
         # Handle CLIP text embeddings
@@ -509,29 +530,16 @@ def import_batch(batch_dir: Path) -> int:
             if text_faiss.exists():
                 text_index = faiss.read_index(str(text_faiss))
             else:
-                text_index = faiss.IndexFlatIP(text_emb.shape[1])
-            text_index.add(text_emb)
+                text_base = faiss.IndexFlatIP(text_emb.shape[1])
+                text_index = faiss.IndexIDMap(text_base)
+            text_index.add_with_ids(text_emb, ids)
             faiss.write_index(text_index, str(text_faiss))
 
-    # 4. Update DB with faiss_row (chunked commits)
-    log(f"Updating DB faiss_row for {len(manifest)} images...")
-    conn = get_connection()
+    # 4. Update embedded_set
+    for lid, iid in manifest:
+        embedded_set.add((lid, iid))
 
-    for i, (lid, iid) in enumerate(manifest):
-        faiss_row = start_row + i
-        conn.execute("""
-            UPDATE image_status SET faiss_row = ?
-            WHERE listing_id = ? AND image_id = ?
-        """, (faiss_row, lid, iid))
-
-        # Commit every chunk
-        if (i + 1) % DB_CHUNK_SIZE == 0:
-            commit_with_retry(conn)
-
-    commit_with_retry(conn)
-    conn.close()
-
-    log(f"Imported {len(manifest)} images (faiss_row {start_row}-{start_row + len(manifest) - 1})")
+    log(f"Imported {len(manifest)} images")
     return len(manifest)
 
 
@@ -726,16 +734,19 @@ def main():
     log("ORCHESTRATOR STARTED")
     log("=" * 60)
 
-    # CRITICAL: Check DB/FAISS consistency before doing any work
-    is_consistent, msg = check_db_faiss_consistency()
+    # CRITICAL: Check FAISS consistency before doing any work
+    is_consistent, msg = check_faiss_consistency()
     if not is_consistent:
-        log(f"FATAL: DB/FAISS inconsistent - {msg}")
-        log("Fix manually: either reset faiss_row to NULL and delete FAISS files,")
-        log("or restore from last consistent backup.")
+        log(f"FATAL: FAISS inconsistent - {msg}")
+        log("Fix manually: delete all .faiss files and start fresh.")
         release_lock()
         return
 
     log(f"Consistency check: {msg}")
+
+    # Load embedded set from FAISS (IDs are stored in IndexIDMap)
+    embedded_set = get_embedded_set_from_faiss()
+    log(f"Already embedded: {len(embedded_set)} images")
     log(f"Workers: {list(WORKERS.keys())}")
     log("Stop with: touch KILL_ORCH")
 
@@ -818,7 +829,7 @@ def main():
 
                 elif state.status in ('idle', 'done'):
                     # Get new batch for this worker
-                    images = get_pending_images(worker.batch_size)
+                    images = get_pending_images(worker.batch_size, embedded_set)
 
                     if images:
                         batch_counter += 1
@@ -848,7 +859,7 @@ def main():
             # Process import queue (one batch per loop iteration)
             if import_queue:
                 worker_name, batch_dir = import_queue.pop(0)
-                imported = import_batch(batch_dir)
+                imported = import_batch(batch_dir, embedded_set)
                 total_imported += imported
 
                 # Cleanup
