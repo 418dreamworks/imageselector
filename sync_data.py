@@ -581,6 +581,18 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
 
 # ─── Image SQL Insert ────────────────────────────────────────────────────────
 
+def _execute_with_retry(conn, sql, params, max_retries=5):
+    """Execute SQL with retry on database lock."""
+    for attempt in range(max_retries):
+        try:
+            return conn.execute(sql, params)
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.2 * (attempt + 1))
+            else:
+                raise
+
+
 def add_images_to_sql(listing_id: int, images: list, conn=None):
     """Upsert images to SQL image_status table.
 
@@ -610,7 +622,7 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
             continue
 
         # Check if exists
-        cursor = conn.execute("""
+        cursor = _execute_with_retry(conn, """
             SELECT url FROM image_status WHERE listing_id = ? AND image_id = ?
         """, (listing_id, image_id))
         row = cursor.fetchone()
@@ -619,18 +631,18 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
             # Exists - update is_primary always, url only if missing
             existing_url = row[0]
             if not existing_url:
-                conn.execute("""
+                _execute_with_retry(conn, """
                     UPDATE image_status SET is_primary = ?, url = ?
                     WHERE listing_id = ? AND image_id = ?
                 """, (is_primary, url, listing_id, image_id))
             else:
-                conn.execute("""
+                _execute_with_retry(conn, """
                     UPDATE image_status SET is_primary = ?
                     WHERE listing_id = ? AND image_id = ?
                 """, (is_primary, listing_id, image_id))
         else:
             # New - insert
-            conn.execute("""
+            _execute_with_retry(conn, """
                 INSERT INTO image_status (listing_id, image_id, is_primary, url, download_done)
                 VALUES (?, ?, ?, ?, 0)
             """, (listing_id, image_id, is_primary, url))

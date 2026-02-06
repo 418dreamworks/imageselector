@@ -74,13 +74,17 @@ class Worker:
     rsync_path: str = 'rsync'  # For Windows: 'C:/cwrsync/bin/rsync.exe'
 
 
+MAX_CHECK_RETRIES = 3  # Freeze worker after this many consecutive timeouts
+
+
 @dataclass
 class WorkerState:
     worker: Worker
     current_batch: Optional[str] = None
     batch_images: List[Tuple[int, int]] = field(default_factory=list)
     started_at: float = 0
-    status: str = 'idle'  # idle, working, done
+    status: str = 'idle'  # idle, working, done, frozen
+    check_failures: int = 0
 
 
 WORKERS = {
@@ -175,9 +179,13 @@ def check_rate_limit() -> dict | None:
 
 
 def update_qps_config(limits: dict):
-    """Update QPS config based on rate limits."""
+    """Update QPS config based on rate limits.
+
+    Keep usage under 90K: if used > 90K reduce QPS 10%, else increase 10% (max 5 QPS).
+    """
     remaining = limits["remaining"]
     limit = limits["limit"]
+    used = limit - remaining
 
     config = {}
     if QPS_CONFIG_FILE.exists():
@@ -188,14 +196,14 @@ def update_qps_config(limits: dict):
 
     current_delay = config.get("api_delay", MIN_DELAY)
 
-    if remaining > RATE_THRESHOLD:
-        new_delay = max(current_delay / 1.1, MIN_DELAY)
-        action = "INCREASE"
-    else:
-        new_delay = min(current_delay / 0.9, MAX_DELAY)
+    if used >= 90000:
+        new_delay = current_delay * 1.1  # reduce QPS by 10%
         action = "DECREASE"
+    else:
+        new_delay = max(current_delay / 1.1, MIN_DELAY)  # increase QPS by 10%, max 5 QPS
+        action = "INCREASE"
 
-    log(f"API: {remaining:,}/{limit:,} | {action} QPS: {1/current_delay:.2f} -> {1/new_delay:.2f}")
+    log(f"API: {used:,}/{limit:,} | {action} QPS: {1/current_delay:.2f} -> {1/new_delay:.2f}")
 
     config["api_delay"] = new_delay
     config["last_updated"] = datetime.now().isoformat()
@@ -559,8 +567,12 @@ def rsync_to_worker(worker: Worker, batch_dir: Path) -> bool:
     if worker.host == '192.168.68.117':
         cmd = ['rsync', '-av', '--delete', f'--rsync-path={worker.rsync_path}', f"{batch_dir}/", target]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log(f"  {worker.name}: rsync to worker timed out")
+        return False
 
 
 def start_worker_job(worker: Worker, batch_name: str) -> bool:
@@ -595,7 +607,10 @@ def check_worker_done(worker: Worker, batch_name: str) -> bool:
     if worker.host == '192.168.68.117':
         cmd = ['rsync', '-av', f'--rsync-path={worker.rsync_path}', '--include=*.npy', '--exclude=*', src, f"{batch_dir}/"]
 
-    subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None  # Signal timeout (distinct from False = not done yet)
 
     # Check if all models complete
     return all((batch_dir / f"{model}.npy").exists() for model in ALL_MODELS)
@@ -610,8 +625,12 @@ def rsync_images_back(worker: Worker, batch_name: str) -> bool:
     if worker.host == '192.168.68.117':
         cmd = ['rsync', '-av', f'--rsync-path={worker.rsync_path}', src, f"{batch_dir}/images/"]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    return result.returncode == 0
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log(f"  {worker.name}: rsync images back timed out")
+        return False
 
 
 def cleanup_worker_batch(worker: Worker, batch_name: str):
@@ -734,14 +753,17 @@ def main():
     total_imported = 0
 
     # Find most recent backup to avoid immediate backup on restart
+    # Check both local backups/ and SSD
     last_backup = 0
-    if BACKUPS_DIR.exists():
-        backup_files = list(BACKUPS_DIR.glob("etsy_data_*.db"))
-        if backup_files:
-            # Get most recent backup's mtime
-            most_recent = max(backup_files, key=lambda f: f.stat().st_mtime)
-            last_backup = most_recent.stat().st_mtime
-            log(f"Last backup: {most_recent.name}")
+    backup_dirs = [BACKUPS_DIR, Path('/Volumes/SSD_120/backups')]
+    all_backups = []
+    for bdir in backup_dirs:
+        if bdir.exists():
+            all_backups.extend(bdir.glob("etsy_data_*.db"))
+    if all_backups:
+        most_recent = max(all_backups, key=lambda f: f.stat().st_mtime)
+        last_backup = most_recent.stat().st_mtime
+        log(f"Last backup: {most_recent.name} ({most_recent.parent})")
 
     try:
         while not check_kill_file():
@@ -769,15 +791,30 @@ def main():
 
                 worker = state.worker
 
+                if state.status == 'frozen':
+                    continue
+
                 if state.status == 'working':
                     # Check if done
-                    if check_worker_done(worker, state.current_batch):
+                    result = check_worker_done(worker, state.current_batch)
+
+                    if result is None:
+                        # Timeout
+                        state.check_failures += 1
+                        log(f"  {name}: rsync timeout ({state.check_failures}/{MAX_CHECK_RETRIES})")
+                        if state.check_failures >= MAX_CHECK_RETRIES:
+                            log(f"  {name}: FROZEN after {MAX_CHECK_RETRIES} timeouts")
+                            state.status = 'frozen'
+                    elif result:
+                        # Done
+                        state.check_failures = 0
                         log(f"{name}: batch complete, syncing images back")
                         rsync_images_back(worker, state.current_batch)
 
                         batch_dir = EXPORTS_DIR / state.current_batch
                         import_queue.append((name, batch_dir))
                         state.status = 'done'
+                    # else: not done yet, keep waiting
 
                 elif state.status in ('idle', 'done'):
                     # Get new batch for this worker
