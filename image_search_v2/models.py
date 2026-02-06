@@ -106,6 +106,18 @@ class ModelLoader:
         self._models[model_key] = model
         self._preprocessors[model_key] = processor
 
+    def unload_all(self):
+        """Unload all models from GPU to free VRAM."""
+        for key in list(self._models.keys()):
+            del self._models[key]
+        self._models.clear()
+        self._preprocessors.clear()
+        self._tokenizers.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
     def embed_image(self, model_key: str, image: Image.Image) -> torch.Tensor:
         """Generate embedding for a single image."""
         model, preprocess = self.get_model(model_key)

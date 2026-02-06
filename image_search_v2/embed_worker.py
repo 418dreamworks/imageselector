@@ -274,7 +274,10 @@ def main():
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
 
     # Process each model (save .npy to batch dir)
+    loader = get_loader()
     for model_key in models_to_run:
+        # Unload previous model to free VRAM before loading next
+        loader.unload_all()
         process_model(
             model_key, manifest, images, listings,
             batch_dir, args.batch_size

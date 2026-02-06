@@ -606,13 +606,15 @@ def start_worker_job(worker: Worker, batch_name: str) -> bool:
     batch_path = get_worker_batch_path(worker, batch_name)
     worker_script = f"{worker.work_dir}/image_search_v2/embed_worker.py"
 
+    log_path = f"{batch_path}/worker.log"
+
     if worker.host == '192.168.68.117':
         # Windows - run Python directly (SSH session stays open in local background via Popen)
         # start /B via SSH is unreliable; running directly works
-        remote_cmd = f'cd /d "{worker.work_dir}\\image_search_v2" && "{worker.python_path}" embed_worker.py --input "{batch_path}"'
+        remote_cmd = f'cd /d "{worker.work_dir}\\image_search_v2" && "{worker.python_path}" embed_worker.py --input "{batch_path}" > "{log_path}" 2>&1'
     else:
         # Mac - use nohup to keep process running after SSH exits
-        remote_cmd = f'nohup {worker.python_path} {worker_script} --input {batch_path} > /dev/null 2>&1 &'
+        remote_cmd = f'nohup {worker.python_path} {worker_script} --input {batch_path} > {log_path} 2>&1 &'
 
     ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
     ssh_cmd = ['ssh', f'{worker.user}@{ssh_host}', remote_cmd]
