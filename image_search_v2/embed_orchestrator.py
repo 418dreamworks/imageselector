@@ -36,27 +36,16 @@ EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
 IMAGES_DIR = BASE_DIR / 'images'
 BACKUPS_DIR = BASE_DIR / 'backups'
 DB_FILE = BASE_DIR / 'etsy_data.db'
-EMBEDDED_DIR = Path('/Volumes/SSD_120/embeddedimages')
+EMBEDDED_DIR = BASE_DIR / 'nonprimary'
 
 # Config files
-QPS_CONFIG_FILE = BASE_DIR / 'qps_config.json'
 ORCH_STATE_FILE = BASE_DIR / 'orchestrator_state.json'
 PID_FILE = BASE_DIR / 'orchestrator.pid'
 KILL_FILE = BASE_DIR / 'KILL_ORCH'
 
-# API config
-ETSY_API_KEY = os.getenv("ETSY_API_KEY")
-API_BASE_URL = "https://openapi.etsy.com/v3"
-
 # Timing
-QPS_CHECK_INTERVAL = 300  # 5 minutes
 BACKUP_INTERVAL = 6 * 3600  # 6 hours
 POLL_INTERVAL = 10  # seconds between worker checks
-
-# QPS limits
-MIN_DELAY = 0.2    # 5 QPS max
-MAX_DELAY = 2.0    # 0.5 QPS min
-RATE_THRESHOLD = 10000  # Remaining quota threshold
 
 # All models
 ALL_MODELS = ['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base']
@@ -116,7 +105,7 @@ WORKERS = {
         user='embed',
         work_dir='C:/Users/embed/imageselector',
         python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
-        batch_size=20000,
+        batch_size=10000,
         rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
 }
@@ -166,57 +155,6 @@ def check_kill_file() -> bool:
 # QPS MANAGEMENT
 # ============================================================
 
-def check_rate_limit() -> dict | None:
-    """Check API rate limits, returns limits dict or None on error."""
-    try:
-        import httpx
-        with httpx.Client(timeout=30) as client:
-            response = client.get(
-                f"{API_BASE_URL}/application/openapi-ping",
-                headers={"x-api-key": ETSY_API_KEY}
-            )
-            return {
-                "remaining": int(response.headers.get("x-remaining-today", 0)),
-                "limit": int(response.headers.get("x-limit-per-day", 0)),
-            }
-    except Exception as e:
-        log(f"Error checking rate limit: {e}")
-        return None
-
-
-def update_qps_config(limits: dict):
-    """Update QPS config based on rate limits.
-
-    Keep usage under 90K: if used > 90K reduce QPS 10%, else increase 10% (max 5 QPS).
-    """
-    remaining = limits["remaining"]
-    limit = limits["limit"]
-    used = limit - remaining
-
-    config = {}
-    if QPS_CONFIG_FILE.exists():
-        try:
-            config = json.loads(QPS_CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, IOError):
-            pass
-
-    current_delay = config.get("api_delay", MIN_DELAY)
-
-    if used >= 90000:
-        new_delay = current_delay * 1.1  # reduce QPS by 10%
-        action = "DECREASE"
-    else:
-        new_delay = max(current_delay / 1.1, MIN_DELAY)  # increase QPS by 10%, max 5 QPS
-        action = "INCREASE"
-
-    log(f"API: {used:,}/{limit:,} | {action} QPS: {1/current_delay:.2f} -> {1/new_delay:.2f}")
-
-    config["api_delay"] = new_delay
-    config["last_updated"] = datetime.now().isoformat()
-    config["remaining"] = remaining
-    config["limit"] = limit
-
-    QPS_CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
 # ============================================================
@@ -634,6 +572,16 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
             text_index.add(text_emb)
             faiss.write_index(text_index, str(text_faiss))
 
+    # 3b. Verify all FAISS files are consistent IMMEDIATELY after writing
+    faiss_counts = {}
+    for model in ALL_MODELS:
+        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
+        idx = faiss.read_index(str(faiss_file))
+        faiss_counts[model] = idx.ntotal
+    counts = list(faiss_counts.values())
+    if len(set(counts)) > 1:
+        raise RuntimeError(f"FAISS inconsistency detected after import! Counts: {faiss_counts}")
+
     # 4. Append to image_index.json with per-model vector hashes
     for i, (lid, iid) in enumerate(manifest):
         hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
@@ -871,7 +819,6 @@ def main():
     # Only finish in-flight imports, then QPS-only
     draining = False
 
-    last_qps_check = 0
     batch_counter = 0
     total_imported = 0
 
@@ -891,13 +838,6 @@ def main():
     try:
         while not check_kill_file():
             now = time.time()
-
-            # QPS check every 5 minutes
-            if now - last_qps_check > QPS_CHECK_INTERVAL:
-                limits = check_rate_limit()
-                if limits:
-                    update_qps_config(limits)
-                last_qps_check = now
 
             # Backup every 6 hours (uses SQLite backup API - safe for concurrent access)
             if now - last_backup > BACKUP_INTERVAL:

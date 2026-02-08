@@ -82,6 +82,7 @@ def check_kill_file():
 
 def acquire_lock() -> bool:
     """Acquire PID lock. Returns False if another instance is running."""
+    global _lock_acquired
     if PID_FILE.exists():
         try:
             old_pid = int(PID_FILE.read_text().strip())
@@ -93,6 +94,7 @@ def acquire_lock() -> bool:
             # PID file is stale or process doesn't exist
             pass
     PID_FILE.write_text(str(os.getpid()))
+    _lock_acquired = True
     return True
 
 
@@ -400,13 +402,38 @@ def insert_review(conn, review, snapshot_ts):
 _api_stats = {"used": 0, "limit": 10000, "remaining": 10000}
 
 
+_last_qps_write = 0
+
+
 def update_api_usage(response):
+    global _last_qps_write
     try:
         remaining = int(response.headers.get("x-remaining-today", 0))
         limit = int(response.headers.get("x-limit-per-day", 10000))
         _api_stats["remaining"] = remaining
         _api_stats["limit"] = limit
         _api_stats["used"] = limit - remaining
+        # Self-manage QPS: write delay to config file every 5 minutes
+        now = time.time()
+        if now - _last_qps_write >= 300:
+            _last_qps_write = now
+            used = limit - remaining
+            try:
+                config = {}
+                if QPS_CONFIG_FILE.exists():
+                    config = json.loads(QPS_CONFIG_FILE.read_text())
+                current_delay = config.get("api_delay", API_DELAY_DEFAULT)
+                if used >= 90000:
+                    new_delay = min(current_delay * 1.1, 30.0)
+                else:
+                    new_delay = API_DELAY_DEFAULT  # 5 QPS
+                config["api_delay"] = new_delay
+                config["remaining"] = remaining
+                config["limit"] = limit
+                config["last_updated"] = datetime.now().isoformat()
+                QPS_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+            except (IOError, json.JSONDecodeError):
+                pass
     except (ValueError, TypeError):
         pass
 
@@ -1092,8 +1119,11 @@ def main():
     print(f"Run image_downloader.py to download queued images")
 
 
+_lock_acquired = False
+
 if __name__ == "__main__":
     try:
         main()
     finally:
-        release_lock()
+        if _lock_acquired:
+            release_lock()
