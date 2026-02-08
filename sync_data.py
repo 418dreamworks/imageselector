@@ -856,14 +856,20 @@ def _process_crawl_batch(client, results, conn, existing_listings, listing_last_
     - Insert listing data into listings_static/listings_dynamic
     - Fetch images via batch API for ALL listings (updates is_primary, fills missing URLs)
     """
-    all_listing_ids = []
+    all_listing_ids = [listing["listing_id"] for listing in results]
+
+    # Fetch images FIRST — only insert listings if images succeed
+    images_by_listing = {}
+    if all_listing_ids:
+        images_by_listing = fetch_listings_batch_with_images(client, all_listing_ids)
+        if not images_by_listing:
+            print(f"  WARNING: Image fetch failed for {len(all_listing_ids)} listings, skipping batch")
+            return
 
     for listing in results:
         lid = listing["listing_id"]
-        all_listing_ids.append(lid)
 
         if lid in existing_listings:
-            # Already known listing — update dynamic if > 1 week old
             last_ts = listing_last_ts.get(lid, 0)
             if snapshot_ts - last_ts > ONE_WEEK:
                 insert_listing_dynamic(conn, listing, snapshot_ts)
@@ -872,21 +878,15 @@ def _process_crawl_batch(client, results, conn, existing_listings, listing_last_
             else:
                 stats["skipped"] += 1
         else:
-            # New listing — insert static + dynamic
             insert_listing_static(conn, listing, snapshot_ts)
             insert_listing_dynamic(conn, listing, snapshot_ts)
             existing_listings.add(lid)
             listing_last_ts[lid] = snapshot_ts
             stats["new_with_images"] += 1
 
-    # Fetch images for ALL listings in one batch API call
-    if all_listing_ids:
-        images_by_listing = fetch_listings_batch_with_images(client, all_listing_ids)
-
-        for lid in all_listing_ids:
-            images = images_by_listing.get(lid, [])
-            if images:
-                add_images_to_sql(lid, images, conn=conn)
+        images = images_by_listing.get(lid, [])
+        if images:
+            add_images_to_sql(lid, images, conn=conn)
 
 
 # ─── Phase: Shop Data ───────────────────────────────────────────────────────

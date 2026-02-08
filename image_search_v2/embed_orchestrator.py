@@ -46,6 +46,8 @@ KILL_FILE = BASE_DIR / 'KILL_ORCH'
 # Timing
 BACKUP_INTERVAL = 6 * 3600  # 6 hours
 POLL_INTERVAL = 10  # seconds between worker checks
+MIN_DISK_GB = 2  # Stop dispatching new batches below this
+DISK_CHECK_INTERVAL = 600  # 10 minutes
 
 # All models
 ALL_MODELS = ['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base']
@@ -149,6 +151,12 @@ def check_kill_file() -> bool:
         log("Kill file detected. Shutting down...")
         return True
     return False
+
+
+def check_disk_space() -> float:
+    """Return free disk space in GB on the images partition."""
+    usage = shutil.disk_usage(IMAGES_DIR)
+    return usage.free / (1024 ** 3)
 
 
 # ============================================================
@@ -821,6 +829,8 @@ def main():
 
     batch_counter = 0
     total_imported = 0
+    last_disk_check = 0
+    disk_low = False
 
     # Find most recent backup to avoid immediate backup on restart
     # Check both local backups/ and SSD
@@ -844,6 +854,17 @@ def main():
                 log("Starting 6-hour backup...")
                 do_backup()
                 last_backup = now
+
+            # Disk space check every 10 min — stop dispatching but keep importing
+            if now - last_disk_check > DISK_CHECK_INTERVAL:
+                free_gb = check_disk_space()
+                was_low = disk_low
+                disk_low = free_gb < MIN_DISK_GB
+                last_disk_check = now
+                if disk_low and not was_low:
+                    log(f"DISK LOW: {free_gb:.1f}GB free — pausing new batch dispatch (imports continue)")
+                elif not disk_low and was_low:
+                    log(f"DISK OK: {free_gb:.1f}GB free — resuming dispatch")
 
             # Check each worker
             should_exit = False
@@ -943,7 +964,7 @@ def main():
                             # status stays 'working'
 
                             # Pre-stage N+2 (async rsync, skip if draining)
-                            if not draining:
+                            if not draining and not disk_low:
                                 next_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                                 if next_images:
                                     batch_counter += 1
@@ -969,7 +990,7 @@ def main():
                             state.next_staged = False
                             state.status = 'staging'
 
-                        elif not draining:
+                        elif not draining and not disk_low:
                             # No pre-staged batch at all → export current + pre-stage, async rsync
                             log(f"{name}: batch complete, dispatching new batch")
                             new_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
@@ -1024,7 +1045,7 @@ def main():
 
                     else:
                         # Not done yet - pre-stage next batch if not already (async rsync)
-                        if not state.next_batch and not state.rsync_prestage_proc and not draining:
+                        if not state.next_batch and not state.rsync_prestage_proc and not draining and not disk_low:
                             images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                             if images:
                                 batch_counter += 1
@@ -1040,7 +1061,7 @@ def main():
 
                 # ---- IDLE: no work in progress ----
                 elif state.status in ('idle', 'done'):
-                    if draining:
+                    if draining or disk_low:
                         state.status = 'idle'
                         continue
 
