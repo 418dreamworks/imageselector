@@ -4,8 +4,8 @@ import sqlite3, json, os, subprocess, time
 from pathlib import Path
 from datetime import datetime
 
-BASE = Path(__file__).parent
-DB = BASE / 'etsy_data.db'
+BASE = Path(__file__).parent.parent
+DB = BASE / 'data' / 'db' / 'etsy_data.db'
 
 def report():
     conn = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
@@ -90,7 +90,7 @@ def report():
     print(f'  └─ Last: {dl_status}')
 
     # --- EMBEDDINGS & CONSISTENCY ---
-    emb_dir = BASE / 'embeddings'
+    emb_dir = BASE / 'data' / 'embeddings'
     idx_file = emb_dir / 'image_index.json'
     idx_count = 0
     if idx_file.exists():
@@ -126,7 +126,7 @@ def report():
             print(f'    image_index ({idx_count}) != FAISS ({list(img_counts)[0] if img_counts else 0})')
 
     # --- API ---
-    qps_file = BASE / 'qps_config.json'
+    qps_file = BASE / 'data' / 'db' / 'qps_config.json'
     if qps_file.exists():
         qps = json.loads(qps_file.read_text())
         used = qps.get('limit', 0) - qps.get('remaining', 0)

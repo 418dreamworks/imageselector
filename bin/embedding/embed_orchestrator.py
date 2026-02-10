@@ -25,18 +25,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Add parent to path for imports
+# Add bin/ to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from image_db import get_connection
 
 # Paths
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).parent.parent.parent
 EXPORTS_DIR = BASE_DIR / 'embed_exports'
-EMBEDDINGS_DIR = BASE_DIR / 'embeddings'
-IMAGES_DIR = BASE_DIR / 'images'
+EMBEDDINGS_DIR = BASE_DIR / 'data' / 'embeddings'
+IMAGES_DIR = BASE_DIR / 'images' / 'imagedownload'
 BACKUPS_DIR = BASE_DIR / 'backups'
-DB_FILE = BASE_DIR / 'etsy_data.db'
-EMBEDDED_DIR = BASE_DIR / 'nonprimary'
+DB_FILE = BASE_DIR / 'data' / 'db' / 'etsy_data.db'
+EMBEDDED_DIR = BASE_DIR / 'images' / 'imageall_new'
 
 # Config files
 ORCH_STATE_FILE = BASE_DIR / 'orchestrator_state.json'
@@ -44,10 +44,8 @@ PID_FILE = BASE_DIR / 'orchestrator.pid'
 KILL_FILE = BASE_DIR / 'KILL_ORCH'
 
 # Timing
-BACKUP_INTERVAL = 6 * 3600  # 6 hours
 POLL_INTERVAL = 10  # seconds between worker checks
-MIN_DISK_GB = 2  # Stop dispatching new batches below this
-DISK_CHECK_INTERVAL = 600  # 10 minutes
+MIN_DISK_GB = 5  # Stop dispatching new batches below this
 
 # All models
 ALL_MODELS = ['clip_vitb32', 'clip_vitl14', 'dinov2_base', 'dinov2_large', 'dinov3_base']
@@ -91,7 +89,7 @@ WORKERS = {
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
-        batch_size=5000,
+        batch_size=10000,
     ),
     'mbp': Worker(
         name='mbp',
@@ -165,56 +163,6 @@ def check_disk_space() -> float:
 
 
 
-# ============================================================
-# BACKUP & PROCESS MANAGEMENT
-# ============================================================
-
-def soft_kill_script(kill_file: Path, name: str, timeout: int = 60):
-    """Create kill file and wait for script to stop."""
-    log(f"Stopping {name}...")
-    kill_file.touch()
-
-    pid_file = BASE_DIR / f"{name}.pid"
-    start = time.time()
-    while time.time() - start < timeout:
-        if not pid_file.exists():
-            log(f"  {name} stopped")
-            return True
-        time.sleep(2)
-
-    log(f"  {name} did not stop in {timeout}s")
-    return False
-
-
-def start_script(script_path: Path, log_file: Path, name: str):
-    """Start a script with unbuffered output."""
-    log(f"Starting {name}...")
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-
-    subprocess.Popen(
-        [sys.executable, str(script_path)],
-        stdout=open(log_file, "a"),
-        stderr=subprocess.STDOUT,
-        cwd=str(BASE_DIR),
-        env=env,
-        start_new_session=True
-    )
-    log(f"  {name} started")
-
-
-def stop_data_scripts():
-    """Stop sync_data and image_downloader for backup."""
-    soft_kill_script(BASE_DIR / "KILL", "sync_data")
-    soft_kill_script(BASE_DIR / "KILL_DL", "image_downloader")
-
-
-def start_data_scripts():
-    """Restart sync_data and image_downloader after backup."""
-    start_script(BASE_DIR / "sync_data.py", BASE_DIR / "sync_data.log", "sync_data")
-    start_script(BASE_DIR / "scripts/image_downloader.py", BASE_DIR / "image_downloader.log", "image_downloader")
-
-
 def check_faiss_consistency() -> tuple[bool, str]:
     """Check that image_index.json and all FAISS files have the same count.
 
@@ -250,47 +198,6 @@ def check_faiss_consistency() -> tuple[bool, str]:
     return True, f"Consistent: {index_count} entries"
 
 
-def do_backup():
-    """Backup DB and FAISS folder after checking consistency.
-
-    Raises RuntimeError if inconsistent - orchestrator must stop.
-    """
-    import sqlite3
-
-    # Check consistency first - FATAL if inconsistent
-    is_consistent, msg = check_faiss_consistency()
-    if not is_consistent:
-        raise RuntimeError(f"FATAL: DB/FAISS inconsistent - {msg}. Fix before continuing.")
-
-    log(f"Consistency check passed: {msg}")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Backup DB using SQLite backup API (safe for concurrent access)
-    backup_db = BACKUPS_DIR / f"etsy_data_{timestamp}.db"
-    log(f"Backing up database to {backup_db.name}...")
-    src = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True)
-    dst = sqlite3.connect(str(backup_db))
-    src.backup(dst)
-    src.close()
-    dst.close()
-    os.chmod(backup_db, 0o444)  # Read-only
-    log(f"  Database backed up")
-
-    # Backup entire embeddings folder
-    if EMBEDDINGS_DIR.exists() and any(EMBEDDINGS_DIR.glob("*.faiss")):
-        backup_emb_dir = BACKUPS_DIR / f"embeddings_{timestamp}"
-        shutil.copytree(EMBEDDINGS_DIR, backup_emb_dir)
-        # Make all files read-only
-        for f in backup_emb_dir.glob("*"):
-            os.chmod(f, 0o444)
-        os.chmod(backup_emb_dir, 0o555)
-        log(f"  FAISS folder backed up to {backup_emb_dir.name}")
-
-    log("Backup complete")
-
-
 # ============================================================
 # IMAGE INDEX (JSON row ↔ FAISS row, with vector hash for integrity)
 # ============================================================
@@ -312,9 +219,14 @@ def load_image_index() -> List[dict]:
 
 
 def save_image_index(index: List[dict]):
-    """Save image_index.json."""
+    """Save image_index.json with lock file to prevent concurrent reads."""
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    IMAGE_INDEX_FILE.write_text(json.dumps(index))
+    lock_file = Path(str(IMAGE_INDEX_FILE) + ".lock")
+    try:
+        lock_file.touch()
+        IMAGE_INDEX_FILE.write_text(json.dumps(index))
+    finally:
+        lock_file.unlink(missing_ok=True)
 
 
 def load_embedded_set(image_index: List[dict]) -> set:
@@ -345,13 +257,24 @@ def top_up_buffer(work_buffer: dict, embedded_set: set):
         WHERE download_done = 2
     """)
     added = 0
+    missing = 0
     for row in cursor:
         key = (row[0], row[1])
         if key not in embedded_set and key not in work_buffer:
-            work_buffer[key] = 'grabbed'
-            added += 1
-            if added >= needed:
-                break
+            # Only grab if the actual JPEG exists and is > 1kb in imagedownload/
+            jpg = IMAGES_DIR / f"{key[0]}_{key[1]}.jpg"
+            try:
+                if jpg.exists() and jpg.stat().st_size > 1024:
+                    work_buffer[key] = 'grabbed'
+                    added += 1
+                    if added >= needed:
+                        break
+                else:
+                    missing += 1
+            except OSError:
+                missing += 1
+    if missing > 0:
+        log(f"Buffer: skipped {missing} images not found in imagedownload/")
     conn.close()
     if added > 0:
         log(f"Buffer topped up: +{added} = {len(work_buffer)} total")
@@ -460,6 +383,10 @@ def get_listing_texts(listing_ids: List[int]) -> dict:
 
 def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
     """Export batch of images for worker processing."""
+    free_gb = check_disk_space()
+    if free_gb < MIN_DISK_GB:
+        raise RuntimeError(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — aborting export")
+
     batch_dir = EXPORTS_DIR / batch_name
     if batch_dir.exists():
         shutil.rmtree(batch_dir)
@@ -521,6 +448,16 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
         if not (batch_dir / f"{model}.npy").exists():
             raise RuntimeError(f"Missing {model}.npy in {batch_dir}")
 
+    # Filter out duplicates: skip images already in embedded_set
+    new_indices = [i for i, (lid, iid) in enumerate(manifest) if (lid, iid) not in embedded_set]
+    skipped = len(manifest) - len(new_indices)
+    if skipped > 0:
+        log(f"Dedup: skipping {skipped} already-embedded images")
+    if not new_indices:
+        log("Entire batch already embedded, skipping")
+        return 0
+    manifest = [manifest[i] for i in new_indices]
+
     # 1. Move original images from images/ to embeddedimages/ on SSD
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
     moved_count = 0
@@ -534,13 +471,15 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
 
     log(f"Moved {moved_count} images to embeddedimages")
 
-    # 2. Load all embeddings for hashing
+    # 2. Load all embeddings for hashing (filter to new_indices if deduped)
     all_embeddings = {}  # model_key -> numpy array
     for model in ALL_MODELS:
-        all_embeddings[model] = np.load(batch_dir / f"{model}.npy").astype("float32")
+        full = np.load(batch_dir / f"{model}.npy").astype("float32")
+        all_embeddings[model] = full[new_indices] if skipped > 0 else full
         text_npy = batch_dir / f"{model}_text.npy"
         if text_npy.exists():
-            all_embeddings[f"{model}_text"] = np.load(text_npy).astype("float32")
+            full_text = np.load(text_npy).astype("float32")
+            all_embeddings[f"{model}_text"] = full_text[new_indices] if skipped > 0 else full_text
 
     # Hash order: clip_vitb32, clip_vitb32_text, clip_vitl14, clip_vitl14_text,
     #             dinov2_base, dinov2_large, dinov3_base
@@ -552,7 +491,11 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
 
     start_row = len(image_index)
 
-    # 3. Append to FAISS indexes
+    # 3. Append to FAISS indexes — check disk BEFORE writing
+    free_gb = check_disk_space()
+    if free_gb < MIN_DISK_GB:
+        raise RuntimeError(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — aborting FAISS write")
+
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     for model in ALL_MODELS:
@@ -660,14 +603,14 @@ def rsync_to_worker_async(worker: Worker, batch_dir: Path) -> subprocess.Popen:
 def start_worker_job(worker: Worker, batch_name: str) -> bool:
     """SSH to start worker process (non-blocking)."""
     batch_path = get_worker_batch_path(worker, batch_name)
-    worker_script = f"{worker.work_dir}/image_search_v2/embed_worker.py"
+    worker_script = f"{worker.work_dir}/bin/embedding/embed_worker.py"
 
     log_path = f"{batch_path}/worker.log"
 
     if worker.host == '192.168.68.117':
         # Windows - run Python directly (SSH session stays open in local background via Popen)
         # start /B via SSH is unreliable; running directly works
-        remote_cmd = f'cd /d "{worker.work_dir}\\image_search_v2" && "{worker.python_path}" embed_worker.py --input "{batch_path}" > "{log_path}" 2>&1'
+        remote_cmd = f'cd /d "{worker.work_dir}\\bin\\embedding" && "{worker.python_path}" embed_worker.py --input "{batch_path}" > "{log_path}" 2>&1'
     else:
         # Mac - use nohup to keep process running after SSH exits
         remote_cmd = f'nohup {worker.python_path} {worker_script} --input {batch_path} > {log_path} 2>&1 &'
@@ -829,42 +772,10 @@ def main():
 
     batch_counter = 0
     total_imported = 0
-    last_disk_check = 0
-    disk_low = False
-
-    # Find most recent backup to avoid immediate backup on restart
-    # Check both local backups/ and SSD
-    last_backup = 0
-    backup_dirs = [BACKUPS_DIR, Path('/Volumes/SSD_120/backups')]
-    all_backups = []
-    for bdir in backup_dirs:
-        if bdir.exists():
-            all_backups.extend(bdir.glob("etsy_data_*.db"))
-    if all_backups:
-        most_recent = max(all_backups, key=lambda f: f.stat().st_mtime)
-        last_backup = most_recent.stat().st_mtime
-        log(f"Last backup: {most_recent.name} ({most_recent.parent})")
 
     try:
         while not check_kill_file():
             now = time.time()
-
-            # Backup every 6 hours (uses SQLite backup API - safe for concurrent access)
-            if now - last_backup > BACKUP_INTERVAL:
-                log("Starting 6-hour backup...")
-                do_backup()
-                last_backup = now
-
-            # Disk space check every 10 min — stop dispatching but keep importing
-            if now - last_disk_check > DISK_CHECK_INTERVAL:
-                free_gb = check_disk_space()
-                was_low = disk_low
-                disk_low = free_gb < MIN_DISK_GB
-                last_disk_check = now
-                if disk_low and not was_low:
-                    log(f"DISK LOW: {free_gb:.1f}GB free — pausing new batch dispatch (imports continue)")
-                elif not disk_low and was_low:
-                    log(f"DISK OK: {free_gb:.1f}GB free — resuming dispatch")
 
             # Check each worker
             should_exit = False
@@ -964,7 +875,7 @@ def main():
                             # status stays 'working'
 
                             # Pre-stage N+2 (async rsync, skip if draining)
-                            if not draining and not disk_low:
+                            if not draining:
                                 next_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                                 if next_images:
                                     batch_counter += 1
@@ -990,7 +901,7 @@ def main():
                             state.next_staged = False
                             state.status = 'staging'
 
-                        elif not draining and not disk_low:
+                        elif not draining:
                             # No pre-staged batch at all → export current + pre-stage, async rsync
                             log(f"{name}: batch complete, dispatching new batch")
                             new_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
@@ -1045,7 +956,7 @@ def main():
 
                     else:
                         # Not done yet - pre-stage next batch if not already (async rsync)
-                        if not state.next_batch and not state.rsync_prestage_proc and not draining and not disk_low:
+                        if not state.next_batch and not state.rsync_prestage_proc and not draining:
                             images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                             if images:
                                 batch_counter += 1
@@ -1061,7 +972,7 @@ def main():
 
                 # ---- IDLE: no work in progress ----
                 elif state.status in ('idle', 'done'):
-                    if draining or disk_low:
+                    if draining:
                         state.status = 'idle'
                         continue
 

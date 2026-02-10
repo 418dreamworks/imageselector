@@ -30,17 +30,18 @@ from image_db import get_connection, insert_image, _retry_on_lock, commit_with_r
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
+API_DELAY_DEFAULT = 1.0  # 1 QPS (default, overridden by qps_config.json)
+UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
 ONE_MONTH = 30 * 24 * 3600
 
-BASE_DIR = Path(__file__).parent
-IMAGES_DIR = BASE_DIR / "images"
-DB_FILE = BASE_DIR / "etsy_data.db"
-TAXONOMY_CONFIG_FILE = BASE_DIR / "furniture_taxonomy_config.json"
-KILL_FILE = BASE_DIR / "KILL"
-QPS_CONFIG_FILE = BASE_DIR / "qps_config.json"
+BASE_DIR = Path(__file__).parent.parent
+IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
+DB_FILE = BASE_DIR / "data" / "db" / "etsy_data.db"
+TAXONOMY_CONFIG_FILE = BASE_DIR / "data" / "db" / "furniture_taxonomy_config.json"
+KILL_FILE = BASE_DIR / "KILL_SD"
+QPS_CONFIG_FILE = BASE_DIR / "data" / "db" / "qps_config.json"
 PID_FILE = BASE_DIR / "sync_data.pid"
 
 
@@ -422,12 +423,13 @@ def update_api_usage(response):
                 config = {}
                 if QPS_CONFIG_FILE.exists():
                     config = json.loads(QPS_CONFIG_FILE.read_text())
-                current_delay = config.get("api_delay", API_DELAY_DEFAULT)
-                if used >= 90000:
-                    new_delay = min(current_delay * 1.1, 30.0)
-                else:
-                    new_delay = API_DELAY_DEFAULT  # 5 QPS
-                config["api_delay"] = new_delay
+                if UPDATE_QPS:
+                    current_delay = config.get("api_delay", API_DELAY_DEFAULT)
+                    if used >= 90000:
+                        new_delay = min(current_delay * 1.1, 30.0)
+                    else:
+                        new_delay = API_DELAY_DEFAULT  # 5 QPS
+                    config["api_delay"] = new_delay
                 config["remaining"] = remaining
                 config["limit"] = limit
                 config["last_updated"] = datetime.now().isoformat()
@@ -996,8 +998,29 @@ def phase_reviews(client, conn, snapshot_ts):
     print(f"[{ts()}] Reviews: {len(shops_with_recent_reviews)} shops already have recent reviews")
 
     # Only fetch for shops without recent reviews
-    shop_ids = list(shops_with_recent_dynamic - shops_with_recent_reviews)
-    print(f"[{ts()}] Reviews: {len(shop_ids)} shops need review fetching")
+    shop_ids_candidates = shops_with_recent_dynamic - shops_with_recent_reviews
+    print(f"[{ts()}] Reviews: {len(shop_ids_candidates)} shops need review fetching (before review_count filter)")
+
+    # Further filter: only shops where review_count changed between last two snapshots
+    cursor = conn.execute("""
+        SELECT a.shop_id
+        FROM shops_dynamic a
+        JOIN (
+            SELECT shop_id, MAX(snapshot_timestamp) as max_ts
+            FROM shops_dynamic
+            GROUP BY shop_id
+        ) latest ON a.shop_id = latest.shop_id AND a.snapshot_timestamp = latest.max_ts
+        LEFT JOIN shops_dynamic prev ON a.shop_id = prev.shop_id
+            AND prev.snapshot_timestamp = (
+                SELECT MAX(snapshot_timestamp)
+                FROM shops_dynamic sd2
+                WHERE sd2.shop_id = a.shop_id AND sd2.snapshot_timestamp < latest.max_ts
+            )
+        WHERE prev.review_count IS NULL OR a.review_count != prev.review_count
+    """)
+    shops_review_changed = set(row[0] for row in cursor.fetchall())
+    shop_ids = list(shop_ids_candidates & shops_review_changed)
+    print(f"[{ts()}] Reviews: {len(shop_ids)} shops with changed review_count")
 
     if not shop_ids:
         # Reset progress for next cycle

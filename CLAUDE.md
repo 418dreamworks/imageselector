@@ -3,16 +3,16 @@
 ## CRITICAL RULES - READ FIRST
 
 **NEVER DO THESE:**
-- ❌ `pkill` or `kill -9` on any script → Use KILL files instead
-- ❌ Use system python on iMac → Use `venv/bin/python`
-- ❌ Wrong iMac path → Correct: `/Users/tzuohannlaw/Documents/418Dreamworks/imageselector`
-- ❌ Direct scp/rsync to remote → Use git push/pull instead
+- `pkill` or `kill -9` on any script → Use KILL files instead
+- Use system python on iMac → Use `venv/bin/python3`
+- Wrong iMac path → Correct: `/Users/tzuohannlaw/Documents/418Dreamworks/imageselector`
+- Direct scp/rsync to remote → Use git push/pull instead
 
 **ALWAYS DO THESE:**
-- ✅ Use KILL files to stop scripts gracefully
-- ✅ Check `lsof etsy_data.db` before any kill/SIG commands to verify no DB write conflicts
-- ✅ Confirm YES:GIT before git push/pull
-- ✅ Read `IMAC_OPERATIONS.md` for detailed operations guide
+- Use KILL files to stop scripts gracefully
+- Check `lsof data/db/etsy_data.db` before any kill/SIG commands to verify no DB write conflicts
+- Confirm YES:GIT before git push/pull
+- Read `docs/IMAC_OPERATIONS.md` for detailed operations guide
 
 ---
 
@@ -23,22 +23,15 @@ This project builds an **ensemble image search system** for Etsy furniture listi
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           DATA COLLECTION PIPELINE                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   sync_data.py ──► image_downloader.py ──► bg_remover.py ──► embed.py     │
-│        │                   │                    │                │          │
-│        ▼                   ▼                    ▼                ▼          │
-│   Etsy API            Etsy CDN              CoreML GPU        MPS GPU      │
-│   (~5 QPS)          (8 workers)            (~56/min)       (5 models)      │
-│        │                   │                    │                │          │
-│        ▼                   ▼                    ▼                ▼          │
-│   SQLite DB           images/               images/          FAISS         │
-│   (listings,        (945K files)          (overwrites)      indexes        │
-│   shops, reviews)                                                          │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+sync_data.py ──► image_downloader.py ──► embed_orchestrator.py (bg removal + embedding)
+     │                   │                         │
+     ▼                   ▼                         ▼
+  Etsy API          Etsy CDN                 3 workers (iMac, MBP, Sleight)
+  (~5 QPS)        (8 workers)              bg removal + 5 model embeddings
+     │                   │                         │
+     ▼                   ▼                         ▼
+  data/db/         images/                   data/embeddings/
+  etsy_data.db     imagedownload/            FAISS indexes
 ```
 
 ### Key Design Decisions
@@ -55,197 +48,131 @@ This project builds an **ensemble image search system** for Etsy furniture listi
 
 ## Codebase Structure
 
-### Core Scripts
+### Core Scripts (bin/)
 
 | File | Purpose |
 |------|---------|
-| `sync_data.py` | Crawls Etsy API taxonomy, discovers listings, fetches shop/review data |
-| `scripts/image_downloader.py` | Downloads images from Etsy CDN (8 parallel workers) |
-| `scripts/bg_remover.py` | Removes backgrounds using rembg + CoreML GPU acceleration |
-| `image_search_v2/embed.py` | Generates embeddings for 5 models, saves to FAISS indexes |
-| `scripts/pipeline_monitor.py` | Manages all 4 scripts, auto-restarts on crash |
-| `scripts/cleanup_images.py` | Moves non-primary images to HDD after embedding complete |
+| `bin/sync_data.py` | Crawls Etsy API taxonomy, discovers listings, fetches shop/review data |
+| `bin/image_downloader.py` | Downloads images from Etsy CDN (8 parallel workers) |
+| `bin/image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
+| `bin/tar_images.py` | Archives 10K image batches from imageall_new → imageall_tars |
+| `bin/embedding/embed_orchestrator.py` | Distributes batches to 3 workers, imports results to FAISS |
+| `bin/embedding/embed_worker.py` | BG removal + 5-model embedding (runs on workers) |
+| `bin/embedding/models.py` | Model definitions and lazy loading for CLIP/DINO |
 
-### Support Modules
+### Maintenance Scripts (bin/)
 
 | File | Purpose |
 |------|---------|
-| `image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
-| `image_search_v2/models.py` | Model definitions and lazy loading for CLIP/DINO |
-| `image_search_v2/search.py` | Search functions (to be implemented) |
+| `bin/update_primary.py` | Extracts primary images from tar archives to imageprimary/ |
+| `bin/backup_db.py` | Backs up entire data/ folder to HDD1TB |
+| `bin/init/fetch_taxonomy.py` | One-time taxonomy bootstrap |
+| `bin/init/calculate_price_breaks.py` | One-time price break calculation |
 
 ### Kill Files (Graceful Shutdown)
 
 | Kill File | Stops |
 |-----------|-------|
-| `KILL` | sync_data.py and pipeline_monitor.py |
+| `KILL_SD` | sync_data.py |
 | `KILL_DL` | image_downloader.py |
-| `KILL_BG` | bg_remover.py |
-| `KILL_EMBED` | embed.py |
+| `KILL_ORCH` | embed_orchestrator.py |
 
 ---
 
-## Database: image_status Table
+## Data Layout
 
-The `image_status` table is the **single source of truth** for pipeline state:
-
-```sql
-CREATE TABLE image_status (
-    listing_id INTEGER,
-    image_id INTEGER,
-    shop_id INTEGER,
-    hex TEXT,                    -- CDN path component
-    suffix TEXT,                 -- CDN suffix
-    is_primary INTEGER,          -- 1 = main listing image
-    when_made TEXT,              -- "2020_2024", etc.
-    price REAL,
-    to_download INTEGER DEFAULT 1,
-    download_done INTEGER DEFAULT 0,
-    bg_removed INTEGER DEFAULT 0,
-    embed_clip_vitb32 INTEGER DEFAULT 0,
-    embed_clip_vitl14 INTEGER DEFAULT 0,
-    embed_dinov2_base INTEGER DEFAULT 0,
-    embed_dinov2_large INTEGER DEFAULT 0,
-    embed_dinov3_base INTEGER DEFAULT 0,
-    PRIMARY KEY (listing_id, image_id)
-);
+```
+data/
+├── db/
+│   ├── etsy_data.db                 # Main SQLite database
+│   ├── qps_config.json              # API rate config
+│   ├── furniture_taxonomy_config.json
+│   ├── furniture_taxonomy_ids.json
+│   └── furniture_leaf_taxonomy_ids.json
+└── embeddings/
+    ├── clip_vitb32.faiss            # Image embeddings (N, 512)
+    ├── clip_vitb32_text.faiss       # Text embeddings (N, 512)
+    ├── clip_vitl14.faiss            # Image embeddings (N, 768)
+    ├── clip_vitl14_text.faiss       # Text embeddings (N, 768)
+    ├── dinov2_base.faiss            # Image embeddings (N, 768)
+    ├── dinov2_large.faiss           # Image embeddings (N, 1024)
+    ├── dinov3_base.faiss            # Image embeddings (N, 768)
+    └── image_index.json             # Row → (listing_id, image_id)
 ```
 
-Each script atomically updates its own flag:
-- `sync_data.py` → sets `to_download=1`
-- `image_downloader.py` → sets `download_done=1`
-- `bg_remover.py` → sets `bg_removed=1`
-- `embed.py` → sets `embed_{model}=1` for each model
+**Row alignment**: Row 42 in ALL FAISS files = same image. `image_index.json[42]` = `[listing_id, image_id]`
+
+---
+
+## Image Layout
+
+```
+images/
+├── imagedownload/    # Raw downloaded images (primary SSD)
+├── imageall_new/     # BG-removed images waiting to be tarred
+├── imageall_tars/    # Symlink → HDD1TB/images/imageall_tars
+└── imageprimary/     # One bg-removed primary image per listing
+```
 
 ---
 
 ## Embedding Models (5 Total)
 
-| Model | Dimension | Library | Inputs | Notes |
-|-------|-----------|---------|--------|-------|
-| clip_vitb32 | 512 | open_clip | image + text | Fast, good general-purpose |
-| clip_vitl14 | 768 | open_clip | image + text | Higher quality than B/32 |
-| dinov2_base | 768 | transformers | image only | Good for visual similarity |
-| dinov2_large | 1024 | transformers | image only | Best visual quality |
-| dinov3_base | 768 | transformers | image only | Latest DINO version |
-
-**CLIP models** also generate text embeddings from listing title + materials.
-
-### FAISS Index Files
-
-```
-embeddings/
-├── clip_vitb32.faiss          # Image embeddings (N, 512)
-├── clip_vitb32_text.faiss     # Text embeddings (N, 512)
-├── clip_vitl14.faiss          # Image embeddings (N, 768)
-├── clip_vitl14_text.faiss     # Text embeddings (N, 768)
-├── dinov2_base.faiss          # Image embeddings (N, 768)
-├── dinov2_large.faiss         # Image embeddings (N, 1024)
-├── dinov3_base.faiss          # Image embeddings (N, 768)
-└── image_index.json           # Row → (listing_id, image_id)
-```
-
-**Row alignment**: Row 42 in ALL files = same image. `image_index.json[42]` = `[listing_id, image_id]`
+| Model | Dimension | Library | Inputs |
+|-------|-----------|---------|--------|
+| clip_vitb32 | 512 | open_clip | image + text |
+| clip_vitl14 | 768 | open_clip | image + text |
+| dinov2_base | 768 | transformers | image only |
+| dinov2_large | 1024 | transformers | image only |
+| dinov3_base | 768 | transformers | image only |
 
 ---
 
-## Current Status
+## Storage & Backup
 
-As of last session:
+| Location | Contents | Update Frequency |
+|----------|----------|-----------------|
+| Primary SSD | Everything (data/, images/, bin/) | Live |
+| SSD500GB | data/ + images/imageprimary/ | Hourly rsync (server-ready) |
+| HDD500GB | Mirror of SSD500GB | Nightly rsync |
+| HDD1TB | images/imageall_tars/ + backups/ | Live (tars) + 6h (backups) |
+| HDD3TB | Mirror of HDD1TB | Nightly rsync |
 
-| Metric | Count |
-|--------|-------|
-| Total images | ~1.2M |
-| Download done | ~945K |
-| BG removed | ~277K |
-| Embedded clip_vitb32 | ~80K |
-| Other models | 0 (processed sequentially) |
+### Cron Schedule
 
-### Processing Rates
-
-| Stage | Rate |
-|-------|------|
-| Etsy API | ~5 QPS (rate limited) |
-| CDN download | ~100/sec (8 workers) |
-| BG removal | ~56/min (~3,400/hr) with CoreML GPU |
-| Embedding | ~32 images/batch with MPS GPU |
-
-### Bottleneck
-
-BG removal is the bottleneck. With ~700K backlog at 3,400/hr, clearing takes ~8 days.
-
----
-
-## Next Steps
-
-### Phase 1: Reach 100K Embeddings (Current)
-
-1. **Keep pipeline running** until all 5 models have 100K+ embeddings
-2. **Monitor progress**: `venv/bin/python image_db.py`
-3. **Check logs**: `tail -f *.log`
-
-### Phase 2: Implement Ensemble Search
-
-Once 100K embeddings exist:
-
-1. **Build search function** in `image_search_v2/search.py`:
-   - Load all 5 FAISS indexes
-   - Query image → embed with all 5 models
-   - Search each index for top-K (e.g., K=100)
-   - Aggregate by listing_id, keeping max score per listing
-   - Rank by ensemble consensus
-
-2. **Scoring approaches** to experiment with:
-   - Simple: Sum of ranks across models
-   - Weighted: Weight by model quality
-   - Consensus: Count how many models have listing in top-K
-   - Hybrid: Combination of above
-
-3. **Display**: Show primary image (`is_primary=1`) for each matched listing
-
-### Phase 3: Build UI
-
-1. **Streamlit app** in `image_search_v2/app.py`
-2. Upload query image → show top matches
-3. Tabs for each model's results vs ensemble
-4. Highlight matches that appear in multiple models
-
-### Phase 4: Cleanup & Scale
-
-1. **Run cleanup_images.py** to move non-primary images to HDD
-2. **Keep pipeline running** to accumulate more data
-3. **Periodic re-embedding** as models improve
+| Time | Job |
+|------|-----|
+| `:00` every 12h | tar_images.py && update_primary.py |
+| `:15` hourly | rsync data/ + imageprimary/ → SSD500GB |
+| `:30` every 6h | backup_db.py (data/ → HDD1TB) |
+| 4am nightly | HDD1TB → HDD3TB |
+| 6am nightly | SSD500GB → HDD500GB |
 
 ---
 
 ## Quick Commands
 
 ```bash
-# Go to project
 cd /Users/tzuohannlaw/Documents/418Dreamworks/imageselector
 
 # Check status
-venv/bin/python image_db.py
+venv/bin/python3 bin/image_db.py
 
-# Start pipeline (manages all 4 scripts)
-nohup venv/bin/python scripts/pipeline_monitor.py > pipeline.log 2>&1 &
-
-# Stop pipeline gracefully
-touch KILL
+# Stop scripts gracefully
+touch KILL_SD     # sync_data
+touch KILL_DL     # image_downloader
+touch KILL_ORCH   # orchestrator
 
 # Watch logs
-tail -f *.log
+tail -f logs/*.log
 
 # Check running processes
 ps aux | grep python | grep -v grep
-
-# Pull code changes from MacBook Pro
-git pull origin main
 ```
 
 ---
 
 ## Documentation
 
-- **`IMAC_OPERATIONS.md`** - Complete operations guide (start/stop, troubleshooting, SQL queries)
-- **`data_structure.md`** - Full database schema reference
+- **`docs/IMAC_OPERATIONS.md`** - Complete operations guide
+- **`docs/data_structure.md`** - Full database schema reference

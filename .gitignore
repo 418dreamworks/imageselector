@@ -4,13 +4,19 @@ venv/
 
 # Data (too large for git)
 images/
-images_test/
-image_metadata.json
-image_metadata_test.json
-sync_progress.json
-sync_progress_test.json
-etsy_taxonomy.json
-pending/
+etsy_data.db
+etsy_data.db-wal
+etsy_data.db-shm
+data/embeddings/
+embed_exports/
+backups
+
+# Runtime
+logs/
+*.pid
+*.log
+KILL*
+.DS_Store
 
 # Dev/experimental
 dev/
@@ -26,8 +32,15 @@ __pycache__/
 
 # Claude
 .claude/
-etsy_data.db
+
+# Legacy (no longer used)
+image_metadata.json
+image_metadata_test.json
+sync_progress.json
+sync_progress_test.json
+etsy_taxonomy.json
+pending/
+images_test/
 data_sync_state.json
 *_data.json
-IMAC_FILES.md
 IMAC_FILES.md

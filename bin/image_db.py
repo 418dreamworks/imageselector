@@ -11,8 +11,8 @@ import time
 import random
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
-DB_FILE = BASE_DIR / "etsy_data.db"
+BASE_DIR = Path(__file__).parent.parent
+DB_FILE = BASE_DIR / "data" / "db" / "etsy_data.db"
 
 # Retry settings for database lock handling
 MAX_RETRIES = 30

@@ -31,14 +31,14 @@ import numpy as np
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent
-IMAGES_DIR = BASE_DIR / "images"
-EMBEDDINGS_DIR = BASE_DIR / "embeddings"
+IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
+EMBEDDINGS_DIR = BASE_DIR / "data" / "embeddings"
 EXPORTS_DIR = BASE_DIR / "embed_exports"
-DB_FILE = BASE_DIR / "etsy_data.db"
+DB_FILE = BASE_DIR / "data" / "db" / "etsy_data.db"
 IMAGE_INDEX_FILE = EMBEDDINGS_DIR / "image_index.json"
 
-# Add parent to path for imports
-sys.path.insert(0, str(BASE_DIR))
+# Add bin/ to path for imports
+sys.path.insert(0, str(BASE_DIR / "bin"))
 from image_db import (
     get_connection, get_images_for_embedding_batch,
     mark_embedded, commit_with_retry

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Image downloader with manager/worker architecture.
 
+download_done values:
+  -1 = dead URL (404 from CDN, image no longer exists)
+   0 = needs download
+   1 = marker (.dl) created, waiting for worker to download
+   2 = download complete (jpg > 1kb on disk)
+
 Manager (main thread):
 - Scans for images where download_done=0, reads URL from DB
 - Creates .dl marker files with URLs, marks download_done=1
@@ -9,6 +15,7 @@ Manager (main thread):
 Workers (4 threads, partitioned):
 - Each worker handles files where first_5_digits % 4 == worker_id
 - Reads URL from marker, downloads image, saves jpg, deletes marker
+- On 404: sets download_done=-1, removes marker
 
 Kill file: touch KILL_DL to stop gracefully.
 """
@@ -23,13 +30,13 @@ import urllib.request
 import urllib.error
 
 BASE_DIR = Path(__file__).parent.parent
-IMAGES_DIR = BASE_DIR / "images"
+IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
 KILL_FILE = BASE_DIR / "KILL_DL"
 PID_FILE = BASE_DIR / "image_downloader.pid"
-NUM_WORKERS = 8
+NUM_WORKERS = 1
 
 # Import from shared image_db module
-sys.path.insert(0, str(BASE_DIR))
+sys.path.insert(0, str(BASE_DIR / "bin"))
 from image_db import get_connection, commit_with_retry
 
 
@@ -257,6 +264,25 @@ def download_one(marker_path: Path) -> bool:
 
     except FileNotFoundError:
         return False
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # Image no longer exists on CDN - mark as dead
+            try:
+                stem = marker_path.stem
+                parts = stem.split("_")
+                if len(parts) == 2:
+                    listing_id, image_id = int(parts[0]), int(parts[1])
+                    conn = get_connection()
+                    conn.execute(
+                        "UPDATE image_status SET download_done = -1 WHERE listing_id = ? AND image_id = ?",
+                        (listing_id, image_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                marker_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
     except Exception:
         # Download failed - leave marker for retry
         return False

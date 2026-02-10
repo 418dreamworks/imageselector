@@ -30,9 +30,9 @@ from models import MODELS, get_loader
 BASE_DIR = Path(__file__).parent.parent
 
 # Paths - adjust for iMac vs local dev
-IMAGES_DIR_NOBG = BASE_DIR / "images_nobg"
-IMAGES_DIR = BASE_DIR / "images"
-EMBEDDINGS_DIR = BASE_DIR / "embeddings"
+IMAGES_DIR_NOBG = BASE_DIR / "images" / "imagedownload"
+IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
+EMBEDDINGS_DIR = BASE_DIR / "data" / "embeddings"
 
 # If images dir doesn't exist, try dev/images (local dev)
 if not IMAGES_DIR.exists():
@@ -41,11 +41,11 @@ if not IMAGES_DIR.exists():
     EMBEDDINGS_DIR = BASE_DIR / "dev" / "embeddings"
 
 IMAGE_INDEX_FILE = EMBEDDINGS_DIR / "image_index.json"
-DB_FILE = BASE_DIR / "etsy_data.db"
+DB_FILE = BASE_DIR / "data" / "db" / "etsy_data.db"
 KILL_FILE = BASE_DIR / "KILL_EMBED"
 
 # Import from shared image_db module
-sys.path.insert(0, str(BASE_DIR))
+sys.path.insert(0, str(BASE_DIR / "bin"))
 from image_db import (
     get_connection, get_images_for_embedding, get_images_for_embedding_batch,
     get_embedding_status_for_images, mark_embedded as db_mark_embedded
