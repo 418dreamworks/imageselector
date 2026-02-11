@@ -30,7 +30,7 @@ from image_db import get_connection, insert_image, _retry_on_lock, commit_with_r
 ETSY_API_KEY = os.getenv("ETSY_API_KEY")
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY_DEFAULT = 1.0  # 1 QPS (default, overridden by qps_config.json)
+API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
 UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600

@@ -383,9 +383,12 @@ def get_listing_texts(listing_ids: List[int]) -> dict:
 
 def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
     """Export batch of images for worker processing."""
-    free_gb = check_disk_space()
-    if free_gb < MIN_DISK_GB:
-        raise RuntimeError(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — aborting export")
+    while True:
+        free_gb = check_disk_space()
+        if free_gb >= MIN_DISK_GB:
+            break
+        log(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — waiting 5 min...")
+        time.sleep(300)
 
     batch_dir = EXPORTS_DIR / batch_name
     if batch_dir.exists():
@@ -492,9 +495,12 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
     start_row = len(image_index)
 
     # 3. Append to FAISS indexes — check disk BEFORE writing
-    free_gb = check_disk_space()
-    if free_gb < MIN_DISK_GB:
-        raise RuntimeError(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — aborting FAISS write")
+    while True:
+        free_gb = check_disk_space()
+        if free_gb >= MIN_DISK_GB:
+            break
+        log(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — waiting 5 min...")
+        time.sleep(300)
 
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1015,8 +1021,8 @@ def main():
             idle = sum(1 for s in worker_states.values() if s.status == 'idle')
 
             if working == 0 and staging == 0 and idle == len(worker_states):
-                log("All workers idle, no pending work. Waiting...")
-                time.sleep(60)
+                log("All workers idle, no pending work. Exiting.")
+                break
             else:
                 time.sleep(POLL_INTERVAL)
 

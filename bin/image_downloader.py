@@ -33,7 +33,7 @@ BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
 KILL_FILE = BASE_DIR / "KILL_DL"
 PID_FILE = BASE_DIR / "image_downloader.pid"
-NUM_WORKERS = 1
+NUM_WORKERS = 8
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR / "bin"))
@@ -329,7 +329,7 @@ def worker_loop(worker_id: int):
                 print(".", end="", flush=True)
 
             # Small delay between downloads
-            time.sleep(0.05)
+            time.sleep(0.2)
 
     print(f"\n[{ts()}] Worker {worker_id} stopped")
 

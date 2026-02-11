@@ -108,10 +108,11 @@ data/
 
 ```
 images/
-├── imagedownload/    # Raw downloaded images (primary SSD)
-├── imageall_new/     # BG-removed images waiting to be tarred
-├── imageall_tars/    # Symlink → HDD1TB/images/imageall_tars
-└── imageprimary/     # One bg-removed primary image per listing
+├── imagedownload/      # Raw downloaded images (primary SSD)
+├── imageall_new/       # BG-removed images waiting to be tarred
+├── imageall_tars/      # Symlink → HDD1TB/images/imageall_tars
+├── imageprimary/       # One bg-removed primary image per listing (most recent 10K loose)
+└── imageprimary_tars/  # Symlink → SSD500GB (10K batches of primary images)
 ```
 
 ---

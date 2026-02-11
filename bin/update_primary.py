@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Maintain imageprimary/ — one bg-removed primary image per listing.
+"""Weekly primary image rebuild.
 
-Sources images only from tar archives (embedded + archived = trustworthy).
-Run manually, roughly monthly.
+Clears imageprimary/, extracts all primary images from imageall_tars/,
+then tars everything in 10K batches (no loose files remain).
 
 Usage:
-    venv/bin/python3 scratch/update_primary.py
+    venv/bin/python3 bin/update_primary.py
 """
 
+import hashlib
 import json
 import os
+import random
 import sqlite3
+import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -39,153 +43,163 @@ def load_index_safe():
             time.sleep(1)
 
 
-def main():
-    # Step 1: Load index
+def clear_primary_dir():
+    """Remove all files (jpgs and tars) from imageprimary/."""
+    print("=== Clearing imageprimary/ ===")
+    removed = 0
+    for fn in os.listdir(PRIMARY_DIR):
+        fp = os.path.join(PRIMARY_DIR, fn)
+        if os.path.isfile(fp):
+            os.remove(fp)
+            removed += 1
+    print(f"  Removed {removed:,} files")
+
+
+def extract_primaries():
+    """Extract all primary images from imageall_tars/ into imageprimary/."""
+    print("\n=== Extracting primary images ===")
+
+    # Load index
     print("Loading image_index.json...")
     idx = load_index_safe()
     print(f"  Total index rows: {len(idx):,}")
 
-    # Step 2: Count tars, limit to tarred rows only
+    # Count imageall tars, limit to tarred rows only
     tar_files = [f for f in os.listdir(TAR_DIR) if f.endswith(".tar")]
     num_tars = len(tar_files)
     max_row = num_tars * BATCH_SIZE
-    print(f"  Tar files: {num_tars} → considering rows 0 to {max_row - 1:,}")
+    print(f"  imageall tars: {num_tars} → rows 0 to {max_row - 1:,}")
 
     tarred_idx = idx[:max_row]
 
-    # Build set of all tarred (listing_id, image_id) and map listing→row
-    tarred_pairs = set()
-    row_for_pair = {}  # (lid, iid) → row number (for tar lookup)
+    # Build (listing_id, image_id) → row mapping
+    row_for_pair = {}
     for row, entry in enumerate(tarred_idx):
         lid, iid = entry[0], entry[1]
-        tarred_pairs.add((lid, iid))
         row_for_pair[(lid, iid)] = row
 
-    print(f"  Tarred images: {len(tarred_pairs):,}")
-
-    # Step 3: Query DB for primary images among tarred set
+    # Query DB for primary images
     print("Querying DB for primary images...")
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
-
-    # Get all primary images
     cursor = conn.execute(
         "SELECT listing_id, image_id FROM image_status WHERE is_primary = 1"
     )
     all_primaries = cursor.fetchall()
     conn.close()
 
-    # Filter to only tarred primaries
-    tarred_primaries = {}  # listing_id → image_id
+    # Filter to only primaries that exist in tars
+    to_extract = {}  # (lid, iid) → tar_number
     for lid, iid in all_primaries:
-        if (lid, iid) in tarred_pairs:
-            tarred_primaries[lid] = iid
-
-    print(f"  Listings with tarred primary image: {len(tarred_primaries):,}")
-
-    # Step 4: Scan existing imageprimary/ files
-    print("Scanning imageprimary/...")
-    existing = {}  # listing_id → image_id (from filename)
-    for fn in os.listdir(PRIMARY_DIR):
-        if not fn.endswith(".jpg"):
-            continue
-        parts = fn[:-4].split("_")  # strip .jpg, split on _
-        if len(parts) == 2:
-            try:
-                existing[int(parts[0])] = int(parts[1])
-            except ValueError:
-                continue
-
-    print(f"  Existing primary files: {len(existing):,}")
-
-    # Step 5: Determine what to add, update, and remove
-    to_extract = {}  # (listing_id, image_id) → tar_number
-    to_remove = []   # filenames to remove
-
-    # Check each tarred primary
-    for lid, iid in tarred_primaries.items():
-        if lid in existing:
-            if existing[lid] == iid:
-                # Already correct, skip
-                continue
-            else:
-                # Wrong image_id — remove old, extract new
-                old_fn = f"{lid}_{existing[lid]}.jpg"
-                to_remove.append(old_fn)
-                row = row_for_pair[(lid, iid)]
-                to_extract[(lid, iid)] = row // BATCH_SIZE
-        else:
-            # Missing — extract
+        if (lid, iid) in row_for_pair:
             row = row_for_pair[(lid, iid)]
             to_extract[(lid, iid)] = row // BATCH_SIZE
 
-    # Files in imageprimary/ whose listing has no tarred primary → remove
-    for lid, iid in existing.items():
-        if lid not in tarred_primaries:
-            to_remove.append(f"{lid}_{iid}.jpg")
+    print(f"  Primary images to extract: {len(to_extract):,}")
 
-    print(f"\n  To extract: {len(to_extract):,}")
-    print(f"  To remove:  {len(to_remove):,}")
-    print(f"  Already OK: {len(tarred_primaries) - len(to_extract):,}")
+    # Group by tar number
+    by_tar = {}
+    for (lid, iid), tar_num in to_extract.items():
+        by_tar.setdefault(tar_num, []).append((lid, iid))
 
-    # Step 6: Remove stale files
-    if to_remove:
-        print(f"\nRemoving {len(to_remove)} stale files...")
-        for fn in to_remove:
-            os.remove(os.path.join(PRIMARY_DIR, fn))
-        print(f"  Removed {len(to_remove)} files")
+    print(f"  Extracting from {len(by_tar)} tar files...")
+    extracted_total = 0
 
-    # Step 7: Extract needed images, grouped by tar number
-    if to_extract:
-        # Group by tar number
-        by_tar = {}  # tar_number → list of (listing_id, image_id)
-        for (lid, iid), tar_num in to_extract.items():
-            by_tar.setdefault(tar_num, []).append((lid, iid))
+    for tar_num in sorted(by_tar.keys()):
+        pairs = by_tar[tar_num]
+        tar_path = os.path.join(TAR_DIR, f"imageall_{tar_num:05d}.tar")
 
-        print(f"\nExtracting from {len(by_tar)} tar files...")
-        extracted_total = 0
+        if not os.path.exists(tar_path):
+            print(f"  WARNING: {tar_path} not found, skipping {len(pairs)} images")
+            continue
 
-        for tar_num in sorted(by_tar.keys()):
-            pairs = by_tar[tar_num]
-            tar_path = os.path.join(TAR_DIR, f"imageall_{tar_num:05d}.tar")
+        needed = {f"{lid}_{iid}.jpg": (lid, iid) for lid, iid in pairs}
 
-            if not os.path.exists(tar_path):
-                print(f"  WARNING: {tar_path} not found, skipping {len(pairs)} images")
-                continue
+        extracted = 0
+        with tarfile.open(tar_path, "r") as tf:
+            for fn in needed:
+                try:
+                    member = tf.getmember(fn)
+                    with tf.extractfile(member) as src:
+                        data = src.read()
+                    dst_path = os.path.join(PRIMARY_DIR, fn)
+                    with open(dst_path, "wb") as dst:
+                        dst.write(data)
+                    extracted += 1
+                except KeyError:
+                    print(f"  WARNING: {fn} not found in tar {tar_num:05d}")
 
-            # Build set of filenames to extract
-            needed = {f"{lid}_{iid}.jpg": (lid, iid) for lid, iid in pairs}
+        extracted_total += extracted
+        print(f"  imageall_{tar_num:05d}.tar: extracted {extracted}/{len(pairs)}")
 
-            extracted = 0
+    print(f"\nTotal extracted: {extracted_total:,}")
+    return extracted_total
+
+
+def tar_primary_images():
+    """Tar ALL loose .jpg files in imageprimary/ in 10K batches. No loose files remain."""
+    print("\n=== Tarring primary images ===")
+    tarnum = -1
+
+    while True:
+        loose = sorted(f for f in os.listdir(PRIMARY_DIR) if f.endswith(".jpg"))
+        if len(loose) == 0:
+            print("  No loose files, done.")
+            break
+
+        tarnum += 1
+        batch = loose[:BATCH_SIZE]
+        tar_name = f"imageprimary_{tarnum:05d}.tar"
+        tar_path = os.path.join(PRIMARY_DIR, tar_name)
+        list_path = f"/tmp/tar_primary_{tarnum:05d}.txt"
+
+        with open(list_path, "w") as f:
+            for fn in batch:
+                f.write(fn + "\n")
+
+        t0 = time.time()
+        print(f"  Creating {tar_name} ({len(batch):,} files)...", end=" ", flush=True)
+        result = subprocess.run(
+            ["tar", "--no-mac-metadata", "-cf", tar_path, "-T", list_path],
+            cwd=PRIMARY_DIR, capture_output=True, text=True,
+        )
+        elapsed = time.time() - t0
+        if result.returncode != 0:
+            print(f"ERROR: {result.stderr.strip()}")
+            os.unlink(list_path)
+            sys.exit(1)
+
+        tar_size = os.path.getsize(tar_path) / (1024 * 1024)
+        print(f"{tar_size:.0f}MB in {elapsed:.0f}s")
+
+        # Verify checksums (up to 50 random)
+        check_count = min(50, len(batch))
+        for fn in random.sample(batch, check_count):
+            with open(os.path.join(PRIMARY_DIR, fn), "rb") as f:
+                orig_md5 = hashlib.md5(f.read()).hexdigest()
             with tarfile.open(tar_path, "r") as tf:
-                for fn in needed:
-                    try:
-                        member = tf.getmember(fn)
-                        with tf.extractfile(member) as src:
-                            data = src.read()
-                        dst_path = os.path.join(PRIMARY_DIR, fn)
-                        with open(dst_path, "wb") as dst:
-                            dst.write(data)
-                        extracted += 1
-                    except KeyError:
-                        lid, iid = needed[fn]
-                        print(f"  WARNING: {fn} not found in tar {tar_num:05d}")
+                tar_md5 = hashlib.md5(tf.extractfile(fn).read()).hexdigest()
+            if orig_md5 != tar_md5:
+                print(f"  CHECKSUM MISMATCH: {fn}. STOPPING.")
+                os.unlink(list_path)
+                sys.exit(1)
+        print(f"  Verified: {check_count} checksums OK")
 
-            extracted_total += extracted
-            print(f"  imageall_{tar_num:05d}.tar: extracted {extracted}/{len(pairs)}")
+        for fn in batch:
+            os.remove(os.path.join(PRIMARY_DIR, fn))
+        print(f"  Deleted {len(batch)} loose files")
 
-        print(f"\nTotal extracted: {extracted_total:,}")
-
-    # Summary
-    final_count = len([f for f in os.listdir(PRIMARY_DIR) if f.endswith(".jpg")])
-    print(f"\n=== Summary ===")
-    print(f"  imageprimary/ files: {final_count:,}")
-    print(f"  Expected (tarred primaries): {len(tarred_primaries):,}")
-    if final_count == len(tarred_primaries):
-        print("  ✓ Counts match")
-    else:
-        print(f"  ✗ Mismatch: {len(tarred_primaries) - final_count:,} missing")
+        os.unlink(list_path)
 
 
 if __name__ == "__main__":
-    main()
+    clear_primary_dir()
+    extract_primaries()
+    tar_primary_images()
+
+    # Final summary
+    tars = [f for f in os.listdir(PRIMARY_DIR) if f.endswith(".tar")]
+    loose = [f for f in os.listdir(PRIMARY_DIR) if f.endswith(".jpg")]
+    print(f"\n=== Done ===")
+    print(f"  Tars: {len(tars)}")
+    print(f"  Loose files: {len(loose)}")
