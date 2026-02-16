@@ -42,6 +42,8 @@ EMBEDDED_DIR = BASE_DIR / 'images' / 'imageall_new'
 ORCH_STATE_FILE = BASE_DIR / 'orchestrator_state.json'
 PID_FILE = BASE_DIR / 'orchestrator.pid'
 KILL_FILE = BASE_DIR / 'KILL_ORCH'
+PAUSE_FILE = BASE_DIR / 'PAUSE_ORCH'
+PAUSED_FILE = BASE_DIR / 'PAUSED_ORCH'
 
 # Timing
 POLL_INTERVAL = 10  # seconds between worker checks
@@ -149,6 +151,14 @@ def check_kill_file() -> bool:
         log("Kill file detected. Shutting down...")
         return True
     return False
+
+
+def wait_for_backup_lock():
+    while PAUSE_FILE.exists():
+        PAUSED_FILE.touch()
+        log("Backup in progress, paused...")
+        time.sleep(10)
+    PAUSED_FILE.unlink(missing_ok=True)
 
 
 def check_disk_space() -> float:
@@ -419,11 +429,14 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
 
 
 def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) -> int:
-    """Import batch: move original images to SSD, append FAISS, append image_index.
+    """Import batch: save image_index, append FAISS, move images.
 
-    IMPORTANT: This function is atomic - once started, it must complete.
+    Write order matters for crash safety:
+      1. image_index.json (if interrupted here, FAISS has fewer rows — recoverable)
+      2. FAISS files
+      3. Move images to imageall_new/ (least critical — images still in batch dir)
+
     Do NOT add kill file checks inside this function.
-    If interrupted, consistency check will catch the mismatch on next startup.
 
     Raises Exception on failure so orchestrator can stop.
 
@@ -461,20 +474,7 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
         return 0
     manifest = [manifest[i] for i in new_indices]
 
-    # 1. Move original images from images/ to embeddedimages/ on SSD
-    EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
-    moved_count = 0
-
-    for lid, iid in manifest:
-        orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
-        if orig.exists():
-            dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
-            shutil.move(str(orig), str(dst))
-            moved_count += 1
-
-    log(f"Moved {moved_count} images to embeddedimages")
-
-    # 2. Load all embeddings for hashing (filter to new_indices if deduped)
+    # 1. Load all embeddings for hashing (filter to new_indices if deduped)
     all_embeddings = {}  # model_key -> numpy array
     for model in ALL_MODELS:
         full = np.load(batch_dir / f"{model}.npy").astype("float32")
@@ -493,6 +493,13 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
             hash_keys.append(f"{model}_text")
 
     start_row = len(image_index)
+
+    # 2. Append to image_index.json FIRST (safest to lose — recoverable)
+    for i, (lid, iid) in enumerate(manifest):
+        hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
+        image_index.append([lid, iid, start_row + i] + hashes)
+        embedded_set.add((lid, iid))
+    save_image_index(image_index)
 
     # 3. Append to FAISS indexes — check disk BEFORE writing
     while True:
@@ -539,13 +546,18 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
     if len(set(counts)) > 1:
         raise RuntimeError(f"FAISS inconsistency detected after import! Counts: {faiss_counts}")
 
-    # 4. Append to image_index.json with per-model vector hashes
-    for i, (lid, iid) in enumerate(manifest):
-        hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
-        image_index.append([lid, iid, start_row + i] + hashes)
-        embedded_set.add((lid, iid))
-    save_image_index(image_index)
+    # 4. Move original images from imagedownload/ to imageall_new/ (last — least critical)
+    EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
+    moved_count = 0
 
+    for lid, iid in manifest:
+        orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
+        if orig.exists():
+            dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
+            shutil.move(str(orig), str(dst))
+            moved_count += 1
+
+    log(f"Moved {moved_count} images to imageall_new")
     log(f"Imported {len(manifest)} images (rows {start_row}-{start_row + len(manifest) - 1})")
     return len(manifest)
 
@@ -781,6 +793,7 @@ def main():
 
     try:
         while not check_kill_file():
+            wait_for_backup_lock()
             now = time.time()
 
             # Check each worker

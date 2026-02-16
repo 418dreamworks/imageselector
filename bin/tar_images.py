@@ -19,6 +19,7 @@ BATCH_SIZE = 10000
 
 LOCK_PATH = INDEX_PATH + ".lock"
 
+
 def load_index_safe():
     """Load image_index.json, waiting if another process holds the lock."""
     while True:
@@ -95,17 +96,30 @@ for batch_num in range(num_full_batches):
 
     if result.returncode != 0:
         print(f"ERROR: {result.stderr.strip()}")
+        if os.path.exists(tar_path):
+            os.unlink(tar_path)
+            print(f"  Deleted corrupt {tar_name}")
         os.unlink(list_path)
-        continue
+        print(f"  STOPPING due to tar failure.")
+        sys.exit(1)
 
     tar_size = os.path.getsize(tar_path) / (1024 * 1024)
     print(f"{tar_size:.0f}MB in {elapsed:.0f}s")
 
     # Verify: check file count
-    with tarfile.open(tar_path, 'r') as tf:
-        tar_members = tf.getnames()
+    try:
+        with tarfile.open(tar_path, 'r') as tf:
+            tar_members = tf.getnames()
+    except Exception as e:
+        print(f"  CORRUPT TAR: {e}")
+        os.unlink(tar_path)
+        print(f"  Deleted corrupt {tar_name}. STOPPING.")
+        sys.exit(1)
+
     if len(tar_members) != BATCH_SIZE:
-        print(f"  VERIFY FAILED: expected {BATCH_SIZE} files, got {len(tar_members)}. STOPPING.")
+        print(f"  VERIFY FAILED: expected {BATCH_SIZE} files, got {len(tar_members)}.")
+        os.unlink(tar_path)
+        print(f"  Deleted corrupt {tar_name}. STOPPING.")
         sys.exit(1)
 
     # Verify: checksum 50 random files
@@ -124,7 +138,8 @@ for batch_num in range(num_full_batches):
                 checksum_ok = False
                 break
     if not checksum_ok:
-        print(f"  VERIFY FAILED: checksum mismatch. STOPPING.")
+        os.unlink(tar_path)
+        print(f"  Deleted corrupt {tar_name}. STOPPING.")
         sys.exit(1)
     print(f"  Verified: {BATCH_SIZE} files, 50 checksums OK")
 

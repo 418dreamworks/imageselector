@@ -33,6 +33,8 @@ BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
 KILL_FILE = BASE_DIR / "KILL_DL"
 PID_FILE = BASE_DIR / "image_downloader.pid"
+PAUSE_FILE = BASE_DIR / "PAUSE_DL"
+PAUSED_FILE = BASE_DIR / "PAUSED_DL"
 NUM_WORKERS = 8
 
 # Import from shared image_db module
@@ -74,13 +76,20 @@ def get_worker_kill_file(worker_id: int) -> Path:
     return BASE_DIR / f"KILL_DL_{worker_id}"
 
 
+def wait_for_backup_lock():
+    while PAUSE_FILE.exists():
+        PAUSED_FILE.touch()
+        print(f"[{ts()}] Backup in progress, paused...")
+        time.sleep(10)
+    PAUSED_FILE.unlink(missing_ok=True)
+
+
 def check_manager_kill_file() -> bool:
     """Check for kill file. If found, create worker kill files and return True."""
     if KILL_FILE.exists():
         print(f"\n[{ts()}] Kill file detected. Notifying workers...")
         for i in range(NUM_WORKERS):
             get_worker_kill_file(i).touch()
-        KILL_FILE.unlink()
         return True
     return False
 
@@ -339,6 +348,10 @@ def worker_loop(worker_id: int):
 # ============================================================
 
 def main():
+    if KILL_FILE.exists():
+        print(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        return
+
     if not acquire_lock():
         print("Error: Another image_downloader.py instance is already running")
         return
@@ -366,6 +379,7 @@ def main():
     last_disk_check = 0
 
     while not check_manager_kill_file():
+        wait_for_backup_lock()
         global workers_paused
         now = time.time()
 

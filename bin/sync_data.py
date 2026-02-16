@@ -43,6 +43,8 @@ TAXONOMY_CONFIG_FILE = BASE_DIR / "data" / "db" / "furniture_taxonomy_config.jso
 KILL_FILE = BASE_DIR / "KILL_SD"
 QPS_CONFIG_FILE = BASE_DIR / "data" / "db" / "qps_config.json"
 PID_FILE = BASE_DIR / "sync_data.pid"
+PAUSE_FILE = BASE_DIR / "PAUSE_SD"
+PAUSED_FILE = BASE_DIR / "PAUSED_SD"
 
 
 def get_api_delay() -> float:
@@ -79,6 +81,14 @@ def check_kill_file():
     except Exception as e:
         print(f"[{ts()}] Error checking kill file: {e}")
     return False
+
+
+def wait_for_backup_lock():
+    while PAUSE_FILE.exists():
+        PAUSED_FILE.touch()
+        print(f"[{ts()}] Backup in progress, paused...")
+        time.sleep(10)
+    PAUSED_FILE.unlink(missing_ok=True)
 
 
 def acquire_lock() -> bool:
@@ -754,7 +764,8 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
     stats = {"new_with_images": 0, "new_no_images": 0, "existing_updated": 0, "skipped": 0}
 
     while crawl_unit_index < len(CRAWL_UNITS):
-        # Check for kill file
+        # Check for kill file / backup lock
+        wait_for_backup_lock()
         if check_kill_file():
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = offset
@@ -944,6 +955,7 @@ def phase_shops(client, conn, snapshot_ts):
     updated_shops = 0
 
     for shop_id in shops_to_fetch:
+        wait_for_backup_lock()
         if check_kill_file():
             commit_with_retry(conn)
             return
@@ -1035,6 +1047,7 @@ def phase_reviews(client, conn, snapshot_ts):
     print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops with recent data")
 
     for i, shop_id in enumerate(shop_ids):
+        wait_for_backup_lock()
         if check_kill_file():
             commit_with_retry(conn)
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
@@ -1069,6 +1082,10 @@ def phase_reviews(client, conn, snapshot_ts):
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    if KILL_FILE.exists():
+        print(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        return
+
     if not ETSY_API_KEY:
         print("Error: ETSY_API_KEY not set in .env")
         return
@@ -1109,6 +1126,7 @@ def main():
             snapshot_ts
         )
 
+        wait_for_backup_lock()
         if check_kill_file():
             commit_with_retry(conn)
             conn.close()
@@ -1119,6 +1137,7 @@ def main():
         print(f"\n--- Phase 2: Shops ---")
         phase_shops(client, conn, snapshot_ts)
 
+        wait_for_backup_lock()
         if check_kill_file():
             commit_with_retry(conn)
             conn.close()
