@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Weekly primary image rebuild.
 
-Clears imageprimary/, extracts all primary images from imageall_tars/,
+Clears imageprimary/, extracts all primary images from imagetarred/,
 then tars everything in 10K batches (no loose files remain).
 
 Usage:
@@ -19,28 +19,14 @@ import tarfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / 'embedding'))
+from shard_utils import get_shard_dirs, load_shard_index, SHARD_SIZE
+
 BASE_DIR = str(Path(__file__).parent.parent)
-INDEX_PATH = os.path.join(BASE_DIR, "data", "embeddings", "image_index.json")
-LOCK_PATH = INDEX_PATH + ".lock"
-TAR_DIR = os.path.join(BASE_DIR, "images", "imageall_tars")
+TAR_DIR = os.path.join(BASE_DIR, "images", "imagetarred")
 PRIMARY_DIR = os.path.join(BASE_DIR, "images", "imageprimary")
 DB_PATH = os.path.join(BASE_DIR, "data", "db", "etsy_data.db")
 BATCH_SIZE = 10000
-
-
-def load_index_safe():
-    """Load image_index.json, waiting if another process holds the lock."""
-    while True:
-        if os.path.exists(LOCK_PATH):
-            print("image_index.json is locked, waiting...")
-            time.sleep(1)
-            continue
-        try:
-            with open(INDEX_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, ValueError):
-            print("image_index.json partial read, retrying...")
-            time.sleep(1)
 
 
 def clear_primary_dir():
@@ -56,27 +42,30 @@ def clear_primary_dir():
 
 
 def extract_primaries():
-    """Extract all primary images from imageall_tars/ into imageprimary/."""
+    """Extract all primary images from imagetarred/ into imageprimary/."""
     print("\n=== Extracting primary images ===")
 
-    # Load index
-    print("Loading image_index.json...")
-    idx = load_index_safe()
-    print(f"  Total index rows: {len(idx):,}")
-
-    # Count imageall tars, limit to tarred rows only
+    # Count imageall tars to determine which rows are tarred
     tar_files = [f for f in os.listdir(TAR_DIR) if f.endswith(".tar")]
     num_tars = len(tar_files)
     max_row = num_tars * BATCH_SIZE
     print(f"  imageall tars: {num_tars} → rows 0 to {max_row - 1:,}")
 
-    tarred_idx = idx[:max_row]
-
-    # Build (listing_id, image_id) → row mapping
+    # Build (listing_id, image_id) → global_row mapping from all shards
+    print("Loading image_index from shards...")
     row_for_pair = {}
-    for row, entry in enumerate(tarred_idx):
-        lid, iid = entry[0], entry[1]
-        row_for_pair[(lid, iid)] = row
+    total_rows = 0
+    for shard_dir in get_shard_dirs():
+        shard_num = int(shard_dir.name.split('_')[1])
+        idx = load_shard_index(shard_dir)
+        for local_row, entry in enumerate(idx):
+            global_row = shard_num * SHARD_SIZE + local_row
+            if global_row < max_row:
+                lid, iid = entry[0], entry[1]
+                row_for_pair[(lid, iid)] = global_row
+        total_rows += len(idx)
+        del idx
+    print(f"  Total index rows: {total_rows:,}, tarred rows mapped: {len(row_for_pair):,}")
 
     # Query DB for primary images
     print("Querying DB for primary images...")
@@ -137,9 +126,11 @@ def extract_primaries():
 
 
 def tar_primary_images():
-    """Tar ALL loose .jpg files in imageprimary/ in 10K batches. No loose files remain."""
+    """Tar ALL loose .jpg files in imageprimary/ in 10K batches. No loose files remain.
+    After all tars are created, builds primary_index.json with byte offsets + reverse lookup."""
     print("\n=== Tarring primary images ===")
     tarnum = -1
+    forward_index = {}  # tar_name -> {filename: offset}
 
     while True:
         loose = sorted(f for f in os.listdir(PRIMARY_DIR) if f.endswith(".jpg"))
@@ -185,11 +176,34 @@ def tar_primary_images():
                 sys.exit(1)
         print(f"  Verified: {check_count} checksums OK")
 
+        # Collect byte offsets for index
+        offsets = {}
+        with tarfile.open(tar_path, "r") as tf:
+            for member in tf.getmembers():
+                offsets[member.name] = member.offset
+        forward_index[tar_name] = offsets
+
         for fn in batch:
             os.remove(os.path.join(PRIMARY_DIR, fn))
         print(f"  Deleted {len(batch)} loose files")
 
         os.unlink(list_path)
+
+    # Build reverse lookup: listing_id -> [image_id, tar_name]
+    reverse_index = {}
+    for tar_name, offsets in forward_index.items():
+        for filename in offsets:
+            parts = filename.replace(".jpg", "").split("_")
+            if len(parts) == 2:
+                reverse_index[parts[0]] = [parts[1], tar_name]
+
+    # Write primary_index.json
+    index_path = os.path.join(PRIMARY_DIR, "primary_index.json")
+    index_data = {"tars": forward_index, "reverse": reverse_index}
+    with open(index_path, "w") as f:
+        json.dump(index_data, f)
+    size_mb = os.path.getsize(index_path) / (1024 * 1024)
+    print(f"  Wrote primary_index.json ({size_mb:.1f}MB, {len(reverse_index):,} listings)")
 
 
 if __name__ == "__main__":

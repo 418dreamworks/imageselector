@@ -118,29 +118,6 @@ class ModelLoader:
         import gc
         gc.collect()
 
-    def embed_image(self, model_key: str, image: Image.Image) -> torch.Tensor:
-        """Generate embedding for a single image."""
-        model, preprocess = self.get_model(model_key)
-        config = MODELS[model_key]
-
-        with torch.no_grad():
-            if config["library"] == "open_clip":
-                img_tensor = preprocess(image).unsqueeze(0).to(self._device)
-                emb = model.encode_image(img_tensor)
-            else:  # transformers (DINOv2/DINOv3)
-                inputs = preprocess(image, return_tensors="pt").to(self._device)
-                outputs = model(**inputs)
-                # DINOv3 uses pooler_output, DINOv2 uses CLS token from last_hidden_state
-                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                    emb = outputs.pooler_output
-                else:
-                    emb = outputs.last_hidden_state[:, 0, :]
-
-            # Normalize
-            emb = emb / emb.norm(dim=-1, keepdim=True)
-
-        return emb
-
     def embed_batch(self, model_key: str, images: list[Image.Image]) -> torch.Tensor:
         """Generate embeddings for a batch of images."""
         model, preprocess = self.get_model(model_key)
@@ -179,37 +156,6 @@ class ModelLoader:
             emb = emb / emb.norm(dim=-1, keepdim=True)
 
         return emb
-
-    def embed_batch_with_text(
-        self,
-        model_key: str,
-        images: list[Image.Image],
-        texts: list[str],
-        text_weight: float = 0.3,
-    ) -> torch.Tensor:
-        """Generate combined image+text embeddings for CLIP models.
-
-        Combines image and text embeddings with weighted average.
-        text_weight: 0.0 = image only, 1.0 = text only, 0.3 = 70% image + 30% text
-        """
-        config = MODELS[model_key]
-        if config["library"] != "open_clip":
-            # Non-CLIP models: just return image embeddings
-            return self.embed_batch(model_key, images)
-
-        # Get image embeddings
-        img_emb = self.embed_batch(model_key, images)
-
-        # Get text embeddings
-        text_emb = self.embed_text_batch(model_key, texts)
-
-        # Weighted combination
-        combined = (1 - text_weight) * img_emb + text_weight * text_emb
-
-        # Re-normalize
-        combined = combined / combined.norm(dim=-1, keepdim=True)
-
-        return combined
 
     @property
     def device(self) -> str:

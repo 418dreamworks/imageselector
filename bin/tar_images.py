@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Create 10K-image tar archives from imageall, ordered by FAISS row index."""
+"""Create 10K-image tar archives from imageembedded, ordered by FAISS row index.
+
+Reads sharded image_index files one shard at a time (lower memory than monolithic).
+Each shard of 500K rows produces exactly 50 tar batches.
+"""
 
 import hashlib
 import json
@@ -11,71 +15,24 @@ import tarfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / 'embedding'))
+from shard_utils import get_shard_dirs, load_shard_index, SHARD_SIZE
+
 BASE_DIR = str(Path(__file__).parent.parent)
-IMAGE_DIR = os.path.join(BASE_DIR, "images", "imageall_new")
-TAR_DIR = os.path.join(BASE_DIR, "images", "imageall_tars")
-INDEX_PATH = os.path.join(BASE_DIR, "data", "embeddings", "image_index.json")
+IMAGE_DIR = os.path.join(BASE_DIR, "images", "imageembedded")
+TAR_DIR = os.path.join(BASE_DIR, "images", "imagetarred")
 BATCH_SIZE = 10000
+TARS_PER_SHARD = SHARD_SIZE // BATCH_SIZE  # 50
 
-LOCK_PATH = INDEX_PATH + ".lock"
 
-
-def load_index_safe():
-    """Load image_index.json, waiting if another process holds the lock."""
-    while True:
-        if os.path.exists(LOCK_PATH):
-            print("image_index.json is locked, waiting...")
-            time.sleep(1)
-            continue
-        try:
-            with open(INDEX_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, ValueError):
-            print("image_index.json partial read, retrying...")
-            time.sleep(1)
-
-print("Loading image_index.json...")
-idx = load_index_safe()
-
-total = len(idx)
-num_full_batches = total // BATCH_SIZE
-remainder = total % BATCH_SIZE
-print(f"Total: {total}, Full batches: {num_full_batches}, Remainder: {remainder} (skipping)")
-
-# Check last existing tar for integrity (could be corrupt from interrupted run)
-for check_num in range(num_full_batches - 1, -1, -1):
-    check_path = os.path.join(TAR_DIR, f"imageall_{check_num:05d}.tar")
-    if os.path.exists(check_path):
-        print(f"Checking last tar: imageall_{check_num:05d}.tar...", end=" ", flush=True)
-        try:
-            with tarfile.open(check_path, 'r') as tf:
-                members = tf.getnames()
-            if len(members) != BATCH_SIZE:
-                print(f"INCOMPLETE ({len(members)}/{BATCH_SIZE}). Deleting.")
-                os.unlink(check_path)
-            else:
-                print(f"OK ({len(members)} files)")
-        except Exception as e:
-            print(f"CORRUPT ({e}). Deleting.")
-            os.unlink(check_path)
-        break
-
-for batch_num in range(num_full_batches):
+def create_tar_batch(batch_num, num_full_batches, filenames):
+    """Create and verify one tar batch. Returns True on success."""
     tar_name = f"imageall_{batch_num:05d}.tar"
     tar_path = os.path.join(TAR_DIR, tar_name)
 
     if os.path.exists(tar_path):
         print(f"[{batch_num+1}/{num_full_batches}] {tar_name} already exists, skipping")
-        continue
-
-    start_row = batch_num * BATCH_SIZE
-    end_row = start_row + BATCH_SIZE
-
-    # Build file list
-    filenames = []
-    for row in range(start_row, end_row):
-        lid, iid = idx[row][0], idx[row][1]
-        filenames.append(f"{lid}_{iid}.jpg")
+        return True
 
     # Write file list to temp file
     list_path = f"/tmp/tar_batch_{batch_num:05d}.txt"
@@ -85,6 +42,8 @@ for batch_num in range(num_full_batches):
 
     # Create tar
     t0 = time.time()
+    start_row = batch_num * BATCH_SIZE
+    end_row = start_row + BATCH_SIZE
     print(f"[{batch_num+1}/{num_full_batches}] Creating {tar_name} (rows {start_row}-{end_row-1})...", end=" ", flush=True)
     result = subprocess.run(
         ["tar", "--no-mac-metadata", "-cf", tar_path, "-T", list_path],
@@ -127,11 +86,9 @@ for batch_num in range(num_full_batches):
     checksum_ok = True
     with tarfile.open(tar_path, 'r') as tf:
         for fn in check_files:
-            # Hash from original on disk
             orig_path = os.path.join(IMAGE_DIR, fn)
             with open(orig_path, 'rb') as f:
                 orig_md5 = hashlib.md5(f.read()).hexdigest()
-            # Hash from tar
             tar_md5 = hashlib.md5(tf.extractfile(fn).read()).hexdigest()
             if orig_md5 != tar_md5:
                 print(f"  CHECKSUM MISMATCH: {fn}")
@@ -143,6 +100,22 @@ for batch_num in range(num_full_batches):
         sys.exit(1)
     print(f"  Verified: {BATCH_SIZE} files, 50 checksums OK")
 
+    # Update tar_index.json with byte offsets
+    index_path = os.path.join(TAR_DIR, "tar_index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            tar_index = json.load(f)
+    else:
+        tar_index = {}
+    offsets = {}
+    with tarfile.open(tar_path, "r") as tf:
+        for member in tf.getmembers():
+            offsets[member.name] = member.offset
+    tar_index[tar_name] = offsets
+    with open(index_path, "w") as f:
+        json.dump(tar_index, f)
+    print(f"  Updated tar_index.json ({len(offsets)} entries)")
+
     # Delete originals from SSD
     deleted = 0
     for fn in filenames:
@@ -150,8 +123,77 @@ for batch_num in range(num_full_batches):
         if os.path.exists(src):
             os.remove(src)
             deleted += 1
-    print(f"  Deleted {deleted}/{len(filenames)} from imageall_new/")
+    print(f"  Deleted {deleted}/{len(filenames)} from imageembedded/")
 
     os.unlink(list_path)
+    return True
+
+
+# Load shard directories
+shard_dirs = get_shard_dirs()
+if not shard_dirs:
+    print("No shard directories found. Nothing to do.")
+    sys.exit(0)
+
+# Calculate total full batches across all shards
+total_rows = 0
+for sd in shard_dirs:
+    idx = load_shard_index(sd)
+    total_rows += len(idx)
+
+num_full_batches = total_rows // BATCH_SIZE
+remainder = total_rows % BATCH_SIZE
+print(f"Total rows: {total_rows:,}, Full batches: {num_full_batches}, Remainder: {remainder} (skipping)")
+
+# Check last existing tar for integrity
+for check_num in range(num_full_batches - 1, -1, -1):
+    check_path = os.path.join(TAR_DIR, f"imageall_{check_num:05d}.tar")
+    if os.path.exists(check_path):
+        print(f"Checking last tar: imageall_{check_num:05d}.tar...", end=" ", flush=True)
+        try:
+            with tarfile.open(check_path, 'r') as tf:
+                members = tf.getnames()
+            if len(members) != BATCH_SIZE:
+                print(f"INCOMPLETE ({len(members)}/{BATCH_SIZE}). Deleting.")
+                os.unlink(check_path)
+            else:
+                print(f"OK ({len(members)} files)")
+        except Exception as e:
+            print(f"CORRUPT ({e}). Deleting.")
+            os.unlink(check_path)
+        break
+
+# Process shard by shard (only one shard's index in memory at a time)
+for shard_dir in shard_dirs:
+    shard_name = shard_dir.name
+    shard_num = int(shard_name.split('_')[1])
+    idx = load_shard_index(shard_dir)
+    shard_rows = len(idx)
+
+    # Calculate which tar batches this shard covers
+    first_tar = shard_num * TARS_PER_SHARD
+    shard_full_batches = shard_rows // BATCH_SIZE
+
+    if shard_full_batches == 0:
+        print(f"{shard_name}: {shard_rows} rows, no full batches to tar")
+        continue
+
+    print(f"\n{shard_name}: {shard_rows:,} rows, tars {first_tar}-{first_tar + shard_full_batches - 1}")
+
+    for local_batch in range(shard_full_batches):
+        batch_num = first_tar + local_batch
+        local_start = local_batch * BATCH_SIZE
+        local_end = local_start + BATCH_SIZE
+
+        # Build file list from this shard's index
+        filenames = []
+        for row in range(local_start, local_end):
+            lid, iid = idx[row][0], idx[row][1]
+            filenames.append(f"{lid}_{iid}.jpg")
+
+        create_tar_batch(batch_num, num_full_batches, filenames)
+
+    # Free shard index memory
+    del idx
 
 print("\nDone!")

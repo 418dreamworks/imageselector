@@ -58,40 +58,6 @@ def commit_with_retry(conn: sqlite3.Connection):
 
 
 # ============================================================
-# INSERT (only sync_data.py uses this)
-# ============================================================
-
-@_retry_on_lock
-def insert_image(
-    conn: sqlite3.Connection,
-    listing_id: int,
-    image_id: int,
-    is_primary: bool,
-    url: str,
-):
-    """Insert a new image. Used by sync_data.py when discovering new images."""
-    conn.execute("""
-        INSERT OR IGNORE INTO image_status (
-            listing_id, image_id, is_primary, url
-        ) VALUES (?, ?, ?, ?)
-    """, (listing_id, image_id, int(is_primary), url))
-
-
-# ============================================================
-# ATOMIC FLAG UPDATES
-# ============================================================
-
-@_retry_on_lock
-def mark_download_done(conn: sqlite3.Connection, listing_id: int, image_id: int) -> bool:
-    """Mark image as downloaded. Returns True if flag was actually flipped."""
-    cursor = conn.execute("""
-        UPDATE image_status SET download_done = 1
-        WHERE listing_id = ? AND image_id = ? AND download_done = 0
-    """, (listing_id, image_id))
-    return cursor.rowcount > 0
-
-
-# ============================================================
 # STATS
 # ============================================================
 

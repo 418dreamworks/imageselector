@@ -65,21 +65,7 @@ if __name__ == "__main__":
         json.dump(all_ids, f)
     print(f"\nSaved {len(all_ids)} taxonomy IDs to furniture_taxonomy_ids.json")
 
-    # Also save leaf nodes only (deepest level - no children)
-    # These are the most specific categories
-    leaf_ids = [tax_id for tax_id, name, depth in furniture_ids
-                if not any(other_depth > depth and other_id != tax_id
-                          for other_id, other_name, other_depth in furniture_ids
-                          if str(tax_id) in str(other_id))]  # crude parent check
-
-    # Actually, let's just get the ones at max depth or that have no children in our list
-    # Simpler: take all IDs that aren't parents of other IDs
-    parent_ids = set()
-    for tax_id, name, depth in furniture_ids:
-        # Find if this is a parent (has children with depth+1)
-        pass
-
-    # Easiest approach: manually identify leaf nodes from the tree output
+    # Leaf nodes: manually identified from the tree output
     leaf_taxonomy_ids = [
         12455, 12456,  # Bed Frames, Headboards
         970,   # Dressers & Armoires

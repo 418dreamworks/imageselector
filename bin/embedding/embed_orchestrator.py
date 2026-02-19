@@ -25,18 +25,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Add bin/ to path for imports
+# Add bin/ and bin/embedding/ to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from image_db import get_connection
+sys.path.insert(0, str(Path(__file__).parent))
+from image_db import get_connection, commit_with_retry
+from shard_utils import (
+    SHARD_SIZE, EMBEDDINGS_DIR, ALL_FAISS_FILES,
+    shard_dir_name, get_shard_dirs, get_active_shard, get_shard_num,
+    load_all_embedded_pairs, load_shard_index, save_shard_index,
+    check_all_shards_consistency,
+)
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent.parent
 EXPORTS_DIR = BASE_DIR / 'embed_exports'
-EMBEDDINGS_DIR = BASE_DIR / 'data' / 'embeddings'
 IMAGES_DIR = BASE_DIR / 'images' / 'imagedownload'
 BACKUPS_DIR = BASE_DIR / 'backups'
 DB_FILE = BASE_DIR / 'data' / 'db' / 'etsy_data.db'
-EMBEDDED_DIR = BASE_DIR / 'images' / 'imageall_new'
+EMBEDDED_DIR = BASE_DIR / 'images' / 'imageembedded'
 
 # Config files
 ORCH_STATE_FILE = BASE_DIR / 'orchestrator_state.json'
@@ -174,45 +180,17 @@ def check_disk_space() -> float:
 
 
 def check_faiss_consistency() -> tuple[bool, str]:
-    """Check that image_index.json and all FAISS files have the same count.
+    """Check that all shards' image_index.json and FAISS files are consistent.
 
     Returns (is_consistent, message).
     """
-    import faiss
-
-    index_data = load_image_index()
-    index_count = len(index_data)
-
-    faiss_counts = {}
-    if EMBEDDINGS_DIR.exists():
-        for f in EMBEDDINGS_DIR.glob("*.faiss"):
-            if '_text' not in f.name:  # Skip text embeddings
-                index = faiss.read_index(str(f))
-                faiss_counts[f.name] = index.ntotal
-
-    if not faiss_counts and index_count == 0:
-        return True, "Both empty"
-
-    if not faiss_counts and index_count > 0:
-        return False, f"image_index has {index_count} but no FAISS files"
-
-    # All FAISS files should have same count
-    counts = list(faiss_counts.values())
-    if len(set(counts)) > 1:
-        return False, f"FAISS files have different counts: {faiss_counts}"
-
-    faiss_count = counts[0]
-    if index_count != faiss_count:
-        return False, f"image_index has {index_count}, FAISS has {faiss_count}"
-
-    return True, f"Consistent: {index_count} entries"
+    return check_all_shards_consistency()
 
 
 # ============================================================
 # IMAGE INDEX (JSON row ↔ FAISS row, with vector hash for integrity)
+# Sharded: each shard_NNNN/ has its own image_index.json + FAISS files
 # ============================================================
-
-IMAGE_INDEX_FILE = EMBEDDINGS_DIR / 'image_index.json'
 
 
 def vector_hash(v) -> str:
@@ -221,27 +199,9 @@ def vector_hash(v) -> str:
     return hashlib.md5(v.tobytes()).hexdigest()[:12]
 
 
-def load_image_index() -> List[dict]:
-    """Load image_index.json. Each entry: {lid, iid, row, hash}."""
-    if IMAGE_INDEX_FILE.exists():
-        return json.loads(IMAGE_INDEX_FILE.read_text())
-    return []
-
-
-def save_image_index(index: List[dict]):
-    """Save image_index.json with lock file to prevent concurrent reads."""
-    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    lock_file = Path(str(IMAGE_INDEX_FILE) + ".lock")
-    try:
-        lock_file.touch()
-        IMAGE_INDEX_FILE.write_text(json.dumps(index))
-    finally:
-        lock_file.unlink(missing_ok=True)
-
-
-def load_embedded_set(image_index: List[dict]) -> set:
-    """Build set of (listing_id, image_id) from image_index."""
-    return {(e[0], e[1]) for e in image_index}
+def load_embedded_set() -> set:
+    """Build set of (listing_id, image_id) from all shards."""
+    return load_all_embedded_pairs()
 
 
 BUFFER_TARGET = 50000
@@ -352,11 +312,6 @@ def buffer_pull(work_buffer: dict, batch_size: int, embedded_set: set) -> List[T
     return get_from_buffer(work_buffer, to_export)
 
 
-def buffer_is_drained(work_buffer: dict) -> bool:
-    """Check if buffer has zero grabbed items (DB is truly empty)."""
-    return not any(s == 'grabbed' for s in work_buffer.values())
-
-
 def get_listing_texts(listing_ids: List[int]) -> dict:
     """Get title + materials for CLIP text embeddings."""
     if not listing_ids:
@@ -428,13 +383,79 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
     return batch_dir
 
 
-def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) -> int:
-    """Import batch: save image_index, append FAISS, move images.
+def _finalize_shard(shard_dir: Path):
+    """Mark a completed shard's images as download_done=3 in the DB."""
+    idx = load_shard_index(shard_dir)
+    pairs = [(entry[0], entry[1]) for entry in idx]
+
+    conn = get_connection()
+    for chunk_start in range(0, len(pairs), 10000):
+        chunk = pairs[chunk_start:chunk_start + 10000]
+        conn.executemany(
+            "UPDATE image_status SET download_done = 3 "
+            "WHERE listing_id = ? AND image_id = ? AND download_done = 2",
+            chunk
+        )
+        commit_with_retry(conn)
+    conn.close()
+    log(f"Finalized {shard_dir.name}: {len(pairs)} images → download_done=3")
+
+
+def _append_to_shard(shard_dir: Path, shard_index: list, manifest: list,
+                     all_embeddings: dict, hash_keys: list, offset: int,
+                     count: int, global_row_start: int, embedded_set: set):
+    """Append `count` images (starting at `offset` in manifest/embeddings) to one shard.
+
+    Write order: image_index first, then FAISS, for crash safety.
+    """
+    import numpy as np
+    import faiss
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Append to shard's image_index.json FIRST
+    for i in range(offset, offset + count):
+        lid, iid = manifest[i]
+        hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
+        shard_index.append([lid, iid, global_row_start + i] + hashes)
+        embedded_set.add((lid, iid))
+    save_shard_index(shard_dir, shard_index)
+
+    # 2. Append to FAISS files
+    for model in ALL_MODELS:
+        emb_slice = all_embeddings[model][offset:offset + count]
+
+        faiss_file = shard_dir / f"{model}.faiss"
+        if faiss_file.exists():
+            index = faiss.read_index(str(faiss_file))
+        else:
+            dim = emb_slice.shape[1]
+            index = faiss.IndexFlatIP(dim)
+
+        index.add(emb_slice)
+        faiss.write_index(index, str(faiss_file))
+
+        # Handle CLIP text embeddings
+        text_key = f"{model}_text"
+        if text_key in all_embeddings:
+            text_slice = all_embeddings[text_key][offset:offset + count]
+            text_faiss = shard_dir / f"{text_key}.faiss"
+            if text_faiss.exists():
+                text_index = faiss.read_index(str(text_faiss))
+            else:
+                text_index = faiss.IndexFlatIP(text_slice.shape[1])
+            text_index.add(text_slice)
+            faiss.write_index(text_index, str(text_faiss))
+
+
+def import_batch(batch_dir: Path, active_shard_dir: Path, active_shard_index: list,
+                 embedded_set: set) -> Tuple[int, Path, list]:
+    """Import batch into sharded FAISS. Handles shard splits.
 
     Write order matters for crash safety:
       1. image_index.json (if interrupted here, FAISS has fewer rows — recoverable)
       2. FAISS files
-      3. Move images to imageall_new/ (least critical — images still in batch dir)
+      3. Move images to imageembedded/ (least critical — images still in batch dir)
 
     Do NOT add kill file checks inside this function.
 
@@ -442,11 +463,12 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
 
     Args:
         batch_dir: Path to the batch directory with manifest and .npy files
-        image_index: The current image_index list (mutated in place and saved)
+        active_shard_dir: Current active shard directory
+        active_shard_index: The active shard's image_index list (mutated in place)
         embedded_set: Set of (listing_id, image_id) already embedded (updated in place)
 
     Returns:
-        Number of images imported
+        (num_imported, new_active_shard_dir, new_active_shard_index)
     """
     import numpy as np
     import faiss
@@ -457,7 +479,7 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
 
     manifest = json.loads(manifest_file.read_text())
     if not manifest:
-        return 0
+        return 0, active_shard_dir, active_shard_index
 
     # Verify all .npy files exist
     for model in ALL_MODELS:
@@ -471,7 +493,7 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
         log(f"Dedup: skipping {skipped} already-embedded images")
     if not new_indices:
         log("Entire batch already embedded, skipping")
-        return 0
+        return 0, active_shard_dir, active_shard_index
     manifest = [manifest[i] for i in new_indices]
 
     # 1. Load all embeddings for hashing (filter to new_indices if deduped)
@@ -492,16 +514,7 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
         if f"{model}_text" in all_embeddings:
             hash_keys.append(f"{model}_text")
 
-    start_row = len(image_index)
-
-    # 2. Append to image_index.json FIRST (safest to lose — recoverable)
-    for i, (lid, iid) in enumerate(manifest):
-        hashes = [vector_hash(all_embeddings[k][i]) for k in hash_keys]
-        image_index.append([lid, iid, start_row + i] + hashes)
-        embedded_set.add((lid, iid))
-    save_image_index(image_index)
-
-    # 3. Append to FAISS indexes — check disk BEFORE writing
+    # Check disk BEFORE writing
     while True:
         free_gb = check_disk_space()
         if free_gb >= MIN_DISK_GB:
@@ -509,57 +522,79 @@ def import_batch(batch_dir: Path, image_index: List[dict], embedded_set: set) ->
         log(f"DISK LOW: {free_gb:.1f}GB free, need {MIN_DISK_GB}GB — waiting 5 min...")
         time.sleep(300)
 
-    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    # Calculate global row start from all shards
+    shard_num = get_shard_num(active_shard_dir)
+    current_shard_rows = len(active_shard_index)
+    global_row_start = shard_num * SHARD_SIZE + current_shard_rows
 
-    for model in ALL_MODELS:
-        embeddings = all_embeddings[model]
+    # How many fit in current shard?
+    remaining_capacity = SHARD_SIZE - current_shard_rows
+    batch_size = len(manifest)
 
-        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
-        if faiss_file.exists():
-            index = faiss.read_index(str(faiss_file))
-        else:
-            dim = embeddings.shape[1]
-            index = faiss.IndexFlatIP(dim)
+    if batch_size <= remaining_capacity:
+        # Entire batch fits in current shard
+        _append_to_shard(active_shard_dir, active_shard_index, manifest,
+                         all_embeddings, hash_keys, 0, batch_size,
+                         global_row_start, embedded_set)
+    else:
+        # Split: fill current shard, finalize it, start new shard(s)
+        offset = 0
 
-        index.add(embeddings)
-        faiss.write_index(index, str(faiss_file))
+        while offset < batch_size:
+            current_shard_rows = len(active_shard_index)
+            remaining_capacity = SHARD_SIZE - current_shard_rows
+            chunk = min(remaining_capacity, batch_size - offset)
 
-        # Handle CLIP text embeddings
-        text_key = f"{model}_text"
-        if text_key in all_embeddings:
-            text_emb = all_embeddings[text_key]
-            text_faiss = EMBEDDINGS_DIR / f"{text_key}.faiss"
-            if text_faiss.exists():
-                text_index = faiss.read_index(str(text_faiss))
-            else:
-                text_index = faiss.IndexFlatIP(text_emb.shape[1])
-            text_index.add(text_emb)
-            faiss.write_index(text_index, str(text_faiss))
+            if chunk > 0:
+                chunk_global_start = shard_num * SHARD_SIZE + current_shard_rows
+                _append_to_shard(active_shard_dir, active_shard_index, manifest,
+                                 all_embeddings, hash_keys, offset, chunk,
+                                 chunk_global_start, embedded_set)
+                offset += chunk
 
-    # 3b. Verify all FAISS files are consistent IMMEDIATELY after writing
+            # If shard is now full, finalize and create next
+            if len(active_shard_index) >= SHARD_SIZE:
+                log(f"Shard {active_shard_dir.name} full ({SHARD_SIZE} rows), finalizing...")
+                _finalize_shard(active_shard_dir)
+                shard_num += 1
+                active_shard_dir = EMBEDDINGS_DIR / shard_dir_name(shard_num)
+                active_shard_dir.mkdir(parents=True, exist_ok=True)
+                active_shard_index = []
+                log(f"Created new shard: {active_shard_dir.name}")
+
+    # Verify active shard consistency IMMEDIATELY after writing
     faiss_counts = {}
-    for model in ALL_MODELS:
-        faiss_file = EMBEDDINGS_DIR / f"{model}.faiss"
-        idx = faiss.read_index(str(faiss_file))
-        faiss_counts[model] = idx.ntotal
-    counts = list(faiss_counts.values())
-    if len(set(counts)) > 1:
-        raise RuntimeError(f"FAISS inconsistency detected after import! Counts: {faiss_counts}")
+    for fname in ALL_FAISS_FILES:
+        fpath = active_shard_dir / fname
+        if fpath.exists():
+            idx = faiss.read_index(str(fpath))
+            faiss_counts[fname] = idx.ntotal
+    if faiss_counts:
+        counts = list(faiss_counts.values())
+        if len(set(counts)) > 1:
+            raise RuntimeError(f"FAISS inconsistency in {active_shard_dir.name}! Counts: {faiss_counts}")
 
-    # 4. Move original images from imagedownload/ to imageall_new/ (last — least critical)
+    # Move BG-removed images from batch to imageembedded/, delete originals
     EMBEDDED_DIR.mkdir(parents=True, exist_ok=True)
+    batch_images_dir = batch_dir / "images"
     moved_count = 0
 
     for lid, iid in manifest:
-        orig = IMAGES_DIR / f"{lid}_{iid}.jpg"
-        if orig.exists():
-            dst = EMBEDDED_DIR / f"{lid}_{iid}.jpg"
-            shutil.move(str(orig), str(dst))
+        fname = f"{lid}_{iid}.jpg"
+        # Move BG-removed image from batch → imageembedded/
+        bg_removed = batch_images_dir / fname
+        if bg_removed.exists():
+            dst = EMBEDDED_DIR / fname
+            shutil.move(str(bg_removed), str(dst))
             moved_count += 1
+        # Delete original from imagedownload/
+        orig = IMAGES_DIR / fname
+        if orig.exists():
+            orig.unlink()
 
-    log(f"Moved {moved_count} images to imageall_new")
-    log(f"Imported {len(manifest)} images (rows {start_row}-{start_row + len(manifest) - 1})")
-    return len(manifest)
+    log(f"Moved {moved_count} BG-removed images to imageembedded")
+    log(f"Imported {len(manifest)} images into {active_shard_dir.name}")
+    return len(manifest), active_shard_dir, active_shard_index
 
 
 # ============================================================
@@ -584,22 +619,6 @@ def get_rsync_target(worker: Worker, batch_name: str) -> str:
         return f"{worker.user}@{worker.host}:/cygdrive/c/Users/embed/imageselector/embed_exports/{batch_name}"
     else:
         return f"{worker.user}@{worker.host}:{worker.work_dir}/embed_exports/{batch_name}"
-
-
-def rsync_to_worker(worker: Worker, batch_dir: Path) -> bool:
-    """Rsync batch to worker."""
-    target = get_rsync_target(worker, batch_dir.name)
-
-    cmd = ['rsync', '-av', '--delete', f"{batch_dir}/", target]
-    if worker.host == '192.168.68.117':
-        cmd = ['rsync', '-av', '--delete', f'--rsync-path={worker.rsync_path}', f"{batch_dir}/", target]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        log(f"  {worker.name}: rsync to worker timed out")
-        return False
 
 
 def rsync_to_worker_async(worker: Worker, batch_dir: Path) -> subprocess.Popen:
@@ -642,23 +661,50 @@ def start_worker_job(worker: Worker, batch_name: str) -> bool:
 
 
 def check_worker_done(worker: Worker, batch_name: str) -> bool:
-    """Check if worker completed by looking for last model's .npy file."""
-    batch_dir = EXPORTS_DIR / batch_name
+    """Check if worker completed by looking for 'Done!' in worker.log via SSH.
 
-    # Quick rsync to check for .npy files
+    Returns True (done), False (not done), or None (SSH failed/timeout).
+    """
+    ssh_host = 'localhost' if worker.host == 'localhost' else worker.host
+    batch_path = get_worker_batch_path(worker, batch_name)
+
+    if worker.host == '192.168.68.117':
+        log_path = f"{batch_path}\\worker.log"
+        remote_cmd = f'powershell -Command "if (Select-String -Path \'{log_path}\' -Pattern \'Done!\' -Quiet) {{ echo DONE }} else {{ echo NOTDONE }}"'
+    else:
+        log_path = f"{batch_path}/worker.log"
+        remote_cmd = f'grep -q "Done!" {log_path} 2>/dev/null && echo DONE || echo NOTDONE'
+
+    cmd = ['ssh', f'{worker.user}@{ssh_host}', remote_cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        output = result.stdout.strip()
+        if output == 'DONE':
+            return True
+        elif output == 'NOTDONE':
+            return False
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def rsync_batch_from_worker(worker: Worker, batch_name: str) -> bool:
+    """Rsync entire batch back from worker (BG-removed images + .npy files)."""
+    batch_dir = EXPORTS_DIR / batch_name
     src = get_rsync_target(worker, batch_name) + "/"
 
-    cmd = ['rsync', '-av', '--include=*.npy', '--exclude=*', src, f"{batch_dir}/"]
+    cmd = ['rsync', '-avW', src, f"{batch_dir}/"]
     if worker.host == '192.168.68.117':
-        cmd = ['rsync', '-av', f'--rsync-path={worker.rsync_path}', '--include=*.npy', '--exclude=*', src, f"{batch_dir}/"]
+        cmd = ['rsync', '-avW', f'--rsync-path={worker.rsync_path}', src, f"{batch_dir}/"]
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            log(f"  rsync batch from {worker.name} failed: {result.stderr[:200]}")
+        return result.returncode == 0
     except subprocess.TimeoutExpired:
-        return None  # Signal timeout (distinct from False = not done yet)
-
-    # Check if all models complete
-    return all((batch_dir / f"{model}.npy").exists() for model in ALL_MODELS)
+        log(f"  rsync batch from {worker.name} timed out")
+        return False
 
 
 def cleanup_worker_batch(worker: Worker, batch_name: str):
@@ -764,10 +810,12 @@ def main():
 
     log(f"Consistency check: {msg}")
 
-    # Load image index and build embedded set
-    image_index = load_image_index()
-    embedded_set = load_embedded_set(image_index)
+    # Load embedded set from all shards, then load active shard
+    embedded_set = load_embedded_set()
     log(f"Already embedded: {len(embedded_set)} images")
+    active_shard_dir, active_shard_rows = get_active_shard()
+    active_shard_index = load_shard_index(active_shard_dir)
+    log(f"Active shard: {active_shard_dir.name} ({active_shard_rows} rows)")
     log(f"Workers: {list(WORKERS.keys())}")
     log("Stop with: touch KILL_ORCH")
 
@@ -875,7 +923,7 @@ def main():
                             state.status = 'frozen'
 
                     elif result:
-                        # Worker done! npy files already synced by check_worker_done
+                        # Worker done! rsync_batch_from_worker handles file transfer
                         state.check_failures = 0
                         completed_batch = state.current_batch
                         completed_images = state.batch_images
@@ -956,10 +1004,12 @@ def main():
                             log(f"{name}: batch complete (draining)")
                             state.status = 'idle'
 
-                        # Step 2: Import completed batch (npy files already local)
+                        # Step 2: Rsync BG-removed images back, then import
                         batch_dir = EXPORTS_DIR / completed_batch
+                        rsync_batch_from_worker(worker, completed_batch)
                         try:
-                            imported = import_batch(batch_dir, image_index, embedded_set)
+                            imported, active_shard_dir, active_shard_index = import_batch(
+                                batch_dir, active_shard_dir, active_shard_index, embedded_set)
                             total_imported += imported
                             buffer_clear_imported(work_buffer, completed_images)
 

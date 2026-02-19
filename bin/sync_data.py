@@ -23,14 +23,16 @@ import httpx
 load_dotenv()
 
 # Import from shared image_db module
-from image_db import get_connection, insert_image, _retry_on_lock, commit_with_retry
+from image_db import get_connection, _retry_on_lock, commit_with_retry
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
-ETSY_API_KEY = os.getenv("ETSY_API_KEY")
+_key = os.getenv("ETSY_API_KEY", "")
+_secret = os.getenv("ETSY_SHARED_SECRET", "")
+ETSY_API_KEY = f"{_key}:{_secret}" if _secret else _key
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
+API_DELAY_DEFAULT = 1.0  # 1 QPS (default, overridden by qps_config.json)
 UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
@@ -458,8 +460,7 @@ def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price
     if max_price is not None:
         params["max_price"] = max_price
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    while True:
         time.sleep(get_api_delay())
         try:
             response = client.get(
@@ -478,20 +479,15 @@ def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price
 
             data = response.json()
             return data.get("results", []), data.get("count", 0)
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"[{ts()}] Timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"[{ts()}] Timeout after {max_retries} attempts, skipping batch")
-                return [], 0  # Return empty to skip this batch
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException,
+                httpx.ConnectError, httpx.NetworkError) as e:
+            print(f"[{ts()}] Network error: {e}. Waiting 30s before retry...")
+            time.sleep(30)
 
 
 def fetch_shop(client, shop_id):
     """Fetch full shop data from API."""
-    max_retries = 3
-    for attempt in range(max_retries):
+    while True:
         time.sleep(get_api_delay())
         try:
             response = client.get(
@@ -503,14 +499,10 @@ def fetch_shop(client, shop_id):
                 return None
             response.raise_for_status()
             return response.json()
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"[{ts()}] Shop {shop_id} timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"[{ts()}] Shop {shop_id} timeout after {max_retries} attempts, skipping")
-                return None
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException,
+                httpx.ConnectError, httpx.NetworkError) as e:
+            print(f"[{ts()}] Shop {shop_id} network error: {e}. Waiting 30s...")
+            time.sleep(30)
         except Exception as e:
             print(f"  Error fetching shop {shop_id}: {e}")
             return None
@@ -524,8 +516,7 @@ def fetch_listings_batch_with_images(client, listing_ids):
     if not listing_ids:
         return {}
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    while True:
         time.sleep(get_api_delay())
         try:
             response = client.get(
@@ -546,14 +537,10 @@ def fetch_listings_batch_with_images(client, listing_ids):
                 if lid and images:
                     result[lid] = images
             return result
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                print(f"[{ts()}] Timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"[{ts()}] Timeout after {max_retries} attempts, skipping batch")
-                return {}
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException,
+                httpx.ConnectError, httpx.NetworkError) as e:
+            print(f"[{ts()}] Batch images network error: {e}. Waiting 30s...")
+            time.sleep(30)
         except Exception as e:
             print(f"  Error fetching batch images: {e}")
             return {}
@@ -563,58 +550,44 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
     """Fetch reviews for a shop newer than last_timestamp."""
     reviews = []
     offset = 0
-    max_retries = 3
 
     while True:
-        success = False
-        for attempt in range(max_retries):
-            time.sleep(get_api_delay())
-            try:
-                response = client.get(
-                    f"{BASE_URL}/application/shops/{shop_id}/reviews",
-                    headers={"x-api-key": ETSY_API_KEY},
-                    params={"limit": 100, "offset": offset},
-                )
-                update_api_usage(response)
-                if response.status_code == 404:
-                    return reviews
-                response.raise_for_status()
+        time.sleep(get_api_delay())
+        try:
+            response = client.get(
+                f"{BASE_URL}/application/shops/{shop_id}/reviews",
+                headers={"x-api-key": ETSY_API_KEY},
+                params={"limit": 100, "offset": offset},
+            )
+            update_api_usage(response)
+            if response.status_code == 404:
+                return reviews
+            response.raise_for_status()
 
-                results = response.json().get("results", [])
-                if not results:
-                    return reviews
-
-                found_old = False
-                for review in results:
-                    if review.get("create_timestamp", 0) <= last_timestamp:
-                        found_old = True
-                        break
-                    reviews.append(review)
-
-                if found_old:
-                    return reviews
-
-                offset += 100
-                if offset >= 10000:
-                    return reviews
-                success = True
-                break
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException) as e:
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    print(f"[{ts()}] Reviews {shop_id} timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    print(f"[{ts()}] Reviews {shop_id} timeout after {max_retries} attempts, returning partial")
-                    return reviews
-            except Exception as e:
-                print(f"  Error fetching reviews for shop {shop_id}: {e}")
+            results = response.json().get("results", [])
+            if not results:
                 return reviews
 
-        if not success:
-            break
+            found_old = False
+            for review in results:
+                if review.get("create_timestamp", 0) <= last_timestamp:
+                    found_old = True
+                    break
+                reviews.append(review)
 
-    return reviews
+            if found_old:
+                return reviews
+
+            offset += 100
+            if offset >= 10000:
+                return reviews
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException,
+                httpx.ConnectError, httpx.NetworkError) as e:
+            print(f"[{ts()}] Reviews {shop_id} network error: {e}. Waiting 30s...")
+            time.sleep(30)
+        except Exception as e:
+            print(f"  Error fetching reviews for shop {shop_id}: {e}")
+            return reviews
 
 
 # ─── Image SQL Insert ────────────────────────────────────────────────────────
