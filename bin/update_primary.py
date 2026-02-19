@@ -19,9 +19,6 @@ import tarfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / 'embedding'))
-from shard_utils import get_shard_dirs, load_shard_index, SHARD_SIZE
-
 BASE_DIR = str(Path(__file__).parent.parent)
 TAR_DIR = os.path.join(BASE_DIR, "images", "imagetarred")
 PRIMARY_DIR = os.path.join(BASE_DIR, "images", "imageprimary")
@@ -42,30 +39,19 @@ def clear_primary_dir():
 
 
 def extract_primaries():
-    """Extract all primary images from imagetarred/ into imageprimary/."""
+    """Extract all primary images from imagetarred/ into imageprimary/.
+
+    Uses tar_index.json reverse lookup for O(1) image location.
+    """
     print("\n=== Extracting primary images ===")
 
-    # Count imageall tars to determine which rows are tarred
-    tar_files = [f for f in os.listdir(TAR_DIR) if f.endswith(".tar")]
-    num_tars = len(tar_files)
-    max_row = num_tars * BATCH_SIZE
-    print(f"  imageall tars: {num_tars} → rows 0 to {max_row - 1:,}")
-
-    # Build (listing_id, image_id) → global_row mapping from all shards
-    print("Loading image_index from shards...")
-    row_for_pair = {}
-    total_rows = 0
-    for shard_dir in get_shard_dirs():
-        shard_num = int(shard_dir.name.split('_')[1])
-        idx = load_shard_index(shard_dir)
-        for local_row, entry in enumerate(idx):
-            global_row = shard_num * SHARD_SIZE + local_row
-            if global_row < max_row:
-                lid, iid = entry[0], entry[1]
-                row_for_pair[(lid, iid)] = global_row
-        total_rows += len(idx)
-        del idx
-    print(f"  Total index rows: {total_rows:,}, tarred rows mapped: {len(row_for_pair):,}")
+    # Load tar_index.json reverse lookup
+    index_path = os.path.join(TAR_DIR, "tar_index.json")
+    print("Loading tar_index.json...")
+    with open(index_path, "r") as f:
+        tar_index = json.load(f)
+    reverse = tar_index["reverse"]
+    print(f"  {len(reverse):,} images indexed")
 
     # Query DB for primary images
     print("Querying DB for primary images...")
@@ -77,49 +63,47 @@ def extract_primaries():
     all_primaries = cursor.fetchall()
     conn.close()
 
-    # Filter to only primaries that exist in tars
-    to_extract = {}  # (lid, iid) → tar_number
+    # Look up each primary in reverse index, group by tar
+    by_tar = {}  # tar_name -> [(filename, offset), ...]
+    skipped = 0
     for lid, iid in all_primaries:
-        if (lid, iid) in row_for_pair:
-            row = row_for_pair[(lid, iid)]
-            to_extract[(lid, iid)] = row // BATCH_SIZE
+        key = f"{lid}_{iid}"
+        if key in reverse:
+            tar_name, offset = reverse[key]
+            by_tar.setdefault(tar_name, []).append((f"{key}.jpg", offset))
+        else:
+            skipped += 1
 
-    print(f"  Primary images to extract: {len(to_extract):,}")
-
-    # Group by tar number
-    by_tar = {}
-    for (lid, iid), tar_num in to_extract.items():
-        by_tar.setdefault(tar_num, []).append((lid, iid))
-
+    total_to_extract = sum(len(v) for v in by_tar.values())
+    print(f"  Primary images to extract: {total_to_extract:,} (skipped {skipped:,} not in tars)")
     print(f"  Extracting from {len(by_tar)} tar files...")
     extracted_total = 0
 
-    for tar_num in sorted(by_tar.keys()):
-        pairs = by_tar[tar_num]
-        tar_path = os.path.join(TAR_DIR, f"imageall_{tar_num:05d}.tar")
+    for tar_name in sorted(by_tar.keys()):
+        entries = by_tar[tar_name]
+        tar_path = os.path.join(TAR_DIR, tar_name)
 
         if not os.path.exists(tar_path):
-            print(f"  WARNING: {tar_path} not found, skipping {len(pairs)} images")
+            print(f"  WARNING: {tar_path} not found, skipping {len(entries)} images")
             continue
-
-        needed = {f"{lid}_{iid}.jpg": (lid, iid) for lid, iid in pairs}
 
         extracted = 0
         with tarfile.open(tar_path, "r") as tf:
-            for fn in needed:
+            for fn, offset in entries:
                 try:
-                    member = tf.getmember(fn)
+                    tf.fileobj.seek(offset)
+                    member = tarfile.TarInfo.fromtarfile(tf)
                     with tf.extractfile(member) as src:
                         data = src.read()
                     dst_path = os.path.join(PRIMARY_DIR, fn)
                     with open(dst_path, "wb") as dst:
                         dst.write(data)
                     extracted += 1
-                except KeyError:
-                    print(f"  WARNING: {fn} not found in tar {tar_num:05d}")
+                except Exception as e:
+                    print(f"  WARNING: {fn} failed in {tar_name}: {e}")
 
         extracted_total += extracted
-        print(f"  imageall_{tar_num:05d}.tar: extracted {extracted}/{len(pairs)}")
+        print(f"  {tar_name}: extracted {extracted}/{len(entries)}")
 
     print(f"\nTotal extracted: {extracted_total:,}")
     return extracted_total

@@ -100,18 +100,20 @@ def create_tar_batch(batch_num, num_full_batches, filenames):
         sys.exit(1)
     print(f"  Verified: {BATCH_SIZE} files, 50 checksums OK")
 
-    # Update tar_index.json with byte offsets
+    # Update tar_index.json with byte offsets + reverse lookup
     index_path = os.path.join(TAR_DIR, "tar_index.json")
     if os.path.exists(index_path):
         with open(index_path, "r") as f:
             tar_index = json.load(f)
     else:
-        tar_index = {}
+        tar_index = {"tars": {}, "reverse": {}}
     offsets = {}
     with tarfile.open(tar_path, "r") as tf:
         for member in tf.getmembers():
             offsets[member.name] = member.offset
-    tar_index[tar_name] = offsets
+            key = member.name.replace(".jpg", "")
+            tar_index["reverse"][key] = [tar_name, member.offset]
+    tar_index["tars"][tar_name] = offsets
     with open(index_path, "w") as f:
         json.dump(tar_index, f)
     print(f"  Updated tar_index.json ({len(offsets)} entries)")
