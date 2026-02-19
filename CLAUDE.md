@@ -187,6 +187,84 @@ ssh embed@HOST "nohup PYTHON_PATH WORKER_SCRIPT --input BATCH_PATH > BATCH_PATH/
 
 ---
 
+## Image & Embedding Retrieval (Byte-Offset Indexes)
+
+All tar archives have byte-offset indexes for O(1) random access — no need to scan entire tars.
+
+### Get a Primary Image by Listing ID
+
+`images/imageprimary/primary_index.json` format:
+```json
+{
+  "tars": {"imageprimary_00000.tar": {"1234567_8901234.jpg": 0, ...}},
+  "reverse": {"1234567": ["8901234", "imageprimary_00000.tar"]}
+}
+```
+
+```python
+import json, tarfile, os
+
+PRIMARY_DIR = "images/imageprimary"
+with open(os.path.join(PRIMARY_DIR, "primary_index.json")) as f:
+    idx = json.load(f)
+
+listing_id = "1234567"
+image_id, tar_name = idx["reverse"][listing_id]
+offset = idx["tars"][tar_name][f"{listing_id}_{image_id}.jpg"]
+
+with tarfile.open(os.path.join(PRIMARY_DIR, tar_name), "r") as tf:
+    tf.fileobj.seek(offset)
+    member = tarfile.TarInfo.fromtarfile(tf)
+    image_bytes = tf.extractfile(member).read()
+```
+
+### Get Any Image by listing_id + image_id
+
+`images/imagetarred/tar_index.json` format:
+```json
+{
+  "tars": {"imageall_00000.tar": {"1234567_8901234.jpg": 0, ...}},
+  "reverse": {"1234567_8901234": ["imageall_00000.tar", 0]}
+}
+```
+
+```python
+TAR_DIR = "images/imagetarred"
+with open(os.path.join(TAR_DIR, "tar_index.json")) as f:
+    idx = json.load(f)
+
+key = f"{listing_id}_{image_id}"
+tar_name, offset = idx["reverse"][key]
+
+with tarfile.open(os.path.join(TAR_DIR, tar_name), "r") as tf:
+    tf.fileobj.seek(offset)
+    member = tarfile.TarInfo.fromtarfile(tf)
+    image_bytes = tf.extractfile(member).read()
+```
+
+### FAISS Similarity Search
+
+Row N in every FAISS index = same image. `data/embeddings/shard_XXXX/image_index.json[N]` = `[listing_id, image_id]`.
+
+```python
+import faiss, numpy as np, json
+
+shard = "data/embeddings/shard_0000"
+index = faiss.read_index(os.path.join(shard, "clip_vitb32.faiss"))
+with open(os.path.join(shard, "image_index.json")) as f:
+    image_index = json.load(f)
+
+# Search with a query vector
+D, I = index.search(query_vec.reshape(1, -1), k=10)
+for i in I[0]:
+    lid, iid = image_index[i]
+    # Use tar_index.json or primary_index.json to retrieve the actual image
+```
+
+Shards hold up to 500K rows each. Finalized shards (exactly 500K rows) are immutable.
+
+---
+
 ## Quick Commands
 
 ```bash

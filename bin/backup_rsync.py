@@ -49,13 +49,13 @@ RSYNCS = {
     },
     "hdd": {
         "description": "HDD1TB → HDD3TB",
-        "cmd": ["rsync", "-a", "--exclude", ".Spotlight-V100/",
+        "cmd": ["rsync", "-a", "--delete", "--chmod=u+w", "--exclude", ".Spotlight-V100/",
                 "/Volumes/HDD1TB/",
                 "/Volumes/HDD3TB/HDD1TB_mirror/"],
     },
     "ssd": {
         "description": "SSD500GB → HDD500GB",
-        "cmd": ["rsync", "-a", "--exclude", ".Spotlight-V100/",
+        "cmd": ["rsync", "-a", "--delete", "--chmod=u+w", "--exclude", ".Spotlight-V100/",
                 "/Volumes/SSD500GB/",
                 "/Volumes/HDD500GB/"],
     },
