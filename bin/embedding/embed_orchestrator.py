@@ -14,6 +14,7 @@ Stop with: touch KILL_ORCH
 import os
 import sys
 import json
+import sqlite3
 import time
 import shutil
 import subprocess
@@ -388,7 +389,8 @@ def _finalize_shard(shard_dir: Path):
     idx = load_shard_index(shard_dir)
     pairs = [(entry[0], entry[1]) for entry in idx]
 
-    conn = get_connection()
+    conn = sqlite3.connect(str(DB_FILE), timeout=300.0)
+    conn.execute("PRAGMA journal_mode=WAL")
     for chunk_start in range(0, len(pairs), 10000):
         chunk = pairs[chunk_start:chunk_start + 10000]
         conn.executemany(
