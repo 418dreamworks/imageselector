@@ -305,11 +305,10 @@ def buffer_pull(work_buffer: dict, batch_size: int, embedded_set: set) -> List[T
         top_up_buffer(work_buffer, embedded_set)
         grabbed_count = sum(1 for s in work_buffer.values() if s == 'grabbed')
         log(f"  BUFFER pull: after refill grabbed={grabbed_count}")
-    to_export = min(batch_size, grabbed_count)
-    if to_export == 0:
-        log(f"  BUFFER pull: nothing to export")
+    if grabbed_count < batch_size:
+        log(f"  BUFFER pull: only {grabbed_count} available, need {batch_size} — skipping")
         return []
-    log(f"  BUFFER pull: exporting min({batch_size}, {grabbed_count}) = {to_export}")
+    log(f"  BUFFER pull: exporting {batch_size}")
     return get_from_buffer(work_buffer, to_export)
 
 
