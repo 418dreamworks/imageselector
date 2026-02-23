@@ -678,40 +678,25 @@ def add_images_to_sql(listing_id: int, images: list, conn=None):
     if own_conn:
         conn = get_connection()
 
+    rows = []
     for img in images:
         image_id = img.get("listing_image_id")
+        if not image_id:
+            continue
         url = img.get("url_570xN", "")
         rank = img.get("rank", 1)
         is_primary = 1 if rank == 1 else 0
+        rows.append((listing_id, image_id, is_primary, url))
 
-        if not image_id:
-            continue
-
-        # Check if exists
-        cursor = _execute_with_retry(conn, """
-            SELECT url FROM image_status WHERE listing_id = ? AND image_id = ?
-        """, (listing_id, image_id))
-        row = cursor.fetchone()
-
-        if row:
-            # Exists - update is_primary always, url only if missing
-            existing_url = row[0]
-            if not existing_url:
-                _execute_with_retry(conn, """
-                    UPDATE image_status SET is_primary = ?, url = ?
-                    WHERE listing_id = ? AND image_id = ?
-                """, (is_primary, url, listing_id, image_id))
-            else:
-                _execute_with_retry(conn, """
-                    UPDATE image_status SET is_primary = ?
-                    WHERE listing_id = ? AND image_id = ?
-                """, (is_primary, listing_id, image_id))
-        else:
-            # New - insert
-            _execute_with_retry(conn, """
-                INSERT INTO image_status (listing_id, image_id, is_primary, url, download_done)
-                VALUES (?, ?, ?, ?, 0)
-            """, (listing_id, image_id, is_primary, url))
+    if rows:
+        conn.executemany("""
+            INSERT INTO image_status (listing_id, image_id, is_primary, url, download_done)
+            VALUES (?, ?, ?, ?, 0)
+            ON CONFLICT(listing_id, image_id) DO UPDATE SET
+                is_primary = excluded.is_primary,
+                url = CASE WHEN image_status.url IS NULL OR image_status.url = ''
+                      THEN excluded.url ELSE image_status.url END
+        """, rows)
 
     if own_conn:
         commit_with_retry(conn)
