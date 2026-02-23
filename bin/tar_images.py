@@ -169,20 +169,36 @@ for check_num in range(num_full_batches - 1, -1, -1):
 for shard_dir in shard_dirs:
     shard_name = shard_dir.name
     shard_num = int(shard_name.split('_')[1])
+    first_tar = shard_num * TARS_PER_SHARD
+
+    # Skip finalized shards: if the 50th tar exists, all tars are done
+    last_possible = os.path.join(TAR_DIR, f"imageall_{first_tar + TARS_PER_SHARD - 1:05d}.tar")
+    if os.path.exists(last_possible):
+        continue
+
     idx = load_shard_index(shard_dir)
     shard_rows = len(idx)
-
-    # Calculate which tar batches this shard covers
-    first_tar = shard_num * TARS_PER_SHARD
     shard_full_batches = shard_rows // BATCH_SIZE
 
     if shard_full_batches == 0:
         print(f"{shard_name}: {shard_rows} rows, no full batches to tar")
         continue
 
-    print(f"\n{shard_name}: {shard_rows:,} rows, tars {first_tar}-{first_tar + shard_full_batches - 1}")
-
+    # Find first missing tar to skip already-completed batches
+    start_batch = 0
     for local_batch in range(shard_full_batches):
+        tar_path = os.path.join(TAR_DIR, f"imageall_{first_tar + local_batch:05d}.tar")
+        if not os.path.exists(tar_path):
+            start_batch = local_batch
+            break
+    else:
+        del idx
+        continue
+
+    print(f"\n{shard_name}: {shard_rows:,} rows, tars {first_tar}-{first_tar + shard_full_batches - 1}"
+          + (f" (resuming from tar {first_tar + start_batch})" if start_batch > 0 else ""))
+
+    for local_batch in range(start_batch, shard_full_batches):
         batch_num = first_tar + local_batch
         local_start = local_batch * BATCH_SIZE
         local_end = local_start + BATCH_SIZE
