@@ -7,51 +7,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ETSY_API_KEY = os.getenv("ETSY_API_KEY")
+_key = os.getenv("ETSY_API_KEY", "")
+_secret = os.getenv("ETSY_SHARED_SECRET", "")
+ETSY_API_KEY = f"{_key}:{_secret}" if _secret else _key
 BASE_URL = "https://openapi.etsy.com/v3"
 
-# Categories to calculate - includes parent replacements for broken IDs
+# Crawl root taxonomy — returns ALL furniture regardless of seller tag level
 TAXONOMIES = [
-    (12455, "Bed Frames"),
-    (12456, "Headboards"),
-    (970, "Dressers & Armoires"),
-    (972, "Nightstands"),
-    (971, "Steps & Stools (bedroom)"),
-    (12470, "Vanity Tables"),
-    (974, "Buffets & China Cabinets"),
-    (975, "Dining Chairs"),
-    (976, "Dining Sets"),
-    (977, "Kitchen & Dining Tables"),
-    (11837, "Kitchen Islands"),
-    (978, "Stools & Banquettes"),
-    (12403, "Hall Trees"),
-    (979, "Entryway & Mudroom Furniture"),  # Parent - replaces broken 12405
-    (12406, "Umbrella Stands"),
-    (981, "Bean Bag Chairs"),
-    (982, "Benches & Toy Boxes"),
-    (983, "Bookcases (kids)"),
-    (985, "Desks, Tables & Chairs (kids)"),
-    (986, "Dressers & Drawers (kids)"),
-    (987, "Steps & Stools (kids)"),
-    (988, "Toddler Beds"),
-    (990, "Benches & Trunks"),  # Parent - replaces broken 12369, 12370
-    (991, "Bookshelves"),
-    (992, "Chairs"),
-    (12371, "Coffee Tables"),
-    (12372, "End Tables"),
-    (11355, "Console & Sofa Tables"),
-    (11356, "TV Stands & Media Centers"),
-    (998, "Couches & Loveseats"),
-    (996, "Floor Pillows"),
-    (12468, "Ottomans & Poufs"),
-    (12216, "Room Dividers"),
-    (997, "Slipcovers"),
-    (1000, "Desk Chairs"),
-    (1001, "Desks"),
-    (12408, "Filing Cabinets"),
+    (967, "Furniture"),
 ]
 
-TARGET_MAX = 8000  # Target max per interval
+TARGET_MAX = 5000  # Target max per interval
 
 
 def get_count(client: httpx.Client, taxonomy_id: int, min_price: float = None, max_price: float = None) -> int:
@@ -71,77 +37,84 @@ def get_count(client: httpx.Client, taxonomy_id: int, min_price: float = None, m
     return response.json().get("count", 0)
 
 
-def find_price_breaks(client: httpx.Client, taxonomy_id: int, name: str) -> list[float]:
-    """Find price breaks to split a category into intervals under TARGET_MAX each.
+def get_max_price(client: httpx.Client, taxonomy_id: int) -> float:
+    """Get the highest listing price for a taxonomy."""
+    params = {"taxonomy_id": taxonomy_id, "limit": 1,
+              "sort_on": "price", "sort_order": "desc"}
+    response = client.get(
+        f"{BASE_URL}/application/listings/active",
+        headers={"x-api-key": ETSY_API_KEY},
+        params=params,
+    )
+    response.raise_for_status()
+    results = response.json().get("results", [])
+    if results:
+        return results[0]["price"]["amount"] / results[0]["price"]["divisor"]
+    return 1000000
 
-    Returns list of price points: [0, p1, p2, ..., 1000000]
+
+def find_price_breaks(client: httpx.Client, taxonomy_id: int, name: str) -> list[float]:
+    """Find price breaks for a category. Each interval targets <5K listings.
+
+    Start with upper=$5. Grow by 10% until >= 5K, shrink by 1% until < 5K.
+    That upper becomes the next lower, next upper = lower * 1.1, repeat.
+
+    Returns list of price points: [0, p1, p2, ..., max_price]
     """
     time.sleep(0.2)
     total = get_count(client, taxonomy_id)
-
     print(f"\n{name} (ID: {taxonomy_id}): {total:,} listings")
 
     if total <= TARGET_MAX:
         print(f"  -> No splits needed")
         return [0, 1000000]
 
-    # Need to split - use binary search to find price points
+    time.sleep(0.2)
+    max_price = get_max_price(client, taxonomy_id)
+    print(f"  Max price: ${max_price:,.2f}")
+
     price_breaks = [0]
-    current_min = 0
+    lower = 0
+    upper = 5
 
     while True:
-        # How many left from current_min to infinity?
-        time.sleep(0.2)
-        remaining = get_count(client, taxonomy_id, min_price=current_min if current_min > 0 else None)
+        # Grow upper by 10% until >= 5K (cap at max_price)
+        while True:
+            time.sleep(0.2)
+            count = get_count(client, taxonomy_id,
+                              min_price=lower if lower > 0 else None,
+                              max_price=upper)
+            print(f"    Grow: ${lower:.2f}-${upper:.2f} = {count:,}")
+            if count >= TARGET_MAX or upper >= max_price:
+                break
+            upper *= 1.10
 
-        if remaining <= TARGET_MAX:
-            # Done - this last segment fits
+        # If we hit the ceiling without reaching 5K, this is the last interval
+        if upper >= max_price:
             break
 
-        # Binary search for a price that gives us ~TARGET_MAX items
-        low = current_min
-        high = 100000  # Start with reasonable high
-
-        # First find a high that's actually high enough
-        time.sleep(0.2)
-        count_at_high = get_count(client, taxonomy_id,
-                                   min_price=current_min if current_min > 0 else None,
-                                   max_price=high)
-        while count_at_high >= remaining:
-            high *= 2
+        # Shrink upper by 1% until < 5K
+        while count >= TARGET_MAX:
+            upper *= 0.99
             time.sleep(0.2)
-            count_at_high = get_count(client, taxonomy_id,
-                                       min_price=current_min if current_min > 0 else None,
-                                       max_price=high)
-            if high > 10000000:
-                break
+            count = get_count(client, taxonomy_id,
+                              min_price=lower if lower > 0 else None,
+                              max_price=upper)
+            print(f"    Shrink: ${lower:.2f}-${upper:.2f} = {count:,}")
 
-        # Binary search
-        for _ in range(25):  # Max iterations
-            mid = (low + high) / 2
-            time.sleep(0.2)
-            count_below_mid = get_count(client, taxonomy_id,
-                                         min_price=current_min if current_min > 0 else None,
-                                         max_price=mid)
+        # Record this break
+        split = round(upper, 2)
+        price_breaks.append(split)
+        print(f"  -> Split at ${split:.2f} ({count:,} items)")
 
-            print(f"    Searching: ${current_min:.0f}-${mid:.0f} = {count_below_mid:,}")
+        lower = split + 0.01
+        upper = lower * 1.10
 
-            if abs(count_below_mid - TARGET_MAX) < 500:
-                # Close enough
-                break
-            elif count_below_mid < TARGET_MAX:
-                low = mid
-            else:
-                high = mid
+        # Next starting upper
+        upper = lower * 1.10
 
-        # Round to nice number
-        split_price = round(mid, -1)  # Round to nearest 10
-        if split_price < 10:
-            split_price = round(mid, 0)
-
-        price_breaks.append(split_price)
-        print(f"  -> Split at ${split_price:.0f} ({count_below_mid:,} items)")
-        current_min = split_price + 0.01
+        # Next starting upper = lower * 1.1
+        upper = lower * 1.10
 
     price_breaks.append(1000000)
     return price_breaks

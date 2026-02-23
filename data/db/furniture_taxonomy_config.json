@@ -1,350 +1,135 @@
 {
-  "description": "Furniture taxonomy crawl config. price_breaks defines intervals for crawling.",
+  "description": "Furniture taxonomy crawl configuration. Each entry has taxonomy_id, name, and price_breaks. Price breaks define intervals: [0, p1], (p1, p2], ..., (pN, 1000000]. For small categories, use [0, 1000000].",
   "taxonomies": [
     {
-      "id": 12455,
-      "name": "Bed Frames",
+      "id": 967,
+      "name": "Furniture",
       "price_breaks": [
         0,
-        1000000
-      ]
-    },
-    {
-      "id": 12456,
-      "name": "Headboards",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 970,
-      "name": "Dressers & Armoires",
-      "price_breaks": [
-        0,
-        412,
-        1099,
-        1953,
-        1000000
-      ]
-    },
-    {
-      "id": 972,
-      "name": "Nightstands",
-      "price_breaks": [
-        0,
-        519,
-        1000000
-      ]
-    },
-    {
-      "id": 971,
-      "name": "Steps & Stools (bedroom)",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 12470,
-      "name": "Vanity Tables",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 974,
-      "name": "Buffets & China Cabinets",
-      "price_breaks": [
-        0,
-        1709,
-        1000000
-      ]
-    },
-    {
-      "id": 975,
-      "name": "Dining Chairs",
-      "price_breaks": [
-        0,
-        671,
-        1647,
-        1000000
-      ]
-    },
-    {
-      "id": 976,
-      "name": "Dining Sets",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 977,
-      "name": "Kitchen & Dining Tables",
-      "price_breaks": [
-        0,
-        94,
-        150,
-        189,
-        223,
-        276,
-        350,
-        425,
-        549,
-        688,
-        845,
-        1089,
-        1495,
-        1990,
-        2714,
-        4297,
-        1000000
-      ]
-    },
-    {
-      "id": 11837,
-      "name": "Kitchen Islands",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 978,
-      "name": "Stools & Banquettes",
-      "price_breaks": [
-        0,
-        214,
-        1000000
-      ]
-    },
-    {
-      "id": 12403,
-      "name": "Hall Trees",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 979,
-      "name": "Entryway & Mudroom Furniture",
-      "price_breaks": [
-        0,
-        71,
-        142,
-        233,
-        336,
-        496,
-        824,
-        1556,
-        1000000
-      ]
-    },
-    {
-      "id": 12406,
-      "name": "Umbrella Stands",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 981,
-      "name": "Bean Bag Chairs",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 982,
-      "name": "Benches & Toy Boxes",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 983,
-      "name": "Bookcases (kids)",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 985,
-      "name": "Desks, Tables & Chairs (kids)",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 986,
-      "name": "Dressers & Drawers (kids)",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 987,
-      "name": "Steps & Stools (kids)",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 988,
-      "name": "Toddler Beds",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 990,
-      "name": "Benches & Trunks",
-      "price_breaks": [
-        0,
-        366,
-        1000000
-      ]
-    },
-    {
-      "id": 991,
-      "name": "Bookshelves",
-      "price_breaks": [
-        0,
-        488,
-        1000000
-      ]
-    },
-    {
-      "id": 992,
-      "name": "Chairs",
-      "price_breaks": [
-        0,
-        163,
-        307,
-        480,
-        702,
-        1556,
-        2653,
-        1000000
-      ]
-    },
-    {
-      "id": 12371,
-      "name": "Coffee Tables",
-      "price_breaks": [
-        0,
-        250,
-        458,
-        1007,
-        1000000
-      ]
-    },
-    {
-      "id": 12372,
-      "name": "End Tables",
-      "price_breaks": [
-        0,
-        427,
-        1000000
-      ]
-    },
-    {
-      "id": 11355,
-      "name": "Console & Sofa Tables",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 11356,
-      "name": "TV Stands & Media Centers",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 998,
-      "name": "Couches & Loveseats",
-      "price_breaks": [
-        0,
-        732,
-        1000000
-      ]
-    },
-    {
-      "id": 996,
-      "name": "Floor Pillows",
-      "price_breaks": [
-        0,
-        31,
-        1000000
-      ]
-    },
-    {
-      "id": 12468,
-      "name": "Ottomans & Poufs",
-      "price_breaks": [
-        0,
-        65,
-        110,
-        132,
-        153,
-        245,
-        1000000
-      ]
-    },
-    {
-      "id": 12216,
-      "name": "Room Dividers",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 997,
-      "name": "Slipcovers",
-      "price_breaks": [
-        0,
-        92,
-        1000000
-      ]
-    },
-    {
-      "id": 1000,
-      "name": "Desk Chairs",
-      "price_breaks": [
-        0,
-        1000000
-      ]
-    },
-    {
-      "id": 1001,
-      "name": "Desks",
-      "price_breaks": [
-        0,
-        1038,
-        1000000
-      ]
-    },
-    {
-      "id": 12408,
-      "name": "Filing Cabinets",
-      "price_breaks": [
-        0,
+        5.45,
+        8.75,
+        13.97,
+        19.86,
+        25.66,
+        32.17,
+        37.78,
+        43.92,
+        49.54,
+        54.77,
+        59.06,
+        62.42,
+        67.31,
+        72.58,
+        78.26,
+        84.38,
+        89.17,
+        95.18,
+        99.58,
+        104.18,
+        110.09,
+        116.34,
+        121.71,
+        126.06,
+        130.56,
+        135.22,
+        141.46,
+        147.99,
+        153.27,
+        158.74,
+        162.76,
+        168.57,
+        171.11,
+        177.22,
+        183.54,
+        190.09,
+        196.87,
+        199.84,
+        204.9,
+        212.21,
+        219.78,
+        223.09,
+        231.05,
+        239.29,
+        245.35,
+        249.05,
+        252.8,
+        259.2,
+        268.45,
+        275.24,
+        282.21,
+        292.27,
+        299.67,
+        307.25,
+        315.03,
+        323.0,
+        334.52,
+        346.45,
+        355.22,
+        367.89,
+        377.2,
+        386.74,
+        396.52,
+        406.55,
+        421.04,
+        431.69,
+        447.08,
+        458.39,
+        479.53,
+        491.66,
+        499.05,
+        516.84,
+        540.67,
+        554.34,
+        574.1,
+        594.56,
+        609.6,
+        631.33,
+        653.83,
+        677.14,
+        694.26,
+        704.7,
+        737.19,
+        763.47,
+        790.68,
+        810.67,
+        848.04,
+        878.26,
+        909.56,
+        941.98,
+        975.55,
+        990.21,
+        1035.86,
+        1083.61,
+        1111.01,
+        1162.23,
+        1191.61,
+        1221.73,
+        1278.05,
+        1336.96,
+        1398.59,
+        1463.06,
+        1515.2,
+        1585.04,
+        1658.1,
+        1734.53,
+        1796.34,
+        1860.35,
+        1965.76,
+        2035.81,
+        2194.84,
+        2296.01,
+        2450.61,
+        2589.46,
+        2791.73,
+        2949.91,
+        3180.34,
+        3428.77,
+        3696.6,
+        4025.61,
+        4585.95,
+        5277.05,
+        6352.17,
+        8755.98,
         1000000
       ]
     }

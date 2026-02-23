@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Image downloader with manager/worker architecture.
+"""Image downloader with manager/worker architecture (single-pass).
 
 download_done values:
   -1 = dead URL (404 from CDN, image no longer exists)
@@ -7,15 +7,11 @@ download_done values:
    1 = marker (.dl) created, waiting for worker to download
    2 = download complete (jpg > 1kb on disk)
 
-Manager (main thread):
-- Scans for images where download_done=0, reads URL from DB
-- Creates .dl marker files with URLs, marks download_done=1
-- Checks for completed jpgs (>1kb), marks download_done=2, cleans up .dl files
-
-Workers (4 threads, partitioned):
-- Each worker handles files where first_5_digits % 4 == worker_id
-- Reads URL from marker, downloads image, saves jpg, deletes marker
-- On 404: sets download_done=-1, removes marker
+Flow:
+1. manager_scan() — create .dl markers for all download_done=0, reconcile
+2. Start 8 worker threads — each processes its partition of .dl markers, exits when none remain
+3. Wait for all workers to finish
+4. manager_scan() — final reconciliation (mark completed downloads as download_done=2)
 
 Kill file: touch KILL_DL to stop gracefully.
 """
@@ -36,7 +32,6 @@ PID_FILE = BASE_DIR / "image_downloader.pid"
 PAUSE_FILE = BASE_DIR / "PAUSE_DL"
 PAUSED_FILE = BASE_DIR / "PAUSED_DL"
 NUM_WORKERS = 8
-MAX_RUNTIME = 3.5 * 3600  # Auto-stop after 3.5 hours (embed_orchestrator starts at 8:00)
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR / "bin"))
@@ -311,7 +306,7 @@ def check_disk_space():
 
 
 def worker_loop(worker_id: int):
-    """Worker loop - find and process marker files for this partition."""
+    """Worker loop - find and process marker files for this partition, exit when done."""
     print(f"[{ts()}] Worker {worker_id} started")
 
     while not check_worker_kill_file(worker_id):
@@ -327,8 +322,7 @@ def worker_loop(worker_id: int):
             markers = []
 
         if not markers:
-            time.sleep(1)
-            continue
+            break  # All markers processed, done
 
         for marker_path in markers:
             if check_worker_kill_file(worker_id) or workers_paused:
@@ -360,67 +354,65 @@ def main():
     IMAGES_DIR.mkdir(exist_ok=True)
 
     print(f"{'='*60}")
-    print(f"IMAGE DOWNLOADER")
+    print(f"IMAGE DOWNLOADER (single-pass)")
     print(f"{'='*60}")
     print(f"Workers: {NUM_WORKERS}")
     print(f"Stop with: touch KILL_DL")
     print(f"{'='*60}")
 
-    # Start worker threads
+    # Step 1: Initial scan — create all markers
+    wait_for_backup_lock()
+    stats = manager_scan()
+    print(f"[{ts()}] Initial scan: completed={stats['completed']:,} "
+          f"markers={stats['markers_created']:,} "
+          f"reconciled={stats['reconciled']:,}")
+
+    if check_manager_kill_file():
+        release_lock()
+        return
+
+    # Check disk space before starting workers
+    free_gb = check_disk_space()
+    if free_gb < MIN_DISK_GB:
+        print(f"[{ts()}] DISK LOW: {free_gb:.1f}GB free — aborting")
+        release_lock()
+        return
+
+    # Step 2: Start worker threads
     threads = []
     for i in range(NUM_WORKERS):
         t = threading.Thread(target=worker_loop, args=(i,), daemon=True)
         t.start()
         threads.append(t)
 
-    # Manager loop - full reconciliation every hour, disk check every minute
-    scan_interval = 3600
-    disk_check_interval = 60
-    last_scan = 0  # Force immediate first scan
-    last_disk_check = 0
-    start_time = time.time()
-
-    while not check_manager_kill_file():
-        wait_for_backup_lock()
-        global workers_paused
-        now = time.time()
-
-        # Auto-stop after MAX_RUNTIME
-        if now - start_time >= MAX_RUNTIME:
-            print(f"\n[{ts()}] Max runtime ({MAX_RUNTIME/3600:.1f}h) reached — stopping")
+    # Step 3: Wait for all workers to finish (with periodic disk/kill checks)
+    global workers_paused
+    while any(t.is_alive() for t in threads):
+        if check_manager_kill_file():
             break
+        wait_for_backup_lock()
 
-        # Disk space check every minute
-        if now - last_disk_check >= disk_check_interval:
-            free_gb = check_disk_space()
-            last_disk_check = now
-            if free_gb < MIN_DISK_GB and not workers_paused:
-                workers_paused = True
-                print(f"\n[{ts()}] DISK LOW: {free_gb:.1f}GB free — workers paused")
-            elif free_gb >= MIN_DISK_GB and workers_paused:
-                workers_paused = False
-                print(f"\n[{ts()}] DISK OK: {free_gb:.1f}GB free — workers resumed")
-
-        # Full reconciliation every hour
-        if now - last_scan >= scan_interval:
-            try:
-                stats = manager_scan()
-                last_scan = now
-                print(f"[{ts()}] Done: completed={stats['completed']:,} "
-                      f"markers={stats['markers_created']:,} "
-                      f"reconciled={stats['reconciled']:,}")
-            except sqlite3.OperationalError as e:
-                print(f"\n[{ts()}] DB locked, will retry next cycle: {e}")
+        free_gb = check_disk_space()
+        if free_gb < MIN_DISK_GB and not workers_paused:
+            workers_paused = True
+            print(f"\n[{ts()}] DISK LOW: {free_gb:.1f}GB free — workers paused")
+        elif free_gb >= MIN_DISK_GB and workers_paused:
+            workers_paused = False
+            print(f"\n[{ts()}] DISK OK: {free_gb:.1f}GB free — workers resumed")
 
         time.sleep(1)
 
-    # Wait for workers to finish
-    print(f"[{ts()}] Waiting for workers to finish...")
     for t in threads:
         t.join(timeout=5)
 
+    # Step 4: Final reconciliation scan
+    stats = manager_scan()
+    print(f"[{ts()}] Final scan: completed={stats['completed']:,} "
+          f"markers={stats['markers_created']:,} "
+          f"reconciled={stats['reconciled']:,}")
+
     release_lock()
-    print(f"\n[{ts()}] Downloader stopped")
+    print(f"\n[{ts()}] Downloader complete")
 
 
 if __name__ == "__main__":

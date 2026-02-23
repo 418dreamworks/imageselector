@@ -35,7 +35,8 @@ BASE_URL = "https://openapi.etsy.com/v3"
 API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
 UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
-ONE_WEEK = 5 * 24 * 3600
+ONE_WEEK = 7 * 24 * 3600
+FIVE_DAYS = 5 * 24 * 3600
 ONE_MONTH = 30 * 24 * 3600
 
 BASE_DIR = Path(__file__).parent.parent
@@ -59,13 +60,6 @@ def get_api_delay() -> float:
         except (json.JSONDecodeError, IOError):
             pass
     return API_DELAY_DEFAULT
-
-FURNITURE_TAXONOMY_IDS = {
-    967, 968, 969, 12455, 12456, 970, 972, 971, 12470, 973, 974, 975, 976, 977,
-    11837, 978, 979, 12403, 12405, 12406, 980, 981, 982, 983, 985, 986, 987, 988,
-    989, 990, 12369, 12370, 991, 992, 993, 12371, 12372, 994, 11355, 11356, 998,
-    996, 12468, 12216, 997, 999, 1000, 1001, 12408
-}
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -265,6 +259,53 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         );
     """)
     commit_with_retry(conn)
+
+    # Add denormalized columns for query optimization (one-time migration)
+    for stmt in [
+        "ALTER TABLE listings_static ADD COLUMN last_dynamic_ts INTEGER DEFAULT 0",
+        "ALTER TABLE shops_static ADD COLUMN last_dynamic_ts INTEGER DEFAULT 0",
+        "ALTER TABLE shops_static ADD COLUMN prev_review_count INTEGER",
+        "ALTER TABLE shops_static ADD COLUMN curr_review_count INTEGER",
+    ]:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # Backfill from existing data (runs once when columns are new)
+    _has_dynamic = conn.execute("SELECT 1 FROM listings_dynamic LIMIT 1").fetchone()
+    _all_zero = conn.execute("SELECT 1 FROM listings_static WHERE last_dynamic_ts > 0 LIMIT 1").fetchone() is None
+    if _has_dynamic and _all_zero:
+        print("Backfilling last_dynamic_ts columns (one-time migration)...")
+        conn.execute("""
+            UPDATE listings_static SET last_dynamic_ts = COALESCE((
+                SELECT MAX(snapshot_timestamp) FROM listings_dynamic
+                WHERE listings_dynamic.listing_id = listings_static.listing_id
+            ), 0)
+        """)
+        conn.execute("""
+            UPDATE shops_static SET last_dynamic_ts = COALESCE((
+                SELECT MAX(snapshot_timestamp) FROM shops_dynamic
+                WHERE shops_dynamic.shop_id = shops_static.shop_id
+            ), 0)
+        """)
+        conn.execute("""
+            UPDATE shops_static SET curr_review_count = (
+                SELECT review_count FROM shops_dynamic sd
+                WHERE sd.shop_id = shops_static.shop_id
+                ORDER BY sd.snapshot_timestamp DESC LIMIT 1
+            )
+        """)
+        conn.execute("""
+            UPDATE shops_static SET prev_review_count = (
+                SELECT review_count FROM shops_dynamic sd
+                WHERE sd.shop_id = shops_static.shop_id
+                ORDER BY sd.snapshot_timestamp DESC LIMIT 1 OFFSET 1
+            )
+        """)
+        commit_with_retry(conn)
+        print("Backfill complete.")
+
     return conn
 
 
@@ -305,6 +346,8 @@ def insert_shop_static(conn, shop_data, snapshot_ts):
 
 @_retry_on_lock
 def insert_shop_dynamic(conn, shop_data, snapshot_ts):
+    shop_id = shop_data.get("shop_id")
+    new_review_count = shop_data.get("review_count")
     conn.execute("""
         INSERT INTO shops_dynamic (
             shop_id, snapshot_timestamp, update_date, listing_active_count,
@@ -312,7 +355,7 @@ def insert_shop_dynamic(conn, shop_data, snapshot_ts):
             review_average, review_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        shop_data.get("shop_id"),
+        shop_id,
         snapshot_ts,
         shop_data.get("update_date"),
         shop_data.get("listing_active_count"),
@@ -320,8 +363,16 @@ def insert_shop_dynamic(conn, shop_data, snapshot_ts):
         shop_data.get("num_favorers"),
         shop_data.get("transaction_sold_count"),
         shop_data.get("review_average"),
-        shop_data.get("review_count"),
+        new_review_count,
     ))
+    old = conn.execute(
+        "SELECT curr_review_count FROM shops_static WHERE shop_id = ?", (shop_id,)
+    ).fetchone()
+    old_review_count = old[0] if old else None
+    conn.execute(
+        "UPDATE shops_static SET prev_review_count = ?, curr_review_count = ?, last_dynamic_ts = ? WHERE shop_id = ?",
+        (old_review_count, new_review_count, snapshot_ts, shop_id)
+    )
 
 
 @_retry_on_lock
@@ -386,6 +437,10 @@ def insert_listing_dynamic(conn, listing, snapshot_ts):
         price.get("divisor"),
         price.get("currency_code"),
     ))
+    conn.execute(
+        "UPDATE listings_static SET last_dynamic_ts = ? WHERE listing_id = ?",
+        (snapshot_ts, listing.get("listing_id"))
+    )
 
 
 @_retry_on_lock
@@ -736,6 +791,8 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
 
     stats = {"new_with_images": 0, "new_no_images": 0, "existing_updated": 0, "skipped": 0}
 
+    last_header_unit = -1
+
     while crawl_unit_index < len(CRAWL_UNITS):
         # Check for kill file / backup lock
         wait_for_backup_lock()
@@ -749,11 +806,12 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
 
         unit = CRAWL_UNITS[crawl_unit_index]
 
-        if offset == 0:
+        if crawl_unit_index != last_header_unit:
             print(f"\n{'='*60}")
             print(f"CRAWL: {unit['name']} [{crawl_unit_index+1}/{len(CRAWL_UNITS)}]")
             print(f"API: {_api_stats['used']}/{_api_stats['limit']}")
             print(f"{'='*60}")
+            last_header_unit = crawl_unit_index
 
         # Fetch batch (includes images)
         result, error = fetch_active_listings(
@@ -857,7 +915,7 @@ def _process_crawl_batch(client, results, conn, existing_listings, listing_last_
 
         if lid in existing_listings:
             last_ts = listing_last_ts.get(lid, 0)
-            if snapshot_ts - last_ts > ONE_WEEK:
+            if snapshot_ts - last_ts > FIVE_DAYS:
                 insert_listing_dynamic(conn, listing, snapshot_ts)
                 listing_last_ts[lid] = snapshot_ts
                 stats["existing_updated"] += 1
@@ -885,29 +943,21 @@ def phase_shops(client, conn, snapshot_ts):
     3. Fetch remaining shops one at a time
     4. Insert: if not in shops_static -> static + dynamic; else -> dynamic only
     """
-    cutoff_ts = snapshot_ts - ONE_WEEK
-
-    # Get shop_ids from listings with recent dynamic entries
-    cursor = conn.execute("""
-        SELECT DISTINCT ls.shop_id
-        FROM listings_static ls
-        JOIN (
-            SELECT listing_id, MAX(snapshot_timestamp) as max_ts
-            FROM listings_dynamic
-            GROUP BY listing_id
-        ) ld ON ls.listing_id = ld.listing_id
-        WHERE ld.max_ts > ?
-    """, (cutoff_ts,))
+    # Get shop_ids from listings with dynamic entries within 7 days
+    listing_cutoff = snapshot_ts - ONE_WEEK
+    cursor = conn.execute(
+        "SELECT DISTINCT shop_id FROM listings_static WHERE last_dynamic_ts > ?",
+        (listing_cutoff,)
+    )
     listing_shop_ids = set(row[0] for row in cursor.fetchall())
     print(f"[{ts()}] Shops: {len(listing_shop_ids)} shops from recent listings")
 
-    # Get shop_ids that already have recent dynamic entries
-    cursor = conn.execute("""
-        SELECT shop_id, MAX(snapshot_timestamp) as max_ts
-        FROM shops_dynamic
-        GROUP BY shop_id
-        HAVING max_ts > ?
-    """, (cutoff_ts,))
+    # Get shop_ids that already have shop dynamic entries within 5 days
+    shop_cutoff = snapshot_ts - FIVE_DAYS
+    cursor = conn.execute(
+        "SELECT shop_id FROM shops_static WHERE last_dynamic_ts > ?",
+        (shop_cutoff,)
+    )
     recent_shop_ids = set(row[0] for row in cursor.fetchall())
     print(f"[{ts()}] Shops: {len(recent_shop_ids)} shops already have recent data")
 
@@ -963,12 +1013,10 @@ def phase_reviews(client, conn, snapshot_ts):
     cutoff_ts = snapshot_ts - ONE_MONTH
 
     # Get shop_ids with recent shops_dynamic entries
-    cursor = conn.execute("""
-        SELECT shop_id
-        FROM shops_dynamic
-        GROUP BY shop_id
-        HAVING MAX(snapshot_timestamp) > ?
-    """, (cutoff_ts,))
+    cursor = conn.execute(
+        "SELECT shop_id FROM shops_static WHERE last_dynamic_ts > ?",
+        (cutoff_ts,)
+    )
     shops_with_recent_dynamic = set(row[0] for row in cursor.fetchall())
     print(f"[{ts()}] Reviews: {len(shops_with_recent_dynamic)} shops with recent dynamic data")
 
@@ -988,21 +1036,10 @@ def phase_reviews(client, conn, snapshot_ts):
 
     # Further filter: only shops where review_count changed between last two snapshots
     cursor = conn.execute("""
-        SELECT a.shop_id
-        FROM shops_dynamic a
-        JOIN (
-            SELECT shop_id, MAX(snapshot_timestamp) as max_ts
-            FROM shops_dynamic
-            GROUP BY shop_id
-        ) latest ON a.shop_id = latest.shop_id AND a.snapshot_timestamp = latest.max_ts
-        LEFT JOIN shops_dynamic prev ON a.shop_id = prev.shop_id
-            AND prev.snapshot_timestamp = (
-                SELECT MAX(snapshot_timestamp)
-                FROM shops_dynamic sd2
-                WHERE sd2.shop_id = a.shop_id AND sd2.snapshot_timestamp < latest.max_ts
-            )
-        WHERE prev.review_count IS NULL OR a.review_count != prev.review_count
-    """)
+        SELECT shop_id FROM shops_static
+        WHERE last_dynamic_ts > ?
+        AND (prev_review_count IS NULL OR prev_review_count != curr_review_count)
+    """, (cutoff_ts,))
     shops_review_changed = set(row[0] for row in cursor.fetchall())
     shop_ids = list(shop_ids_candidates & shops_review_changed)
     print(f"[{ts()}] Reviews: {len(shop_ids)} shops with changed review_count")
@@ -1081,10 +1118,10 @@ def main():
 
     # Pre-load DB state for O(1) lookups
     print("Loading DB state...")
-    existing_listings = set(r[0] for r in conn.execute("SELECT listing_id FROM listings_static").fetchall())
-
+    existing_listings = set()
     listing_last_ts = {}
-    for r in conn.execute("SELECT listing_id, MAX(snapshot_timestamp) FROM listings_dynamic GROUP BY listing_id").fetchall():
+    for r in conn.execute("SELECT listing_id, last_dynamic_ts FROM listings_static").fetchall():
+        existing_listings.add(r[0])
         listing_last_ts[r[0]] = r[1]
 
     print(f"DB: {len(existing_listings)} listings")

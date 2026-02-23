@@ -10,7 +10,7 @@
 - Use `venv/bin/python` (symlink doesn't exist) — Use `venv/bin/python3`
 
 **ALWAYS DO THESE:**
-- Use KILL files to stop scripts gracefully (KILL_SD, KILL_DL, KILL_ORCH)
+- Use KILL files to stop scripts gracefully (KILL_SD, KILL_DL, KILL_ORCH, KILL_PIPELINE)
 - Use `PYTHONUNBUFFERED=1` when running Python scripts in background
 - Write temporary/one-off scripts to `scratch/`, never at the top level
 - Check what was done before — don't invent new approaches
@@ -38,7 +38,8 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 | File | Purpose |
 |------|---------|
 | `bin/sync_data.py` | Crawls Etsy API (5 QPS), discovers listings, fetches shop/review data |
-| `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, pauses at 5GB free, auto-stops after 3.5h) |
+| `bin/pipeline.py` | Sequential runner — chains all steps via subprocess, logs to pipeline.log, kill with KILL_PIPELINE |
+| `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, single-pass, pauses at 5GB free) |
 | `bin/image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
 | `bin/tar_images.py` | Archives 10K batches from imageembedded → imagetarred (exits when done) |
 | `bin/update_primary.py` | Weekly full rebuild: clear imageprimary/, extract all primaries, tar all in 10K batches (no loose files) |
@@ -51,6 +52,7 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 
 | Kill File | Stops |
 |-----------|-------|
+| `KILL_PIPELINE` | pipeline.py (between steps) |
 | `KILL_SD` | sync_data.py |
 | `KILL_DL` | image_downloader.py |
 | `KILL_ORCH` | embed_orchestrator.py |
@@ -114,17 +116,13 @@ images/
 
 ## Weekly Cron Schedule
 
-| Day | Time | Job |
-|-----|------|-----|
-| Sunday | 0:00 | sync_data (5 QPS) |
-| Sunday | 4:00 | image_downloader (8 workers) |
-| Sunday | 8:00 | embed_orchestrator |
-| Sunday | 22:00 | tar_images |
-| Monday | 0:00 | update_primary (full rebuild) |
-| Monday | 4:00 | backup_db |
-| Monday | 5:00 | rsync data/ → SSD500GB |
-| Monday | 6:00 | HDD1TB → HDD3TB |
-| Monday | 10:00 | SSD500GB → HDD500GB |
+Single pipeline entry — `pipeline.py` chains all steps sequentially:
+
+```
+0 0 * * 0  cd $CD && PYTHONUNBUFFERED=1 $VENV bin/pipeline.py >> $LOG/pipeline.log 2>&1
+```
+
+Pipeline step order: sync_data → image_downloader → embed_orchestrator → tar_images → update_primary → backup_db → backup_rsync (data, hdd, ssd)
 
 ---
 
@@ -273,9 +271,10 @@ cd /Users/tzuohannlaw/Documents/418Dreamworks/imageselector
 venv/bin/python3 bin/image_db.py
 
 # Stop scripts gracefully
-touch KILL_SD     # sync_data
-touch KILL_DL     # image_downloader
-touch KILL_ORCH   # orchestrator
+touch KILL_PIPELINE  # pipeline (between steps)
+touch KILL_SD        # sync_data
+touch KILL_DL        # image_downloader
+touch KILL_ORCH      # orchestrator
 
 # Run in background
 PYTHONUNBUFFERED=1 nohup venv/bin/python3 bin/SCRIPT.py > logs/SCRIPT.log 2>&1 &
