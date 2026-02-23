@@ -38,7 +38,7 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 | File | Purpose |
 |------|---------|
 | `bin/sync_data.py` | Crawls Etsy API (5 QPS), discovers listings, fetches shop/review data |
-| `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, pauses at 5GB free) |
+| `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, pauses at 5GB free, auto-stops after 3.5h) |
 | `bin/image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
 | `bin/tar_images.py` | Archives 10K batches from imageembedded → imagetarred (exits when done) |
 | `bin/update_primary.py` | Weekly full rebuild: clear imageprimary/, extract all primaries, tar all in 10K batches (no loose files) |
@@ -116,7 +116,6 @@ images/
 
 | Day | Time | Job |
 |-----|------|-----|
-| Every day | every 3h | tar_images.py |
 | Sunday | 0:00 | sync_data (5 QPS) |
 | Sunday | 4:00 | image_downloader (8 workers) |
 | Sunday | 8:00 | embed_orchestrator |

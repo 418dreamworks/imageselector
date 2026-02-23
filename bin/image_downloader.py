@@ -36,6 +36,7 @@ PID_FILE = BASE_DIR / "image_downloader.pid"
 PAUSE_FILE = BASE_DIR / "PAUSE_DL"
 PAUSED_FILE = BASE_DIR / "PAUSED_DL"
 NUM_WORKERS = 8
+MAX_RUNTIME = 3.5 * 3600  # Auto-stop after 3.5 hours (embed_orchestrator starts at 8:00)
 
 # Import from shared image_db module
 sys.path.insert(0, str(BASE_DIR / "bin"))
@@ -377,11 +378,17 @@ def main():
     disk_check_interval = 60
     last_scan = 0  # Force immediate first scan
     last_disk_check = 0
+    start_time = time.time()
 
     while not check_manager_kill_file():
         wait_for_backup_lock()
         global workers_paused
         now = time.time()
+
+        # Auto-stop after MAX_RUNTIME
+        if now - start_time >= MAX_RUNTIME:
+            print(f"\n[{ts()}] Max runtime ({MAX_RUNTIME/3600:.1f}h) reached — stopping")
+            break
 
         # Disk space check every minute
         if now - last_disk_check >= disk_check_interval:

@@ -1,6 +1,6 @@
 {
   "api_delay": 0.2,
-  "last_updated": "2026-02-15T00:00:07.758026",
+  "last_updated": "2026-02-19T07:44:10.813181",
   "limits": {
     "per_second": {
       "limit": 150,
@@ -11,6 +11,6 @@
       "remaining": 95688
     }
   },
-  "remaining": 0,
-  "limit": 10000
+  "remaining": 66854,
+  "limit": 100000
 }

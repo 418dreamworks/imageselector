@@ -32,10 +32,10 @@ _secret = os.getenv("ETSY_SHARED_SECRET", "")
 ETSY_API_KEY = f"{_key}:{_secret}" if _secret else _key
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY_DEFAULT = 1.0  # 1 QPS (default, overridden by qps_config.json)
+API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
 UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
-ONE_WEEK = 7 * 24 * 3600
+ONE_WEEK = 5 * 24 * 3600
 ONE_MONTH = 30 * 24 * 3600
 
 BASE_DIR = Path(__file__).parent.parent
