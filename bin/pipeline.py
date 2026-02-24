@@ -43,7 +43,8 @@ SEQUENTIAL_STEPS = [
     {"name": "backup_rsync_ssd",  "cmd": [VENV_PYTHON, "bin/backup_rsync.py", "ssd"],  "log": "logs/rsync_hdd500.log"},
 ]
 
-GRACE_PERIOD = 300  # 5 min
+TAR_DIR = BASE_DIR / "images" / "imagetarred"
+TAR_IDLE_TIMEOUT = 3600  # 1 hour since last new tar
 
 
 def ts():
@@ -52,6 +53,18 @@ def ts():
 
 def log(msg):
     print(f"[{ts()}] {msg}", flush=True)
+
+
+def newest_tar_age():
+    """Return seconds since the most recently created tar in imagetarred/, or None if no tars."""
+    try:
+        tars = [TAR_DIR / f for f in os.listdir(TAR_DIR) if f.endswith(".tar")]
+        if not tars:
+            return None
+        newest_mtime = max(f.stat().st_mtime for f in tars)
+        return time.time() - newest_mtime
+    except Exception:
+        return None
 
 
 def start_subprocess(step):
@@ -183,19 +196,21 @@ def main():
         results.append(("sync_data", sd_status, sd_elapsed))
         log(f"  sync_data: {sd_status} ({sd_elapsed:.0f}s)")
 
-        # Grace period for others to process remaining work
-        log(f"Grace period: {GRACE_PERIOD // 60} min for remaining work...")
-        grace_end = time.time() + GRACE_PERIOD
-        while time.time() < grace_end:
+        # Wait for others to finish: poll newest tar mtime, kill after 1hr idle
+        log("Waiting for remaining work (kill after 1hr with no new tars)...")
+        while True:
             if KILL_FILE.exists():
-                log("KILL_PIPELINE detected during grace period")
+                log("KILL_PIPELINE detected while waiting")
                 killed = True
                 break
-            # If all others already exited, no need to wait
             if all(procs[n].poll() is not None for n in procs if n != "sync_data"):
                 log("  All concurrent steps already finished")
                 break
-            time.sleep(5)
+            age = newest_tar_age()
+            if age is not None and age > TAR_IDLE_TIMEOUT:
+                log(f"  Last tar is {age:.0f}s old (>{TAR_IDLE_TIMEOUT}s). Stopping others.")
+                break
+            time.sleep(30)
 
         # Signal remaining concurrent steps to stop
         still_running = [n for n in procs if n != "sync_data" and procs[n].poll() is None]

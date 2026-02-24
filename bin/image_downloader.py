@@ -394,8 +394,9 @@ def main():
                 t.start()
                 threads.append(t)
 
-            # Step 3: Wait for all workers to finish (with periodic disk/kill checks)
+            # Step 3: Wait for all workers to finish (with periodic disk/kill/reconciliation checks)
             global workers_paused
+            last_reconcile = time.time()
             while any(t.is_alive() for t in threads):
                 if check_manager_kill_file():
                     break
@@ -408,6 +409,13 @@ def main():
                 elif free_gb >= MIN_DISK_GB and workers_paused:
                     workers_paused = False
                     print(f"\n[{ts()}] DISK OK: {free_gb:.1f}GB free — workers resumed")
+
+                # Periodic reconciliation so orchestrator can see new dl=2 images
+                if time.time() - last_reconcile >= 120:
+                    mid_stats = manager_scan()
+                    print(f"[{ts()}] Mid-pass reconcile: completed={mid_stats['completed']:,} "
+                          f"markers={mid_stats['markers_created']:,}")
+                    last_reconcile = time.time()
 
                 time.sleep(1)
 
