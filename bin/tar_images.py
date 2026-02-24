@@ -45,6 +45,12 @@ def create_tar_batch(batch_num, num_full_batches, filenames):
         print(f"[{batch_num+1}/{num_full_batches}] {tar_name} already exists, skipping")
         return True
 
+    # Check all files exist before tarring
+    missing = [fn for fn in filenames if not os.path.exists(os.path.join(IMAGE_DIR, fn))]
+    if missing:
+        print(f"[{batch_num+1}/{num_full_batches}] {tar_name}: {len(missing)}/{len(filenames)} files not in imageembedded/ yet, skipping")
+        return False
+
     # Write file list to temp file
     list_path = f"/tmp/tar_batch_{batch_num:05d}.txt"
     with open(list_path, "w") as f:
@@ -70,8 +76,7 @@ def create_tar_batch(batch_num, num_full_batches, filenames):
             os.unlink(tar_path)
             print(f"  Deleted corrupt {tar_name}")
         os.unlink(list_path)
-        print(f"  STOPPING due to tar failure.")
-        sys.exit(1)
+        return False
 
     tar_size = os.path.getsize(tar_path) / (1024 * 1024)
     print(f"{tar_size:.0f}MB in {elapsed:.0f}s")
@@ -83,14 +88,12 @@ def create_tar_batch(batch_num, num_full_batches, filenames):
     except Exception as e:
         print(f"  CORRUPT TAR: {e}")
         os.unlink(tar_path)
-        print(f"  Deleted corrupt {tar_name}. STOPPING.")
-        sys.exit(1)
+        return False
 
     if len(tar_members) != BATCH_SIZE:
         print(f"  VERIFY FAILED: expected {BATCH_SIZE} files, got {len(tar_members)}.")
         os.unlink(tar_path)
-        print(f"  Deleted corrupt {tar_name}. STOPPING.")
-        sys.exit(1)
+        return False
 
     # Verify: checksum 50 random files
     check_files = random.sample(filenames, 50)
@@ -107,8 +110,7 @@ def create_tar_batch(batch_num, num_full_batches, filenames):
                 break
     if not checksum_ok:
         os.unlink(tar_path)
-        print(f"  Deleted corrupt {tar_name}. STOPPING.")
-        sys.exit(1)
+        return False
     print(f"  Verified: {BATCH_SIZE} files, 50 checksums OK")
 
     # Update tar_index.json with byte offsets + reverse lookup
@@ -248,8 +250,10 @@ def run_pass():
                 lid, iid = idx[row][0], idx[row][1]
                 filenames.append(f"{lid}_{iid}.jpg")
 
-            create_tar_batch(batch_num, num_full_batches, filenames)
-            tars_created += 1
+            if create_tar_batch(batch_num, num_full_batches, filenames):
+                tars_created += 1
+            else:
+                break  # Files not ready yet, try again next pass
 
         # Check if shard is now fully tarred (all 50 tars exist for 500K shard)
         if shard_rows == SHARD_SIZE:
