@@ -18,7 +18,34 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
 KILL_FILE = BASE_DIR / "KILL_PIPELINE"
+PID_FILE = BASE_DIR / "pipeline.pid"
 VENV_PYTHON = str(BASE_DIR / "venv" / "bin" / "python3")
+
+
+_lock_acquired = False
+
+
+def acquire_lock() -> bool:
+    """Acquire PID lock. Returns False if another instance is running."""
+    global _lock_acquired
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)
+            return False
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    PID_FILE.write_text(str(os.getpid()))
+    _lock_acquired = True
+    return True
+
+
+def release_lock():
+    """Release PID lock."""
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 # Kill files for each concurrent step
 KILL_FILES = {
@@ -145,6 +172,10 @@ def run_sequential_step(step):
 def main():
     if KILL_FILE.exists():
         log(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        return
+
+    if not acquire_lock():
+        log("Error: Another pipeline.py instance is already running")
         return
 
     log("=" * 60)
@@ -276,4 +307,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if _lock_acquired:
+            release_lock()
