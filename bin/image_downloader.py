@@ -198,21 +198,29 @@ def manager_scan() -> dict:
     # --- Step 4: Batch UPDATE DB (brief hold) ---
     stats["completed"] = len(promote_to_2)
 
-    conn = get_connection()
-    try:
-        for lid, iid in promote_to_2:
-            conn.execute("""
-                UPDATE image_status SET download_done = 2
-                WHERE listing_id = ? AND image_id = ?
-            """, (lid, iid))
-        for lid, iid in promote_to_1:
-            conn.execute("""
-                UPDATE image_status SET download_done = 1
-                WHERE listing_id = ? AND image_id = ?
-            """, (lid, iid))
-        commit_with_retry(conn)
-    finally:
-        conn.close()
+    for attempt in range(10):
+        try:
+            conn = get_connection()
+            try:
+                if promote_to_2:
+                    conn.executemany(
+                        "UPDATE image_status SET download_done = 2 WHERE listing_id = ? AND image_id = ?",
+                        promote_to_2
+                    )
+                if promote_to_1:
+                    conn.executemany(
+                        "UPDATE image_status SET download_done = 1 WHERE listing_id = ? AND image_id = ?",
+                        promote_to_1
+                    )
+                commit_with_retry(conn)
+            finally:
+                conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < 9:
+                time.sleep(2 * (attempt + 1))
+            else:
+                raise
 
     return stats
 
