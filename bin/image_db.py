@@ -37,7 +37,7 @@ def _retry_on_lock(func):
 
 def get_connection() -> sqlite3.Connection:
     """Get a database connection with WAL mode for concurrent access."""
-    conn = sqlite3.connect(DB_FILE, timeout=30.0)
+    conn = sqlite3.connect(DB_FILE, timeout=300.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn

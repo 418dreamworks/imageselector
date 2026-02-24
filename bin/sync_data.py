@@ -1039,11 +1039,20 @@ def phase_reviews(client, conn, snapshot_ts):
     default_ts = 946684800
 
     total_reviews = 0
+    review_batch = []
     print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops with recent data")
 
     for i, shop_id in enumerate(shop_ids):
         wait_for_backup_lock()
         if check_kill_file():
+            if review_batch:
+                conn.executemany("""
+                    INSERT OR IGNORE INTO reviews (
+                        snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                        language, create_timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, review_batch)
+                review_batch = []
             commit_with_retry(conn)
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
             return
@@ -1055,17 +1064,40 @@ def phase_reviews(client, conn, snapshot_ts):
         if reviews:
             newest_ts = max(r.get("create_timestamp", 0) for r in reviews)
             last_review_ts[sid_str] = newest_ts
-            # Insert ALL reviews (no listing_id filter — needed for sales ratio analysis)
             for review in reviews:
-                insert_review(conn, review, snapshot_ts)
+                review_batch.append((
+                    snapshot_ts,
+                    review.get("shop_id"),
+                    review.get("listing_id"),
+                    review.get("buyer_user_id"),
+                    review.get("rating"),
+                    review.get("review"),
+                    review.get("language"),
+                    review.get("create_timestamp"),
+                ))
             total_reviews += len(reviews)
 
         if (i + 1) % 10 == 0:
+            if review_batch:
+                conn.executemany("""
+                    INSERT OR IGNORE INTO reviews (
+                        snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                        language, create_timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, review_batch)
+                review_batch = []
             commit_with_retry(conn)
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
             print(f"  Reviews: {i+1}/{len(shop_ids)} shops, {total_reviews} new reviews "
                   f"| API={_api_stats['used']}/{_api_stats['limit']}")
 
+    if review_batch:
+        conn.executemany("""
+            INSERT OR IGNORE INTO reviews (
+                snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                language, create_timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, review_batch)
     commit_with_retry(conn)
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
     print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops")
