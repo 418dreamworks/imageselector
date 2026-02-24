@@ -92,13 +92,14 @@ class WorkerState:
 
 
 WORKERS = {
-    'imac': Worker(
-        name='imac',
-        host='localhost',
+    'sleight': Worker(
+        name='sleight',
+        host='192.168.68.117',
         user='embed',
-        work_dir='/Users/embed/imageselector',
-        python_path='/Users/embed/imageselector/venv/bin/python',
+        work_dir='C:/Users/embed/imageselector',
+        python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
         batch_size=10000,
+        rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
     'mbp': Worker(
         name='mbp',
@@ -108,14 +109,13 @@ WORKERS = {
         python_path='/Users/embed/imageselector/venv/bin/python',
         batch_size=10000,
     ),
-    'sleight': Worker(
-        name='sleight',
-        host='192.168.68.117',
+    'imac': Worker(
+        name='imac',
+        host='localhost',
         user='embed',
-        work_dir='C:/Users/embed/imageselector',
-        python_path='C:/Users/embed/imageselector/venv/Scripts/python.exe',
+        work_dir='/Users/embed/imageselector',
+        python_path='/Users/embed/imageselector/venv/bin/python',
         batch_size=10000,
-        rsync_path='C:/cwrsync/bin/rsync.exe',
     ),
 }
 
@@ -309,7 +309,7 @@ def buffer_pull(work_buffer: dict, batch_size: int, embedded_set: set) -> List[T
         log(f"  BUFFER pull: only {grabbed_count} available, need {batch_size} — skipping")
         return []
     log(f"  BUFFER pull: exporting {batch_size}")
-    return get_from_buffer(work_buffer, to_export)
+    return get_from_buffer(work_buffer, batch_size)
 
 
 def get_listing_texts(listing_ids: List[int]) -> dict:
@@ -384,22 +384,9 @@ def export_batch(batch_name: str, images: List[Tuple[int, int]]) -> Path:
 
 
 def _finalize_shard(shard_dir: Path):
-    """Mark a completed shard's images as download_done=3 in the DB."""
+    """Log shard finalization. download_done updates are handled by tar_images."""
     idx = load_shard_index(shard_dir)
-    pairs = [(entry[0], entry[1]) for entry in idx]
-
-    conn = sqlite3.connect(str(DB_FILE), timeout=300.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    for chunk_start in range(0, len(pairs), 10000):
-        chunk = pairs[chunk_start:chunk_start + 10000]
-        conn.executemany(
-            "UPDATE image_status SET download_done = 3 "
-            "WHERE listing_id = ? AND image_id = ? AND download_done = 2",
-            chunk
-        )
-        commit_with_retry(conn)
-    conn.close()
-    log(f"Finalized {shard_dir.name}: {len(pairs)} images → download_done=3")
+    log(f"Finalized {shard_dir.name}: {len(idx)} rows")
 
 
 def _append_to_shard(shard_dir: Path, shard_index: list, manifest: list,
@@ -837,6 +824,11 @@ def main():
     # Only finish in-flight imports, then QPS-only
     draining = False
 
+    def other_workers_idle(current_name):
+        """Check if any other worker is idle and could use a batch."""
+        return any(s.status in ('idle', 'done') and n != current_name
+                   for n, s in worker_states.items() if s.status != 'frozen')
+
     batch_counter = 0
     total_imported = 0
 
@@ -942,8 +934,8 @@ def main():
                             state.next_staged = False
                             # status stays 'working'
 
-                            # Pre-stage N+2 (async rsync, skip if draining)
-                            if not draining:
+                            # Pre-stage N+2 (skip if draining or other workers need work)
+                            if not draining and not other_workers_idle(name):
                                 next_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                                 if next_images:
                                     batch_counter += 1
@@ -983,19 +975,20 @@ def main():
                                 state.rsync_current_proc = rsync_to_worker_async(worker, new_dir)
                                 state.status = 'staging'
 
-                                # Also export + async rsync pre-stage
-                                ps_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
-                                if ps_images:
-                                    batch_counter += 1
-                                    ps_name = f"batch_{batch_counter:05d}_{name}"
-                                    log(f"{name}: pre-staging {ps_name} ({len(ps_images)} images)")
-                                    ps_dir = export_batch(ps_name, ps_images)
-                                    state.next_batch = ps_name
-                                    state.next_batch_images = ps_images
-                                    state.rsync_prestage_proc = rsync_to_worker_async(worker, ps_dir)
-                                else:
-                                    draining = True
-                                    log("Buffer drained - finishing remaining imports, QPS only")
+                                # Also export + async rsync pre-stage (skip if other workers idle)
+                                if not other_workers_idle(name):
+                                    ps_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
+                                    if ps_images:
+                                        batch_counter += 1
+                                        ps_name = f"batch_{batch_counter:05d}_{name}"
+                                        log(f"{name}: pre-staging {ps_name} ({len(ps_images)} images)")
+                                        ps_dir = export_batch(ps_name, ps_images)
+                                        state.next_batch = ps_name
+                                        state.next_batch_images = ps_images
+                                        state.rsync_prestage_proc = rsync_to_worker_async(worker, ps_dir)
+                                    else:
+                                        draining = True
+                                        log("Buffer drained - finishing remaining imports, QPS only")
                             else:
                                 draining = True
                                 log("Buffer drained - finishing remaining imports, QPS only")
@@ -1025,8 +1018,8 @@ def main():
                             break
 
                     else:
-                        # Not done yet - pre-stage next batch if not already (async rsync)
-                        if not state.next_batch and not state.rsync_prestage_proc and not draining:
+                        # Not done yet - pre-stage next batch if not already (skip if other workers idle)
+                        if not state.next_batch and not state.rsync_prestage_proc and not draining and not other_workers_idle(name):
                             images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                             if images:
                                 batch_counter += 1
@@ -1043,10 +1036,17 @@ def main():
                 # ---- IDLE: no work in progress ----
                 elif state.status in ('idle', 'done'):
                     if draining:
-                        state.status = 'idle'
-                        continue
+                        # Try refilling — new images may have arrived
+                        top_up_buffer(work_buffer, embedded_set)
+                        grabbed = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                        if grabbed >= worker.batch_size:
+                            draining = False
+                            log(f"Buffer refilled ({grabbed} grabbed), resuming dispatch")
+                        else:
+                            state.status = 'idle'
+                            continue
 
-                    # Export current + pre-stage, start async rsyncs, move on
+                    # Export current batch, start async rsync
                     images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
                     if images:
                         batch_counter += 1
@@ -1058,19 +1058,20 @@ def main():
                         state.rsync_current_proc = rsync_to_worker_async(worker, cur_dir)
                         state.status = 'staging'
 
-                        # Also export + async rsync pre-stage
-                        ps_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
-                        if ps_images:
-                            batch_counter += 1
-                            ps_name = f"batch_{batch_counter:05d}_{name}"
-                            log(f"{name}: pre-staging {ps_name} ({len(ps_images)} images)")
-                            ps_dir = export_batch(ps_name, ps_images)
-                            state.next_batch = ps_name
-                            state.next_batch_images = ps_images
-                            state.rsync_prestage_proc = rsync_to_worker_async(worker, ps_dir)
-                        else:
-                            draining = True
-                            log("Buffer drained - finishing remaining imports, QPS only")
+                        # Pre-stage only if no other workers are idle
+                        if not other_workers_idle(name):
+                            ps_images = buffer_pull(work_buffer, worker.batch_size, embedded_set)
+                            if ps_images:
+                                batch_counter += 1
+                                ps_name = f"batch_{batch_counter:05d}_{name}"
+                                log(f"{name}: pre-staging {ps_name} ({len(ps_images)} images)")
+                                ps_dir = export_batch(ps_name, ps_images)
+                                state.next_batch = ps_name
+                                state.next_batch_images = ps_images
+                                state.rsync_prestage_proc = rsync_to_worker_async(worker, ps_dir)
+                            else:
+                                draining = True
+                                log("Buffer drained - finishing remaining imports, QPS only")
                     else:
                         draining = True
                         log("Buffer drained - finishing remaining imports, QPS only")
@@ -1085,8 +1086,18 @@ def main():
             idle = sum(1 for s in worker_states.values() if s.status == 'idle')
 
             if working == 0 and staging == 0 and idle == len(worker_states):
-                log("All workers idle, no pending work. Exiting.")
-                break
+                if draining:
+                    # Try refilling buffer — new images may have arrived
+                    top_up_buffer(work_buffer, embedded_set)
+                    grabbed = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                    if grabbed >= worker.batch_size:
+                        log(f"Buffer refilled ({grabbed} grabbed), resuming dispatch")
+                        draining = False
+                    else:
+                        log(f"All workers idle, buffer low ({grabbed}). Waiting...")
+                else:
+                    log("All workers idle, no pending work. Waiting...")
+                time.sleep(POLL_INTERVAL)
             else:
                 time.sleep(POLL_INTERVAL)
 

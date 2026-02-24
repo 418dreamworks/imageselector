@@ -10,7 +10,7 @@
 - Use `venv/bin/python` (symlink doesn't exist) — Use `venv/bin/python3`
 
 **ALWAYS DO THESE:**
-- Use KILL files to stop scripts gracefully (KILL_SD, KILL_DL, KILL_ORCH, KILL_PIPELINE)
+- Use KILL files to stop scripts gracefully (KILL_SD, KILL_DL, KILL_ORCH, KILL_TAR, KILL_PIPELINE)
 - Use `PYTHONUNBUFFERED=1` when running Python scripts in background
 - Write temporary/one-off scripts to `scratch/`, never at the top level
 - Check what was done before — don't invent new approaches
@@ -38,7 +38,7 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 | File | Purpose |
 |------|---------|
 | `bin/sync_data.py` | Crawls Etsy API (5 QPS), discovers listings, fetches shop/review data |
-| `bin/pipeline.py` | Sequential runner — chains all steps via subprocess, logs to pipeline.log, kill with KILL_PIPELINE |
+| `bin/pipeline.py` | Concurrent runner — Phase 1: sync_data + image_downloader + embed_orchestrator + tar_images run simultaneously; Phase 2: sequential finishers. Kill with KILL_PIPELINE |
 | `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, single-pass, pauses at 5GB free) |
 | `bin/image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
 | `bin/tar_images.py` | Archives 10K batches from imageembedded → imagetarred (exits when done) |
@@ -56,6 +56,7 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 | `KILL_SD` | sync_data.py |
 | `KILL_DL` | image_downloader.py |
 | `KILL_ORCH` | embed_orchestrator.py |
+| `KILL_TAR` | tar_images.py |
 
 ---
 
@@ -69,7 +70,7 @@ SQLite with WAL mode at `data/db/etsy_data.db`
 | listing_id | INTEGER | PK with image_id |
 | image_id | INTEGER | PK with listing_id |
 | is_primary | INTEGER | 1 if primary image for listing |
-| download_done | INTEGER | -1=dead URL, 0=needs download, 1=marker created, 2=complete |
+| download_done | INTEGER | -1=dead URL, 0=needs download, 1=marker created, 2=downloaded, 3=tarred (set by tar_images), 4=shard finalized (set by tar_images when all 50 tars for a 500K shard exist) |
 | url | TEXT | Etsy CDN URL |
 
 ### Other Tables
@@ -80,9 +81,9 @@ SQLite with WAL mode at `data/db/etsy_data.db`
 - `reviews` — shop reviews (rating, review text, buyer_user_id)
 - `sync_state` — key-value crawler state
 
-### Embedding Tracking
-- Tracked via `data/embeddings/image_index.json` (not in DB)
-- Row alignment: Row N in ALL FAISS files = same image. `image_index.json[N]` = `[listing_id, image_id]`
+### Embedding & Tar Tracking
+- DB: `download_done=3` = tarred (set by tar_images after each 10K batch), `download_done=4` = shard finalized (set by tar_images when all 50 tars for a 500K shard exist)
+- FAISS row alignment: Row N in ALL FAISS files = same image. `shard_XXXX/image_index.json[N]` = `[listing_id, image_id]`
 
 ---
 
@@ -122,7 +123,7 @@ Single pipeline entry — `pipeline.py` chains all steps sequentially:
 0 0 * * 0  cd $CD && PYTHONUNBUFFERED=1 $VENV bin/pipeline.py >> $LOG/pipeline.log 2>&1
 ```
 
-Pipeline step order: sync_data → image_downloader → embed_orchestrator → tar_images → update_primary → backup_db → backup_rsync (data, hdd, ssd)
+Pipeline: Phase 1 concurrent (sync_data + image_downloader + embed_orchestrator + tar_images) → Phase 2 sequential (update_primary → backup_db → backup_rsync data, hdd, ssd)
 
 ---
 
@@ -275,6 +276,7 @@ touch KILL_PIPELINE  # pipeline (between steps)
 touch KILL_SD        # sync_data
 touch KILL_DL        # image_downloader
 touch KILL_ORCH      # orchestrator
+touch KILL_TAR       # tar_images
 
 # Run in background
 PYTHONUNBUFFERED=1 nohup venv/bin/python3 bin/SCRIPT.py > logs/SCRIPT.log 2>&1 &

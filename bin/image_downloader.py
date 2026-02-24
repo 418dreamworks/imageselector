@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Image downloader with manager/worker architecture (single-pass).
+"""Image downloader with manager/worker architecture (continuous loop).
 
 download_done values:
   -1 = dead URL (404 from CDN, image no longer exists)
    0 = needs download
    1 = marker (.dl) created, waiting for worker to download
    2 = download complete (jpg > 1kb on disk)
+   3 = tarred (set by tar_images after each 10K batch)
+   4 = shard finalized (set by tar_images when all 50 tars for 500K shard exist)
 
-Flow:
+Flow (each pass):
 1. manager_scan() — create .dl markers for all download_done=0, reconcile
 2. Start 8 worker threads — each processes its partition of .dl markers, exits when none remain
 3. Wait for all workers to finish
 4. manager_scan() — final reconciliation (mark completed downloads as download_done=2)
+5. Sleep 2 min, then loop back to 1
 
 Kill file: touch KILL_DL to stop gracefully.
 """
@@ -354,65 +357,81 @@ def main():
     IMAGES_DIR.mkdir(exist_ok=True)
 
     print(f"{'='*60}")
-    print(f"IMAGE DOWNLOADER (single-pass)")
+    print(f"IMAGE DOWNLOADER (continuous)")
     print(f"{'='*60}")
     print(f"Workers: {NUM_WORKERS}")
     print(f"Stop with: touch KILL_DL")
     print(f"{'='*60}")
 
-    # Step 1: Initial scan — create all markers
-    wait_for_backup_lock()
-    stats = manager_scan()
-    print(f"[{ts()}] Initial scan: completed={stats['completed']:,} "
-          f"markers={stats['markers_created']:,} "
-          f"reconciled={stats['reconciled']:,}")
+    pass_num = 0
+    while not KILL_FILE.exists():
+        pass_num += 1
+        print(f"\n[{ts()}] === Pass {pass_num} ===")
 
-    if check_manager_kill_file():
-        release_lock()
-        return
+        # Step 1: Scan — create markers, reconcile
+        wait_for_backup_lock()
+        stats = manager_scan()
+        print(f"[{ts()}] Scan: completed={stats['completed']:,} "
+              f"markers={stats['markers_created']:,} "
+              f"reconciled={stats['reconciled']:,}")
 
-    # Check disk space before starting workers
-    free_gb = check_disk_space()
-    if free_gb < MIN_DISK_GB:
-        print(f"[{ts()}] DISK LOW: {free_gb:.1f}GB free — aborting")
-        release_lock()
-        return
-
-    # Step 2: Start worker threads
-    threads = []
-    for i in range(NUM_WORKERS):
-        t = threading.Thread(target=worker_loop, args=(i,), daemon=True)
-        t.start()
-        threads.append(t)
-
-    # Step 3: Wait for all workers to finish (with periodic disk/kill checks)
-    global workers_paused
-    while any(t.is_alive() for t in threads):
         if check_manager_kill_file():
             break
-        wait_for_backup_lock()
 
+        # Check disk space before starting workers
         free_gb = check_disk_space()
-        if free_gb < MIN_DISK_GB and not workers_paused:
-            workers_paused = True
-            print(f"\n[{ts()}] DISK LOW: {free_gb:.1f}GB free — workers paused")
-        elif free_gb >= MIN_DISK_GB and workers_paused:
-            workers_paused = False
-            print(f"\n[{ts()}] DISK OK: {free_gb:.1f}GB free — workers resumed")
+        # Check if any .dl markers exist on disk (workers process these)
+        has_markers = next((True for f in IMAGES_DIR.iterdir() if f.suffix == '.dl'), False)
+        if free_gb < MIN_DISK_GB:
+            print(f"[{ts()}] DISK LOW: {free_gb:.1f}GB free — skipping downloads")
+        elif not has_markers:
+            print(f"[{ts()}] No markers on disk, nothing to download")
+        else:
+            # Step 2: Start worker threads
+            threads = []
+            for i in range(NUM_WORKERS):
+                t = threading.Thread(target=worker_loop, args=(i,), daemon=True)
+                t.start()
+                threads.append(t)
 
-        time.sleep(1)
+            # Step 3: Wait for all workers to finish (with periodic disk/kill checks)
+            global workers_paused
+            while any(t.is_alive() for t in threads):
+                if check_manager_kill_file():
+                    break
+                wait_for_backup_lock()
 
-    for t in threads:
-        t.join(timeout=5)
+                free_gb = check_disk_space()
+                if free_gb < MIN_DISK_GB and not workers_paused:
+                    workers_paused = True
+                    print(f"\n[{ts()}] DISK LOW: {free_gb:.1f}GB free — workers paused")
+                elif free_gb >= MIN_DISK_GB and workers_paused:
+                    workers_paused = False
+                    print(f"\n[{ts()}] DISK OK: {free_gb:.1f}GB free — workers resumed")
 
-    # Step 4: Final reconciliation scan
-    stats = manager_scan()
-    print(f"[{ts()}] Final scan: completed={stats['completed']:,} "
-          f"markers={stats['markers_created']:,} "
-          f"reconciled={stats['reconciled']:,}")
+                time.sleep(1)
+
+            for t in threads:
+                t.join(timeout=5)
+
+            # Final reconciliation for this pass
+            stats = manager_scan()
+            print(f"[{ts()}] Pass {pass_num} final: completed={stats['completed']:,} "
+                  f"markers={stats['markers_created']:,} "
+                  f"reconciled={stats['reconciled']:,}")
+
+        if KILL_FILE.exists():
+            break
+
+        # Sleep 2 min between passes (12 × 10s), checking kill file
+        print(f"[{ts()}] Pass {pass_num} done. Sleeping 2 min...")
+        for _ in range(12):
+            if KILL_FILE.exists():
+                break
+            time.sleep(10)
 
     release_lock()
-    print(f"\n[{ts()}] Downloader complete")
+    print(f"\n[{ts()}] Downloader stopped")
 
 
 if __name__ == "__main__":
