@@ -1080,6 +1080,15 @@ def main():
             if should_exit:
                 break
 
+            # Periodic buffer refill check (every 2 min, not just on worker complete)
+            if draining and time.time() - getattr(main, '_last_refill_check', 0) >= 120:
+                main._last_refill_check = time.time()
+                top_up_buffer(work_buffer, embedded_set)
+                grabbed = sum(1 for s in work_buffer.values() if s == 'grabbed')
+                if grabbed >= worker.batch_size:
+                    log(f"Buffer refilled ({grabbed} grabbed), resuming dispatch")
+                    draining = False
+
             # Status summary
             working = sum(1 for s in worker_states.values() if s.status == 'working')
             staging = sum(1 for s in worker_states.values() if s.status == 'staging')
@@ -1087,19 +1096,11 @@ def main():
 
             if working == 0 and staging == 0 and idle == len(worker_states):
                 if draining:
-                    # Try refilling buffer — new images may have arrived
-                    top_up_buffer(work_buffer, embedded_set)
-                    grabbed = sum(1 for s in work_buffer.values() if s == 'grabbed')
-                    if grabbed >= worker.batch_size:
-                        log(f"Buffer refilled ({grabbed} grabbed), resuming dispatch")
-                        draining = False
-                    else:
-                        log(f"All workers idle, buffer low ({grabbed}). Waiting...")
+                    log(f"All workers idle, buffer low ({sum(1 for s in work_buffer.values() if s == 'grabbed')}). Waiting...")
                 else:
                     log("All workers idle, no pending work. Waiting...")
-                time.sleep(POLL_INTERVAL)
-            else:
-                time.sleep(POLL_INTERVAL)
+
+            time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
         log("Interrupted")

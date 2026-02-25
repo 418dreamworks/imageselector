@@ -492,7 +492,7 @@ def update_api_usage(response):
                     config = json.loads(QPS_CONFIG_FILE.read_text())
                 if UPDATE_QPS:
                     current_delay = config.get("api_delay", API_DELAY_DEFAULT)
-                    if used >= 90000:
+                    if used >= 99750:
                         new_delay = min(current_delay * 1.1, 30.0)
                     else:
                         new_delay = API_DELAY_DEFAULT  # 5 QPS
@@ -1035,14 +1035,21 @@ def phase_reviews(client, conn, snapshot_ts):
         return
 
     last_review_ts = get_sync_state(conn, "last_review_timestamps", {})
+    reviews_done = set(get_sync_state(conn, "reviews_done_shops", []))
     # Jan 1, 2000 as default
     default_ts = 946684800
 
+    # Skip already-completed shops
+    remaining = [sid for sid in shop_ids if sid not in reviews_done]
+    skipped = len(shop_ids) - len(remaining)
+    if skipped:
+        print(f"[{ts()}] Reviews: skipping {skipped} already-completed shops")
+
     total_reviews = 0
     review_batch = []
-    print(f"\n[{ts()}] Reviews: syncing {len(shop_ids)} shops with recent data")
+    print(f"\n[{ts()}] Reviews: syncing {len(remaining)} shops with recent data")
 
-    for i, shop_id in enumerate(shop_ids):
+    for i, shop_id in enumerate(remaining):
         wait_for_backup_lock()
         if check_kill_file():
             if review_batch:
@@ -1055,6 +1062,7 @@ def phase_reviews(client, conn, snapshot_ts):
                 review_batch = []
             commit_with_retry(conn)
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
+            set_sync_state(conn, "reviews_done_shops", list(reviews_done))
             return
 
         sid_str = str(shop_id)
@@ -1077,6 +1085,8 @@ def phase_reviews(client, conn, snapshot_ts):
                 ))
             total_reviews += len(reviews)
 
+        reviews_done.add(shop_id)
+
         if (i + 1) % 10 == 0:
             if review_batch:
                 conn.executemany("""
@@ -1088,7 +1098,8 @@ def phase_reviews(client, conn, snapshot_ts):
                 review_batch = []
             commit_with_retry(conn)
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
-            print(f"  Reviews: {i+1}/{len(shop_ids)} shops, {total_reviews} new reviews "
+            set_sync_state(conn, "reviews_done_shops", list(reviews_done))
+            print(f"  Reviews: {i+1}/{len(remaining)} shops, {total_reviews} new reviews "
                   f"| API={_api_stats['used']}/{_api_stats['limit']}")
 
     if review_batch:
@@ -1100,7 +1111,9 @@ def phase_reviews(client, conn, snapshot_ts):
         """, review_batch)
     commit_with_retry(conn)
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
-    print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(shop_ids)} shops")
+    # Clear reviews_done for next cycle
+    set_sync_state(conn, "reviews_done_shops", [])
+    print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(remaining)} shops")
 
     # Reset progress for next cycle
     save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []}, conn)
