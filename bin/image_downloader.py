@@ -124,7 +124,7 @@ def manager_scan() -> dict:
     5. For dl=0 without .dl: create .dl marker file, promote to 1
     6. Hold DB briefly, batch UPDATE all changes, release
     """
-    stats = {"completed": 0, "markers_created": 0, "reconciled": 0}
+    stats = {"completed": 0, "markers_created": 0, "reconciled": 0, "dead": 0}
 
     # --- Step 1: Snapshot DB (brief hold) ---
     conn = get_connection()
@@ -161,13 +161,21 @@ def manager_scan() -> dict:
     markers_to_delete = []  # paths to clean up
 
     # Check dl=1 entries for completed jpgs
+    mark_dead = []  # (lid, iid) - tiny/error jpgs, mark as -1
     for lid, iid in in_progress:
         jpg = get_image_path(lid, iid)
         dl = get_marker_path(lid, iid)
-        if jpg.exists() and jpg.stat().st_size > 1000:
-            promote_to_2.append((lid, iid))
-            if dl.exists():
-                markers_to_delete.append(dl)
+        if jpg.exists():
+            if jpg.stat().st_size > 1000:
+                promote_to_2.append((lid, iid))
+                if dl.exists():
+                    markers_to_delete.append(dl)
+            else:
+                # Tiny/error image from CDN — mark as dead
+                mark_dead.append((lid, iid))
+                markers_to_delete.append(jpg)
+                if dl.exists():
+                    markers_to_delete.append(dl)
 
     # Check dl=0 entries
     for (lid, iid), url in needs_download.items():
@@ -197,6 +205,7 @@ def manager_scan() -> dict:
 
     # --- Step 4: Batch UPDATE DB (brief hold) ---
     stats["completed"] = len(promote_to_2)
+    stats["dead"] = len(mark_dead)
 
     conn = get_connection()
     try:
@@ -209,6 +218,11 @@ def manager_scan() -> dict:
             conn.executemany(
                 "UPDATE image_status SET download_done = 1 WHERE listing_id = ? AND image_id = ?",
                 promote_to_1
+            )
+        if mark_dead:
+            conn.executemany(
+                "UPDATE image_status SET download_done = -1 WHERE listing_id = ? AND image_id = ?",
+                mark_dead
             )
         commit_with_retry(conn)
     finally:
@@ -373,7 +387,7 @@ def main():
         stats = manager_scan()
         print(f"[{ts()}] Scan: completed={stats['completed']:,} "
               f"markers={stats['markers_created']:,} "
-              f"reconciled={stats['reconciled']:,}")
+              f"reconciled={stats['reconciled']:,} dead={stats['dead']:,}")
 
         if check_manager_kill_file():
             break
@@ -414,7 +428,7 @@ def main():
                 if time.time() - last_reconcile >= 120:
                     mid_stats = manager_scan()
                     print(f"[{ts()}] Mid-pass reconcile: completed={mid_stats['completed']:,} "
-                          f"markers={mid_stats['markers_created']:,}")
+                          f"markers={mid_stats['markers_created']:,} dead={mid_stats['dead']:,}")
                     last_reconcile = time.time()
 
                 time.sleep(1)
@@ -426,7 +440,7 @@ def main():
             stats = manager_scan()
             print(f"[{ts()}] Pass {pass_num} final: completed={stats['completed']:,} "
                   f"markers={stats['markers_created']:,} "
-                  f"reconciled={stats['reconciled']:,}")
+                  f"reconciled={stats['reconciled']:,} dead={stats['dead']:,}")
 
         if KILL_FILE.exists():
             break
