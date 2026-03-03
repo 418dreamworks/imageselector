@@ -169,9 +169,24 @@ def run_sequential_step(step):
         return f"ERROR({e})", time.time() - t0
 
 
+REQUIRED_VOLUMES = ["/Volumes/SSD500GB", "/Volumes/HDD1TB"]
+
+
+def check_volumes():
+    """Verify required external drives are mounted."""
+    missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
+    if missing:
+        log(f"Error: Required volumes not mounted: {', '.join(missing)}")
+        return False
+    return True
+
+
 def main():
     if KILL_FILE.exists():
         log(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        return
+
+    if not check_volumes():
         return
 
     if not acquire_lock():
@@ -277,6 +292,20 @@ def main():
 
     # Clean up kill files
     cleanup_kill_files()
+
+    # ── Cleanup: remove dead URL rows before backup ──
+    if not killed:
+        try:
+            import sqlite3
+            db_path = BASE_DIR / "data" / "db" / "etsy_data.db"
+            conn = sqlite3.connect(str(db_path), timeout=300)
+            deleted = conn.execute("DELETE FROM image_status WHERE download_done = -1").rowcount
+            conn.commit()
+            conn.close()
+            if deleted:
+                log(f"Cleaned up {deleted} dead URL rows (dl=-1)")
+        except Exception as e:
+            log(f"Warning: failed to clean dead URLs: {e}")
 
     # ── Phase 2: Sequential steps (skip if killed) ──
     if not killed:
