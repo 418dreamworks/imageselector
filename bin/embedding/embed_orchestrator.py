@@ -91,7 +91,7 @@ class WorkerState:
     rsync_prestage_proc: Optional[subprocess.Popen] = None  # rsync for pre-stage batch
 
 
-WORKERS = {
+ALL_WORKERS = {
     'sleight': Worker(
         name='sleight',
         host='192.168.68.117',
@@ -103,7 +103,7 @@ WORKERS = {
     ),
     'mbp': Worker(
         name='mbp',
-        host='mbp.local',
+        host='192.168.68.109',
         user='embed',
         work_dir='/Users/embed/imageselector',
         python_path='/Users/embed/imageselector/venv/bin/python',
@@ -118,6 +118,9 @@ WORKERS = {
         batch_size=10000,
     ),
 }
+
+# Active workers — add 'sleight' and/or 'mbp' back to re-enable
+WORKERS = {k: v for k, v in ALL_WORKERS.items() if k in ('imac',)}
 
 
 # ============================================================
