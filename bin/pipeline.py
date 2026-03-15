@@ -10,10 +10,12 @@ Kill: touch KILL_PIPELINE (signals all children, skips Phase 2)
 """
 
 import os
+import smtplib
 import subprocess
 import sys
 import time
 from datetime import datetime
+from email.mime.text import MIMEText
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
@@ -47,6 +49,12 @@ def release_lock():
     except FileNotFoundError:
         pass
 
+CHILD_PID_FILES = [
+    BASE_DIR / "sync_data.pid",
+    BASE_DIR / "image_downloader.pid",
+    BASE_DIR / "orchestrator.pid",
+]
+
 # Kill files for each concurrent step
 KILL_FILES = {
     "sync_data": BASE_DIR / "KILL_SD",
@@ -72,6 +80,27 @@ SEQUENTIAL_STEPS = [
 
 TAR_DIR = BASE_DIR / "images" / "imagetarred"
 TAR_IDLE_TIMEOUT = 3600  # 1 hour since last new tar
+
+# SMS alerts via Gmail → T-Mobile gateway
+GMAIL_USER = "418dreamworks@gmail.com"
+GMAIL_PASS = "mkcsnpzojtgqfnpn"
+SMS_TO = "2674743645@tmomail.net"
+
+
+def send_alert(msg):
+    """Send SMS alert. Fails silently."""
+    try:
+        email = MIMEText(msg)
+        email["Subject"] = "Pipeline Alert"
+        email["From"] = GMAIL_USER
+        email["To"] = SMS_TO
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+            s.starttls()
+            s.login(GMAIL_USER, GMAIL_PASS)
+            s.send_message(email)
+        log(f"Alert sent: {msg}")
+    except Exception as e:
+        log(f"Warning: failed to send alert: {e}")
 
 
 def ts():
@@ -127,6 +156,21 @@ def cleanup_kill_files():
             pass
 
 
+def cleanup_stale_pids():
+    """Remove stale PID files from child processes (left over from previous runs)."""
+    for pf in CHILD_PID_FILES:
+        if not pf.exists():
+            continue
+        try:
+            old_pid = int(pf.read_text().strip())
+            os.kill(old_pid, 0)
+            # Process is alive — don't touch it
+            log(f"  Warning: {pf.name} PID {old_pid} is still alive")
+        except (ValueError, ProcessLookupError, PermissionError):
+            pf.unlink()
+            log(f"  Removed stale {pf.name}")
+
+
 def wait_for_procs(procs, timeout=None):
     """Wait for all procs to exit. Returns True if all exited, False on timeout."""
     deadline = time.time() + timeout if timeout else None
@@ -172,30 +216,87 @@ def run_sequential_step(step):
 REQUIRED_VOLUMES = ["/Volumes/SSD500GB", "/Volumes/HDD1TB"]
 
 
+def mount_volume(name):
+    """Try to mount a volume by name using diskutil. Returns True if mounted."""
+    try:
+        result = subprocess.run(
+            ["diskutil", "list", "external"],
+            capture_output=True, text=True, timeout=10
+        )
+        # Find the disk identifier for this volume name
+        for line in result.stdout.splitlines():
+            if name in line:
+                parts = line.split()
+                disk_id = parts[-1]  # e.g. disk4s2
+                log(f"  Mounting {name} ({disk_id})...")
+                mount_result = subprocess.run(
+                    ["diskutil", "mount", disk_id],
+                    capture_output=True, text=True, timeout=30
+                )
+                if mount_result.returncode == 0:
+                    log(f"  Mounted {name}")
+                    return True
+                else:
+                    log(f"  Failed to mount {name}: {mount_result.stderr.strip()}")
+                    return False
+        log(f"  {name} not found in external disks")
+        return False
+    except Exception as e:
+        log(f"  Mount error for {name}: {e}")
+        return False
+
+
 def check_volumes():
-    """Verify required external drives are mounted."""
+    """Verify required external drives are mounted, attempt to mount if not.
+
+    1. Check if mounted
+    2. If not, attempt diskutil mount
+    3. Wait 30s for drives to settle
+    4. Re-check — if still missing, alert via SMS and abort
+    """
     missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
-    if missing:
-        log(f"Error: Required volumes not mounted: {', '.join(missing)}")
+    if not missing:
+        return True
+
+    log(f"Volumes not mounted: {', '.join(missing)}")
+    for vol in missing:
+        name = Path(vol).name
+        mount_volume(name)
+
+    # Wait for drives to settle
+    time.sleep(30)
+
+    # Re-check
+    still_missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
+    if still_missing:
+        msg = f"Pipeline aborted: volumes not mounted: {', '.join(still_missing)}"
+        log(f"Error: {msg}")
+        send_alert(msg)
         return False
     return True
 
 
 def main():
     if KILL_FILE.exists():
-        log(f"Error: Kill file exists ({KILL_FILE}). Remove it to start.")
+        msg = f"Pipeline aborted: kill file exists ({KILL_FILE})"
+        log(msg)
+        send_alert(msg)
         return
 
     if not check_volumes():
-        return
+        return  # check_volumes already sends alert
 
     if not acquire_lock():
-        log("Error: Another pipeline.py instance is already running")
+        msg = "Pipeline aborted: another instance already running"
+        log(msg)
+        send_alert(msg)
         return
 
     log("=" * 60)
     log("PIPELINE START (concurrent mode)")
     log("=" * 60)
+
+    cleanup_stale_pids()
 
     results = []
     killed = False
@@ -332,7 +433,22 @@ def main():
     for name, status, elapsed in results:
         log(f"  {name}: {status} ({elapsed:.0f}s)")
     log("=" * 60)
-    log("PIPELINE COMPLETE" if not killed else "PIPELINE KILLED")
+    if killed:
+        log("PIPELINE KILLED")
+        send_alert("Pipeline was killed")
+    else:
+        failures = [n for n, s, _ in results if not s.startswith("OK")]
+        if failures:
+            msg = f"Pipeline done with failures: {', '.join(failures)}"
+            log(msg)
+            send_alert(msg)
+        else:
+            log("PIPELINE COMPLETE")
+            # Clean up KILL_PIPELINE if it exists from a previous run
+            try:
+                KILL_FILE.unlink()
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":
