@@ -530,6 +530,10 @@ def fetch_active_listings(client, taxonomy_id, offset, min_price=None, max_price
                 return None, "rate_limited"
             if response.status_code == 400:
                 return None, "bad_request"
+            if response.status_code >= 500:
+                print(f"[{ts()}] Server error {response.status_code}. Waiting 30s before retry...")
+                time.sleep(30)
+                continue
             response.raise_for_status()
 
             data = response.json()
@@ -552,6 +556,10 @@ def fetch_shop(client, shop_id):
             update_api_usage(response)
             if response.status_code == 404:
                 return None
+            if response.status_code >= 500:
+                print(f"[{ts()}] Shop {shop_id} server error {response.status_code}. Waiting 30s...")
+                time.sleep(30)
+                continue
             response.raise_for_status()
             return response.json()
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.TimeoutException,
@@ -583,6 +591,10 @@ def fetch_listings_batch_with_images(client, listing_ids):
                 },
             )
             update_api_usage(response)
+            if response.status_code >= 500:
+                print(f"[{ts()}] Batch images server error {response.status_code}. Waiting 30s...")
+                time.sleep(30)
+                continue
             response.raise_for_status()
 
             result = {}
@@ -617,6 +629,10 @@ def fetch_shop_reviews(client, shop_id, last_timestamp=0):
             update_api_usage(response)
             if response.status_code == 404:
                 return reviews
+            if response.status_code >= 500:
+                print(f"[{ts()}] Reviews {shop_id} server error {response.status_code}. Waiting 30s...")
+                time.sleep(30)
+                continue
             response.raise_for_status()
 
             results = response.json().get("results", [])

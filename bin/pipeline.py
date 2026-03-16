@@ -79,7 +79,7 @@ SEQUENTIAL_STEPS = [
 ]
 
 TAR_DIR = BASE_DIR / "images" / "imagetarred"
-TAR_IDLE_TIMEOUT = 3600  # 1 hour since last new tar
+TAR_IDLE_TIMEOUT = 7200  # 2 hours since last new tar (imac-only takes ~1.5hr per batch)
 
 # SMS alerts via Gmail → T-Mobile gateway
 GMAIL_USER = "418dreamworks@gmail.com"
