@@ -120,7 +120,7 @@ images/
 Single pipeline entry — `pipeline.py` chains all steps sequentially:
 
 ```
-0 0 * * 0  cd $CD && PYTHONUNBUFFERED=1 $VENV bin/pipeline.py >> $LOG/pipeline.log 2>&1
+0 21 * * 6  cd $CD && PYTHONUNBUFFERED=1 $VENV bin/pipeline.py >> $LOG/pipeline.log 2>&1
 ```
 
 Pipeline: Phase 1 concurrent (sync_data + image_downloader + embed_orchestrator + tar_images) → Phase 2 sequential (update_primary → backup_db → backup_rsync data, hdd, ssd)
@@ -163,11 +163,11 @@ Result: DB exists in 5 places (Primary SSD live, SSD500GB mirror, HDD1TB timesta
 
 ## Embed Workers
 
-- 3 workers: imac (localhost), mbp (mbp.local), sleight (192.168.68.117)
+- 3 workers: imac (localhost), mbp (192.168.68.109), sleight (192.168.68.117)
 - Orchestrator rsyncs batches to workers, workers run embed_worker.py
 - To verify workers are running, check worker.log on each machine — NOT ps/orchestrator log
   - imac: `ssh embed@localhost "tail -c 200 /Users/embed/imageselector/embed_exports/BATCH_NAME/worker.log"`
-  - mbp: `ssh embed@mbp.local "tail -c 200 /Users/embed/imageselector/embed_exports/BATCH_NAME/worker.log"`
+  - mbp: `ssh embed@192.168.68.109 "tail -c 200 /Users/embed/imageselector/embed_exports/BATCH_NAME/worker.log"`
   - sleight: `ssh embed@192.168.68.117 "powershell -Command \"Get-Content 'C:\\Users\\embed\\imageselector\\embed_exports\\BATCH_NAME\\worker.log' -Tail 3\""`
 - DINOv3 requires HuggingFace token (`~/.huggingface/token` or `C:\Users\embed\.huggingface\token` on Windows)
 - Models cached in `~/.cache/huggingface/hub/`; once downloaded, token not needed for subsequent runs
@@ -194,10 +194,12 @@ All tar archives have byte-offset indexes for O(1) random access — no need to 
 `images/imageprimary/primary_index.json` format:
 ```json
 {
-  "tars": {"imageprimary_00000.tar": {"1234567_8901234.jpg": 0, ...}},
-  "reverse": {"1234567": ["8901234", "imageprimary_00000.tar"]}
+  "tars": {"imageprimary_00000.tar": {"1234567.jpg": 0, ...}},
+  "reverse": {"1234567": ["imageprimary_00000.tar", 0]}
 }
 ```
+
+Files inside tars are named `{listing_id}.jpg` (no image_id — one primary per listing).
 
 ```python
 import json, tarfile, os
@@ -207,8 +209,7 @@ with open(os.path.join(PRIMARY_DIR, "primary_index.json")) as f:
     idx = json.load(f)
 
 listing_id = "1234567"
-image_id, tar_name = idx["reverse"][listing_id]
-offset = idx["tars"][tar_name][f"{listing_id}_{image_id}.jpg"]
+tar_name, offset = idx["reverse"][listing_id]
 
 with tarfile.open(os.path.join(PRIMARY_DIR, tar_name), "r") as tf:
     tf.fileobj.seek(offset)

@@ -64,13 +64,13 @@ def extract_primaries():
     conn.close()
 
     # Look up each primary in reverse index, group by tar
-    by_tar = {}  # tar_name -> [(filename, offset), ...]
+    by_tar = {}  # tar_name -> [(src_filename, dst_filename, offset), ...]
     skipped = 0
     for lid, iid in all_primaries:
         key = f"{lid}_{iid}"
         if key in reverse:
             tar_name, offset = reverse[key]
-            by_tar.setdefault(tar_name, []).append((f"{key}.jpg", offset))
+            by_tar.setdefault(tar_name, []).append((f"{key}.jpg", f"{lid}.jpg", offset))
         else:
             skipped += 1
 
@@ -89,18 +89,18 @@ def extract_primaries():
 
         extracted = 0
         with tarfile.open(tar_path, "r") as tf:
-            for fn, offset in entries:
+            for src_fn, dst_fn, offset in entries:
                 try:
                     tf.fileobj.seek(offset)
                     member = tarfile.TarInfo.fromtarfile(tf)
                     with tf.extractfile(member) as src:
                         data = src.read()
-                    dst_path = os.path.join(PRIMARY_DIR, fn)
+                    dst_path = os.path.join(PRIMARY_DIR, dst_fn)
                     with open(dst_path, "wb") as dst:
                         dst.write(data)
                     extracted += 1
                 except Exception as e:
-                    print(f"  WARNING: {fn} failed in {tar_name}: {e}")
+                    print(f"  WARNING: {src_fn} failed in {tar_name}: {e}")
 
         extracted_total += extracted
         print(f"  {tar_name}: extracted {extracted}/{len(entries)}")
@@ -173,13 +173,12 @@ def tar_primary_images():
 
         os.unlink(list_path)
 
-    # Build reverse lookup: listing_id -> [image_id, tar_name]
+    # Build reverse lookup: listing_id -> [tar_name, offset]
     reverse_index = {}
     for tar_name, offsets in forward_index.items():
-        for filename in offsets:
-            parts = filename.replace(".jpg", "").split("_")
-            if len(parts) == 2:
-                reverse_index[parts[0]] = [parts[1], tar_name]
+        for filename, offset in offsets.items():
+            listing_id = filename.replace(".jpg", "")
+            reverse_index[listing_id] = [tar_name, offset]
 
     # Write primary_index.json
     index_path = os.path.join(PRIMARY_DIR, "primary_index.json")

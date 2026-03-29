@@ -266,7 +266,7 @@ def run_pass():
                 for chunk_start in range(0, len(pairs), 10000):
                     chunk = pairs[chunk_start:chunk_start + 10000]
                     conn.executemany(
-                        "UPDATE image_status SET download_done = 4 "
+                        "UPDATE image_status SET download_done = 4, url = NULL "
                         "WHERE listing_id = ? AND image_id = ?",
                         chunk
                     )

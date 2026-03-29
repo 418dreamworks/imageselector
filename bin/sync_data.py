@@ -189,7 +189,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             title TEXT,
             description TEXT,
             creation_timestamp INTEGER,
-            url TEXT,
             is_customizable INTEGER,
             is_personalizable INTEGER,
             listing_type TEXT,
@@ -229,8 +228,6 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_listings_dynamic_timestamp ON listings_dynamic(snapshot_timestamp);
 
         CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_timestamp INTEGER,
             shop_id INTEGER NOT NULL,
             listing_id INTEGER NOT NULL,
             buyer_user_id INTEGER,
@@ -380,13 +377,13 @@ def insert_listing_static(conn, listing, snapshot_ts):
     conn.execute("""
         INSERT OR IGNORE INTO listings_static (
             listing_id, snapshot_timestamp, shop_id, title, description,
-            creation_timestamp, url,
+            creation_timestamp,
             is_customizable, is_personalizable, listing_type, tags, materials,
             processing_min, processing_max, who_made, when_made,
             item_weight, item_weight_unit, item_length, item_width,
             item_height, item_dimensions_unit, should_auto_renew, language,
             taxonomy_id, production_partners
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         listing.get("listing_id"),
         snapshot_ts,
@@ -394,7 +391,6 @@ def insert_listing_static(conn, listing, snapshot_ts):
         listing.get("title"),
         listing.get("description"),
         listing.get("creation_timestamp"),
-        listing.get("url"),
         1 if listing.get("is_customizable") else 0,
         1 if listing.get("is_personalizable") else 0,
         listing.get("listing_type"),
@@ -448,11 +444,10 @@ def insert_review(conn, review, snapshot_ts):
     try:
         conn.execute("""
             INSERT OR IGNORE INTO reviews (
-                snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                shop_id, listing_id, buyer_user_id, rating, review,
                 language, create_timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            snapshot_ts,
             review.get("shop_id"),
             review.get("listing_id"),
             review.get("buyer_user_id"),
@@ -1071,9 +1066,9 @@ def phase_reviews(client, conn, snapshot_ts):
             if review_batch:
                 conn.executemany("""
                     INSERT OR IGNORE INTO reviews (
-                        snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                        shop_id, listing_id, buyer_user_id, rating, review,
                         language, create_timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, review_batch)
                 review_batch = []
             commit_with_retry(conn)
@@ -1090,7 +1085,6 @@ def phase_reviews(client, conn, snapshot_ts):
             last_review_ts[sid_str] = newest_ts
             for review in reviews:
                 review_batch.append((
-                    snapshot_ts,
                     review.get("shop_id"),
                     review.get("listing_id"),
                     review.get("buyer_user_id"),
@@ -1107,9 +1101,9 @@ def phase_reviews(client, conn, snapshot_ts):
             if review_batch:
                 conn.executemany("""
                     INSERT OR IGNORE INTO reviews (
-                        snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                        shop_id, listing_id, buyer_user_id, rating, review,
                         language, create_timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, review_batch)
                 review_batch = []
             commit_with_retry(conn)
@@ -1121,9 +1115,9 @@ def phase_reviews(client, conn, snapshot_ts):
     if review_batch:
         conn.executemany("""
             INSERT OR IGNORE INTO reviews (
-                snapshot_timestamp, shop_id, listing_id, buyer_user_id, rating, review,
+                shop_id, listing_id, buyer_user_id, rating, review,
                 language, create_timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, review_batch)
     commit_with_retry(conn)
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
