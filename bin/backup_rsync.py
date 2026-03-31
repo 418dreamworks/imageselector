@@ -42,10 +42,10 @@ SCRIPTS = [
 
 RSYNCS = {
     "data": {
-        "description": "data/ → SSD500GB",
-        "cmd": ["rsync", "-a", "--exclude", "embeddings/",
-                str(BASE_DIR / "data") + "/",
-                "/Volumes/SSD500GB/imageselector/data/"],
+        "description": "data/db/ → SSD500GB",
+        "cmd": ["rsync", "-a",
+                str(BASE_DIR / "data" / "db") + "/",
+                "/Volumes/SSD500GB/imageselector/data/db/"],
     },
     "hdd": {
         "description": "HDD1TB → HDD3TB",
