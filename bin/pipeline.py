@@ -13,6 +13,7 @@ import os
 import smtplib
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -101,6 +102,45 @@ def send_alert(msg):
         log(f"Alert sent: {msg}")
     except Exception as e:
         log(f"Warning: failed to send alert: {e}")
+
+
+LOG_STALE_THRESHOLD = 5 * 3600  # 5 hours
+LOG_CHECK_INTERVAL = 1800  # check every 30 min
+_watchdog_stop = threading.Event()
+
+
+def _watchdog_thread():
+    """Background thread: alert if ALL log files are stale for 5 hours."""
+    log_files = [BASE_DIR / step["log"] for step in CONCURRENT_STEPS + SEQUENTIAL_STEPS]
+    log_files.append(BASE_DIR / "logs" / "pipeline.log")
+    alerted = False
+
+    while not _watchdog_stop.wait(LOG_CHECK_INTERVAL):
+        now = time.time()
+        newest_mtime = 0
+        for lf in log_files:
+            if lf.exists():
+                mtime = lf.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest_mtime = mtime
+
+        if newest_mtime > 0 and (now - newest_mtime) > LOG_STALE_THRESHOLD:
+            if not alerted:
+                stale_hrs = (now - newest_mtime) / 3600
+                send_alert(f"Pipeline stuck: no log activity for {stale_hrs:.1f}hr")
+                alerted = True
+        else:
+            alerted = False
+
+
+def start_watchdog():
+    t = threading.Thread(target=_watchdog_thread, daemon=True)
+    t.start()
+    return t
+
+
+def stop_watchdog():
+    _watchdog_stop.set()
 
 
 def ts():
@@ -247,32 +287,47 @@ def mount_volume(name):
 
 
 def check_volumes():
-    """Verify required external drives are mounted, attempt to mount if not.
+    """Force remount all required drives for clean filesystem state, then verify.
 
-    1. Check if mounted
-    2. If not, attempt diskutil mount
+    1. Unmount each volume (force if needed)
+    2. Remount each volume
     3. Wait 30s for drives to settle
-    4. Re-check — if still missing, alert via SMS and abort
+    4. Verify writable — if not, alert via SMS and abort
     """
-    missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
-    if not missing:
-        return True
-
-    log(f"Volumes not mounted: {', '.join(missing)}")
-    for vol in missing:
+    log("Remounting required volumes...")
+    for vol in REQUIRED_VOLUMES:
         name = Path(vol).name
+        if Path(vol).is_dir():
+            log(f"  Unmounting {name}...")
+            subprocess.run(
+                ["diskutil", "unmount", "force", vol],
+                capture_output=True, text=True, timeout=30
+            )
+            time.sleep(2)
         mount_volume(name)
 
     # Wait for drives to settle
     time.sleep(30)
 
-    # Re-check
+    # Verify all mounted and writable
     still_missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
     if still_missing:
         msg = f"Pipeline aborted: volumes not mounted: {', '.join(still_missing)}"
         log(f"Error: {msg}")
         send_alert(msg)
         return False
+
+    # Test write on each volume
+    for vol in REQUIRED_VOLUMES:
+        test_file = Path(vol) / "_pipeline_write_test"
+        try:
+            test_file.touch()
+            test_file.unlink()
+        except OSError as e:
+            msg = f"Pipeline aborted: {vol} not writable: {e}"
+            log(f"Error: {msg}")
+            send_alert(msg)
+            return False
     return True
 
 
@@ -295,6 +350,8 @@ def main():
     log("=" * 60)
     log("PIPELINE START (concurrent mode)")
     log("=" * 60)
+    send_alert("Pipeline started")
+    start_watchdog()
 
     cleanup_stale_pids()
 
@@ -454,6 +511,11 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except Exception as e:
+        log(f"PIPELINE CRASHED: {e}")
+        send_alert(f"Pipeline crashed: {e}")
+        raise
     finally:
+        stop_watchdog()
         if _lock_acquired:
             release_lock()
