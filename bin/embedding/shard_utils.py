@@ -55,28 +55,33 @@ def get_shard_num(shard_dir: Path) -> int:
 
 
 def get_total_rows() -> int:
-    """Sum of image_index lengths across all shards."""
-    total = 0
-    for shard_dir in get_shard_dirs():
-        idx = load_shard_index(shard_dir)
-        total += len(idx)
-    return total
+    """Total rows: finalized shards (500K each) + active shard."""
+    dirs = get_shard_dirs()
+    if not dirs:
+        return 0
+    active = dirs[-1]
+    idx = load_shard_index(active)
+    if len(idx) >= SHARD_SIZE:
+        return len(dirs) * SHARD_SIZE  # all finalized
+    return (len(dirs) - 1) * SHARD_SIZE + len(idx)
 
 
 def load_all_embedded_pairs() -> set:
-    """Load non-finalized shards' image_index, return set of (lid, iid).
+    """Load active shard's image_index, return set of (lid, iid).
 
-    Finalized shards (500K rows) are skipped — their images are download_done=3
-    so they won't appear in DB queries and don't need dedup tracking.
+    Only the active (last) shard is loaded. Finalized shards' images are at
+    download_done>=3 so they won't appear in dd=2 queries and don't need dedup.
     """
-    pairs = set()
-    for shard_dir in get_shard_dirs():
-        idx = load_shard_index(shard_dir)
-        if len(idx) >= SHARD_SIZE:
-            continue  # finalized, skip
-        for entry in idx:
-            pairs.add((entry[0], entry[1]))
-    return pairs
+    dirs = get_shard_dirs()
+    if not dirs:
+        return set()
+
+    active = dirs[-1]
+    idx = load_shard_index(active)
+    if len(idx) >= SHARD_SIZE:
+        return set()  # all shards finalized, nothing to dedup
+
+    return {(entry[0], entry[1]) for entry in idx}
 
 
 def load_shard_index(shard_dir: Path) -> list:
@@ -154,9 +159,9 @@ def check_shard_consistency(shard_dir: Path, exclude: set = None) -> Tuple[bool,
 
 
 def check_all_shards_consistency(exclude: set = None) -> Tuple[bool, str]:
-    """Check consistency of active shard only. Returns (all_ok, combined_message).
+    """Check consistency of active shard only. Returns (all_ok, message).
 
-    Finalized shards (500K rows) are immutable and already verified, so skipped.
+    Finalized shards are immutable — only the last (active) shard needs checking.
 
     Args:
         exclude: Set of FAISS filenames to skip (e.g. {'clip_vitl14.faiss'})
@@ -167,21 +172,10 @@ def check_all_shards_consistency(exclude: set = None) -> Tuple[bool, str]:
     if not dirs:
         return True, "No shards exist"
 
-    messages = []
-    all_ok = True
-    total = 0
+    active = dirs[-1]
+    idx = load_shard_index(active)
+    if len(idx) >= SHARD_SIZE:
+        return True, f"All shards finalized ({len(dirs)} shards)"
 
-    for shard_dir in dirs:
-        idx = load_shard_index(shard_dir)
-        rows = len(idx)
-        total += rows
-        if rows >= SHARD_SIZE:
-            messages.append(f"{shard_dir.name}: finalized ({rows} rows, skipped)")
-            continue
-        ok, msg = check_shard_consistency(shard_dir, exclude=exclude)
-        messages.append(msg)
-        if not ok:
-            all_ok = False
-
-    summary = f"Total rows: {total}" if all_ok else "INCONSISTENCIES FOUND"
-    return all_ok, f"{summary}\n  " + "\n  ".join(messages)
+    ok, msg = check_shard_consistency(active, exclude=exclude)
+    return ok, msg
