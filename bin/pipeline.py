@@ -221,6 +221,31 @@ def wait_for_procs(procs, timeout=None):
     return True
 
 
+STEP_LOGS = {step["name"]: BASE_DIR / step["log"] for step in CONCURRENT_STEPS + SEQUENTIAL_STEPS}
+STOP_STALE_THRESHOLD = 1800  # 30 min with no log activity = stuck
+
+
+def wait_for_stop(procs, names):
+    """Wait for named processes to exit after kill signal, monitoring log progress.
+
+    Never sends SIGTERM. If a process's log goes stale for 30 min, alert but keep waiting.
+    """
+    alerted = set()
+    while True:
+        still_alive = [n for n in names if procs[n].poll() is None]
+        if not still_alive:
+            break
+        for name in still_alive:
+            log_path = STEP_LOGS.get(name)
+            if log_path and log_path.exists():
+                age = time.time() - log_path.stat().st_mtime
+                if age > STOP_STALE_THRESHOLD and name not in alerted:
+                    log(f"  WARNING: {name} log stale for {age/60:.0f}min after kill signal")
+                    send_alert(f"{name} not responding to kill after {age/60:.0f}min")
+                    alerted.add(name)
+        time.sleep(30)
+
+
 def run_sequential_step(step):
     """Run a single step, streaming output to log and stdout. Returns (status, elapsed)."""
     log_path = BASE_DIR / step["log"]
@@ -382,16 +407,10 @@ def main():
         time.sleep(5)
 
     if killed:
-        # Signal all concurrent steps to stop
+        # Signal all concurrent steps to stop via kill files (no SIGTERM)
         log("Signaling all concurrent steps to stop...")
         signal_stop(procs.keys())
-        wait_for_procs(list(procs.values()), timeout=120)
-        # Force-terminate anything still alive
-        for name, proc in procs.items():
-            if proc.poll() is None:
-                log(f"  {name} still running after 120s, terminating...")
-                proc.terminate()
-                proc.wait(timeout=30)
+        wait_for_stop(procs, list(procs.keys()))
     else:
         # sync_data finished naturally
         sd_elapsed = time.time() - start_times["sync_data"]
@@ -416,17 +435,13 @@ def main():
                 break
             time.sleep(30)
 
-        # Signal remaining concurrent steps to stop
+        # Signal remaining concurrent steps to stop via kill files (no SIGTERM)
+        # Never SIGTERM: killing mid-write corrupts FAISS indexes.
         still_running = [n for n in procs if n != "sync_data" and procs[n].poll() is None]
         if still_running:
             log(f"Signaling stop: {', '.join(still_running)}")
             signal_stop(still_running)
-            wait_for_procs([procs[n] for n in still_running], timeout=120)
-            for name in still_running:
-                if procs[name].poll() is None:
-                    log(f"  {name} still running after 120s, terminating...")
-                    procs[name].terminate()
-                    procs[name].wait(timeout=30)
+            wait_for_stop(procs, still_running)
 
     # Collect results for concurrent steps (except sync_data already recorded)
     for step in CONCURRENT_STEPS:
