@@ -141,7 +141,7 @@ with tarfile.open(f"images/imagetarred/{tar_name}", "r") as tf:
 
 Symlink → /Volumes/SSD500GB/imageselector/images/imageprimary
 
-A subset: only the primary (is_primary=1) image per listing, repacked into tars. Rebuilt weekly by update_primary.py. No loose files.
+A subset: only the primary (is_primary=1) image per listing. Append-only — update_primary.py adds new listings' primaries to new tars each week. Use `--full` for a complete rebuild. No loose files.
 
 ```
 images/imageprimary/

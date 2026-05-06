@@ -42,7 +42,7 @@ sync_data.py ──► image_downloader.py ──► embed_orchestrator.py ─�
 | `bin/image_downloader.py` | Downloads images from Etsy CDN (8 workers, single-pass, pauses at 5GB free) |
 | `bin/image_db.py` | Shared database helpers with `@_retry_on_lock` decorator |
 | `bin/tar_images.py` | Archives 10K batches from imageembedded → imagetarred (exits when done) |
-| `bin/update_primary.py` | Weekly full rebuild: clear imageprimary/, extract all primaries, tar all in 10K batches (no loose files) |
+| `bin/update_primary.py` | Append-only: extract primaries for new listings only, tar in 10K batches. Use `--full` for complete rebuild |
 | `bin/backup_db.py` | Backs up entire data/ folder to HDD1TB |
 | `bin/embedding/embed_orchestrator.py` | Distributes batches to 3 workers, imports to FAISS (exits when no work left) |
 | `bin/embedding/embed_worker.py` | BG removal + 5-model embedding (overwrites JPGs with bg-removed, produces .npy; after import, JPGs move to images/imageembedded/) |
