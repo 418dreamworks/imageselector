@@ -77,19 +77,32 @@ SEQUENTIAL_STEPS = [
     {"name": "backup_rsync_data", "cmd": [VENV_PYTHON, "bin/backup_rsync.py", "data"], "log": "logs/rsync_ssd500.log"},
     {"name": "backup_rsync_hdd",  "cmd": [VENV_PYTHON, "bin/backup_rsync.py", "hdd"],  "log": "logs/rsync_hdd3tb.log"},
     {"name": "backup_rsync_ssd",  "cmd": [VENV_PYTHON, "bin/backup_rsync.py", "ssd"],  "log": "logs/rsync_hdd500.log"},
+    {"name": "verify_mirrors",    "cmd": [VENV_PYTHON, "bin/verify_mirrors.py"],       "log": "logs/verify_mirrors.log"},
 ]
 
 TAR_DIR = BASE_DIR / "images" / "imagetarred"
 TAR_IDLE_TIMEOUT = 7200  # 2 hours since last new tar (imac-only takes ~1.5hr per batch)
 
 # SMS alerts via Gmail → T-Mobile gateway
+# Password is read from ~/.imageselector_smtp_pass (chmod 600), not committed.
 GMAIL_USER = "418dreamworks@gmail.com"
-GMAIL_PASS = "mkcsnpzojtgqfnpn"
 SMS_TO = "2674743645@tmomail.net"
+GMAIL_PASS_FILE = Path.home() / ".imageselector_smtp_pass"
+
+
+def _load_gmail_pass():
+    try:
+        return GMAIL_PASS_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None
 
 
 def send_alert(msg):
     """Send SMS alert. Fails silently."""
+    gmail_pass = _load_gmail_pass()
+    if not gmail_pass:
+        log(f"Warning: {GMAIL_PASS_FILE} missing; alert not sent: {msg}")
+        return
     try:
         email = MIMEText(msg)
         email["Subject"] = "Pipeline Alert"
@@ -97,7 +110,7 @@ def send_alert(msg):
         email["To"] = SMS_TO
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
             s.starttls()
-            s.login(GMAIL_USER, GMAIL_PASS)
+            s.login(GMAIL_USER, gmail_pass)
             s.send_message(email)
         log(f"Alert sent: {msg}")
     except Exception as e:
@@ -286,7 +299,7 @@ def mount_volume(name):
     try:
         result = subprocess.run(
             ["diskutil", "list", "external"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=60
         )
         # Find the disk identifier for this volume name
         for line in result.stdout.splitlines():
@@ -296,7 +309,7 @@ def mount_volume(name):
                 log(f"  Mounting {name} ({disk_id})...")
                 mount_result = subprocess.run(
                     ["diskutil", "mount", disk_id],
-                    capture_output=True, text=True, timeout=30
+                    capture_output=True, text=True, timeout=300
                 )
                 if mount_result.returncode == 0:
                     log(f"  Mounted {name}")
@@ -312,37 +325,21 @@ def mount_volume(name):
 
 
 def check_volumes():
-    """Force remount all required drives for clean filesystem state, then verify.
+    """Verify required drives are mounted and writable. No force-remount.
 
-    1. Unmount each volume (force if needed)
-    2. Remount each volume
-    3. Wait 30s for drives to settle
-    4. Verify writable — if not, alert via SMS and abort
+    Force-remounting was the root cause of HFS+ stuck states on the backup
+    mirrors. If a volume is missing or not writable, alert via SMS and abort
+    so a human can investigate.
     """
-    log("Remounting required volumes...")
-    for vol in REQUIRED_VOLUMES:
-        name = Path(vol).name
-        if Path(vol).is_dir():
-            log(f"  Unmounting {name}...")
-            subprocess.run(
-                ["diskutil", "unmount", "force", vol],
-                capture_output=True, text=True, timeout=30
-            )
-            time.sleep(2)
-        mount_volume(name)
+    log("Checking required volumes...")
 
-    # Wait for drives to settle
-    time.sleep(30)
-
-    # Verify all mounted and writable
-    still_missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
-    if still_missing:
-        msg = f"Pipeline aborted: volumes not mounted: {', '.join(still_missing)}"
+    missing = [v for v in REQUIRED_VOLUMES if not Path(v).is_dir()]
+    if missing:
+        msg = f"Pipeline aborted: volumes not mounted: {', '.join(missing)}"
         log(f"Error: {msg}")
         send_alert(msg)
         return False
 
-    # Test write on each volume
     for vol in REQUIRED_VOLUMES:
         test_file = Path(vol) / "_pipeline_write_test"
         try:
@@ -353,6 +350,7 @@ def check_volumes():
             log(f"Error: {msg}")
             send_alert(msg)
             return False
+        log(f"  {Path(vol).name}: writable")
     return True
 
 
@@ -363,14 +361,14 @@ def main():
         send_alert(msg)
         return
 
-    if not check_volumes():
-        return  # check_volumes already sends alert
-
     if not acquire_lock():
         msg = "Pipeline aborted: another instance already running"
         log(msg)
         send_alert(msg)
         return
+
+    if not check_volumes():
+        return  # check_volumes already sends alert
 
     log("=" * 60)
     log("PIPELINE START (concurrent mode)")

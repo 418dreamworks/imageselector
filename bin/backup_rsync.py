@@ -141,6 +141,7 @@ def main():
             print(f"[{ts()}] FAILED (exit {result.returncode}): {rsync['description']} ({elapsed:.0f}s)")
             if result.stderr:
                 print(f"  stderr: {result.stderr[:500]}")
+        return result.returncode
 
     finally:
         cleanup()
@@ -148,4 +149,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
