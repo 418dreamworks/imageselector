@@ -13,7 +13,9 @@ import sys
 import json
 import time
 import signal
+import smtplib
 import sqlite3
+from email.mime.text import MIMEText
 from pathlib import Path
 from datetime import datetime
 from typing import Dict
@@ -32,12 +34,16 @@ _secret = os.getenv("ETSY_SHARED_SECRET", "")
 ETSY_API_KEY = f"{_key}:{_secret}" if _secret else _key
 BASE_URL = "https://openapi.etsy.com/v3"
 
-API_DELAY_DEFAULT = 0.2  # 5 QPS (default, overridden by qps_config.json)
+API_DELAY_DEFAULT = 5.0  # 0.2 QPS — fits Etsy's 5K daily quota in ~7hr
 UPDATE_QPS = True  # Auto-adjust api_delay based on remaining quota
 MAX_OFFSET = 10000     # Etsy API offset limit
 ONE_WEEK = 7 * 24 * 3600
 FIVE_DAYS = 5 * 24 * 3600
 ONE_MONTH = 30 * 24 * 3600
+
+# Abort a phase when remaining daily quota dips below this floor so subsequent
+# phases still have budget (and to fail fast instead of grinding 429s).
+QUOTA_FLOOR = 50
 
 BASE_DIR = Path(__file__).parent.parent
 IMAGES_DIR = BASE_DIR / "images" / "imagedownload"
@@ -48,6 +54,31 @@ QPS_CONFIG_FILE = BASE_DIR / "data" / "db" / "qps_config.json"
 PID_FILE = BASE_DIR / "sync_data.pid"
 PAUSE_FILE = BASE_DIR / "PAUSE_SD"
 PAUSED_FILE = BASE_DIR / "PAUSED_SD"
+
+GMAIL_USER = "418dreamworks@gmail.com"
+SMS_TO = "2674743645@tmomail.net"
+GMAIL_PASS_FILE = Path.home() / ".imageselector_smtp_pass"
+
+
+def _send_alert(msg):
+    """Send SMS alert via Gmail->T-Mobile gateway. Fails silently."""
+    try:
+        gmail_pass = GMAIL_PASS_FILE.read_text().strip()
+    except FileNotFoundError:
+        print(f"[{ts()}] Warning: {GMAIL_PASS_FILE} missing; alert not sent: {msg}")
+        return
+    try:
+        email = MIMEText(msg)
+        email["Subject"] = "Pipeline Alert"
+        email["From"] = GMAIL_USER
+        email["To"] = SMS_TO
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+            s.starttls()
+            s.login(GMAIL_USER, gmail_pass)
+            s.send_message(email)
+        print(f"[{ts()}] Alert sent: {msg}")
+    except Exception as e:
+        print(f"[{ts()}] Warning: failed to send alert: {e}")
 
 
 def get_api_delay() -> float:
@@ -462,17 +493,61 @@ def insert_review(conn, review, snapshot_ts):
 
 # ─── API Functions ───────────────────────────────────────────────────────────
 
-_api_stats = {"used": 0, "limit": 10000, "remaining": 10000}
+_api_stats = {"used": 0, "limit": None, "remaining": None}
+_quota_change_check_done = False
+_phase_failed = False
 
 
 _last_qps_write = 0
 
 
+def _quota_low() -> bool:
+    """True once Etsy's remaining daily quota dips below QUOTA_FLOOR."""
+    r = _api_stats.get("remaining")
+    return r is not None and r < QUOTA_FLOOR
+
+
+def _fmt_quota() -> str:
+    used = _api_stats.get("used")
+    limit = _api_stats.get("limit")
+    if used is None:
+        used = "?"
+    if limit is None:
+        limit = "?"
+    return f"{used}/{limit}"
+
+
+def _fail_phase(phase: str, msg: str):
+    """Mark sync as failed, log, and alert. Caller should bail out cleanly."""
+    global _phase_failed
+    _phase_failed = True
+    full = f"sync_data {phase}: {msg}"
+    print(f"[{ts()}] {full}")
+    _send_alert(full)
+
+
 def update_api_usage(response):
-    global _last_qps_write
+    global _last_qps_write, _quota_change_check_done
     try:
-        remaining = int(response.headers.get("x-remaining-today", 0))
-        limit = int(response.headers.get("x-limit-per-day", 10000))
+        limit_hdr = response.headers.get("x-limit-per-day")
+        remaining_hdr = response.headers.get("x-remaining-today")
+        if limit_hdr is None or remaining_hdr is None:
+            return
+        limit = int(limit_hdr)
+        remaining = int(remaining_hdr)
+
+        # On the first response of this run, compare against the last-saved
+        # daily limit. If Etsy reduced our tier, alert immediately so we don't
+        # find out 2 weeks later via silent zero-result phases.
+        if not _quota_change_check_done:
+            _quota_change_check_done = True
+            try:
+                prev = json.loads(QPS_CONFIG_FILE.read_text()).get("limit")
+                if isinstance(prev, int) and prev > 0 and limit < prev:
+                    _send_alert(f"Etsy daily quota dropped: {prev} -> {limit}")
+            except (IOError, json.JSONDecodeError):
+                pass
+
         _api_stats["remaining"] = remaining
         _api_stats["limit"] = limit
         _api_stats["used"] = limit - remaining
@@ -480,17 +555,18 @@ def update_api_usage(response):
         now = time.time()
         if now - _last_qps_write >= 300:
             _last_qps_write = now
-            used = limit - remaining
             try:
                 config = {}
                 if QPS_CONFIG_FILE.exists():
                     config = json.loads(QPS_CONFIG_FILE.read_text())
                 if UPDATE_QPS:
                     current_delay = config.get("api_delay", API_DELAY_DEFAULT)
-                    if used >= 99750:
-                        new_delay = min(current_delay * 1.1, 30.0)
+                    # Throttle harder near the daily cap, scaled to whatever
+                    # the cap currently is (was previously hardcoded to 99750).
+                    if limit > 0 and (limit - remaining) >= int(limit * 0.95):
+                        new_delay = min(current_delay * 1.5, 30.0)
                     else:
-                        new_delay = API_DELAY_DEFAULT  # 5 QPS
+                        new_delay = API_DELAY_DEFAULT
                     config["api_delay"] = new_delay
                 config["remaining"] = remaining
                 config["limit"] = limit
@@ -816,12 +892,12 @@ def phase_crawl(client, conn, progress, existing_listings, listing_last_ts,
         )
 
         if error == "rate_limited":
-            print("Rate limited. Saving and stopping.")
             progress["crawl_unit_index"] = crawl_unit_index
             progress["offset"] = offset
             progress["exhausted"] = list(exhausted)
             save_progress(progress, conn)
             commit_with_retry(conn)
+            _fail_phase("crawl", f"rate-limited at quota {_fmt_quota()}")
             return
 
         if error == "bad_request" or result is None:
@@ -968,10 +1044,19 @@ def phase_shops(client, conn, snapshot_ts):
     cursor = conn.execute("SELECT shop_id FROM shops_static")
     existing_static = set(row[0] for row in cursor.fetchall())
 
+    # Bail before burning time on guaranteed 429s.
+    if _quota_low():
+        commit_with_retry(conn)
+        _fail_phase("shops", f"quota exhausted before start ({_fmt_quota()})")
+        return
+
     # Fetch each shop
     fetched = 0
     new_shops = 0
     updated_shops = 0
+    attempts = 0
+    successes = 0
+    aborted_quota = False
 
     for shop_id in shops_to_fetch:
         wait_for_backup_lock()
@@ -979,8 +1064,14 @@ def phase_shops(client, conn, snapshot_ts):
             commit_with_retry(conn)
             return
 
+        if _quota_low():
+            aborted_quota = True
+            break
+
         shop_data = fetch_shop(client, shop_id)
+        attempts += 1
         if shop_data:
+            successes += 1
             if shop_id not in existing_static:
                 insert_shop_static(conn, shop_data, snapshot_ts)
                 insert_shop_dynamic(conn, shop_data, snapshot_ts)
@@ -994,10 +1085,15 @@ def phase_shops(client, conn, snapshot_ts):
         if fetched % 100 == 0:
             commit_with_retry(conn)
             print(f"  Shops: {fetched}/{len(shops_to_fetch)} (new={new_shops}, updated={updated_shops}) "
-                  f"API={_api_stats['used']}/{_api_stats['limit']}")
+                  f"API={_fmt_quota()}")
 
     commit_with_retry(conn)
     print(f"[{ts()}] Shops complete: {new_shops} new, {updated_shops} updated")
+
+    if aborted_quota:
+        _fail_phase("shops", f"quota exhausted at {fetched}/{len(shops_to_fetch)} ({_fmt_quota()})")
+    elif attempts >= 50 and successes / attempts < 0.5:
+        _fail_phase("shops", f"only {successes}/{attempts} fetches succeeded ({_fmt_quota()})")
 
 
 # ─── Phase 5: Sync Check ────────────────────────────────────────────────────
@@ -1058,7 +1154,14 @@ def phase_reviews(client, conn, snapshot_ts):
 
     total_reviews = 0
     review_batch = []
+    aborted_quota = False
+    last_index = 0
     print(f"\n[{ts()}] Reviews: syncing {len(remaining)} shops with recent data")
+
+    if _quota_low():
+        commit_with_retry(conn)
+        _fail_phase("reviews", f"quota exhausted before start ({_fmt_quota()})")
+        return
 
     for i, shop_id in enumerate(remaining):
         wait_for_backup_lock()
@@ -1076,6 +1179,11 @@ def phase_reviews(client, conn, snapshot_ts):
             set_sync_state(conn, "reviews_done_shops", list(reviews_done))
             return
 
+        if _quota_low():
+            aborted_quota = True
+            break
+
+        last_index = i + 1
         sid_str = str(shop_id)
         last_ts = last_review_ts.get(sid_str, default_ts)
 
@@ -1110,7 +1218,7 @@ def phase_reviews(client, conn, snapshot_ts):
             set_sync_state(conn, "last_review_timestamps", last_review_ts)
             set_sync_state(conn, "reviews_done_shops", list(reviews_done))
             print(f"  Reviews: {i+1}/{len(remaining)} shops, {total_reviews} new reviews "
-                  f"| API={_api_stats['used']}/{_api_stats['limit']}")
+                  f"| API={_fmt_quota()}")
 
     if review_batch:
         conn.executemany("""
@@ -1121,10 +1229,14 @@ def phase_reviews(client, conn, snapshot_ts):
         """, review_batch)
     commit_with_retry(conn)
     set_sync_state(conn, "last_review_timestamps", last_review_ts)
-    # Clear reviews_done for next cycle
-    set_sync_state(conn, "reviews_done_shops", [])
     print(f"[{ts()}] Reviews complete: {total_reviews} new reviews from {len(remaining)} shops")
 
+    if aborted_quota:
+        _fail_phase("reviews", f"quota exhausted at shop {last_index}/{len(remaining)} ({_fmt_quota()})")
+        return
+
+    # Clear reviews_done for next cycle (only on clean completion)
+    set_sync_state(conn, "reviews_done_shops", [])
     # Reset progress for next cycle
     save_progress({"crawl_unit_index": 0, "offset": 0, "exhausted": []}, conn)
 

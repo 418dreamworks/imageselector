@@ -418,7 +418,7 @@ def main():
         log(f"  sync_data: {sd_status} ({sd_elapsed:.0f}s)")
 
         # Wait for others to finish: poll newest tar mtime, kill after 1hr idle
-        log("Waiting for remaining work (kill after 1hr with no new tars)...")
+        log("Waiting for remaining work (kill after 2hr with no new tars)...")
         while True:
             if KILL_FILE.exists():
                 log("KILL_PIPELINE detected while waiting")
